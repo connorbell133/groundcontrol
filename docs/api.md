@@ -183,8 +183,9 @@ and cron-shaped automations talk to.
 - `timeoutMs` — kill deadline, default 15 min (configurable via the `jobs`
   config key), max 2h. A timed-out job ends in state `timeout`.
 - `callbackUrl` — POSTed the `job.exit` event when the run finishes.
-- `isolation` / `docker` — accepted and rejected with `501 not_implemented`;
-  jobs currently run as the runner's user, same as sessions.
+- `isolation` / `docker` — booleans; `true` is rejected with
+  `501 not_implemented`. Jobs currently run as the runner's user, same as
+  sessions.
 
 Job states: `queued` → `running` → `succeeded` | `failed` | `timeout` |
 `canceled`. Concurrency is bounded (default 2, FIFO queue) by the `jobs`

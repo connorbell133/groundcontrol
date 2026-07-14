@@ -10,29 +10,56 @@ import (
 	"sort"
 	"strconv"
 	"strings"
-	"sync"
 	"syscall"
 	"time"
 
 	"github.com/creack/pty"
 )
 
+// sessionState and spawnMode keep string underneath: JSON marshals identically,
+// and the untyped literals other files compare against still compile
+type sessionState string
+
+const (
+	stateStarting sessionState = "starting"
+	stateReady    sessionState = "ready"
+	stateExited   sessionState = "exited"
+	stateError    sessionState = "error"
+)
+
+type spawnMode string
+
+const (
+	spawnSameDir  spawnMode = "same-dir"
+	spawnWorktree spawnMode = "worktree"
+)
+
+// session lifecycle event names; evSessionFailed is a derived match token
+// (announce adds it alongside a failed exit), never an emitted event itself
+const (
+	evSessionStart  = "session.start"
+	evSessionReady  = "session.ready"
+	evSessionKill   = "session.kill"
+	evSessionExit   = "session.exit"
+	evSessionFailed = "session.failed"
+)
+
 type Session struct {
-	ID             string  `json:"id"`
-	Name           string  `json:"name"`
-	Folder         string  `json:"folder"`
-	SpawnMode      string  `json:"spawnMode"` // "same-dir" | "worktree"
-	Branch         *string `json:"branch"`
-	WorktreePath   *string `json:"worktreePath"`
-	PermissionMode string  `json:"permissionMode"`
-	State          string  `json:"state"` // "starting" | "ready" | "exited" | "error"
-	PairingURL     *string `json:"pairingUrl"`
-	CallbackURL    *string `json:"callbackUrl"`
-	StartedAt      string  `json:"startedAt"`
-	ExitedAt       *string `json:"exitedAt"`
-	ExitCode       *int    `json:"exitCode"`
-	LastOutputAt   *string `json:"lastOutputAt"`
-	LastLine       *string `json:"lastLine"`
+	ID             string       `json:"id"`
+	Name           string       `json:"name"`
+	Folder         string       `json:"folder"`
+	SpawnMode      spawnMode    `json:"spawnMode"`
+	Branch         *string      `json:"branch"`
+	WorktreePath   *string      `json:"worktreePath"`
+	PermissionMode string       `json:"permissionMode"`
+	State          sessionState `json:"state"`
+	PairingURL     *string      `json:"pairingUrl"`
+	CallbackURL    *string      `json:"callbackUrl"`
+	StartedAt      string       `json:"startedAt"`
+	ExitedAt       *string      `json:"exitedAt"`
+	ExitCode       *int         `json:"exitCode"`
+	LastOutputAt   *string      `json:"lastOutputAt"`
+	LastLine       *string      `json:"lastLine"`
 }
 
 type liveSession struct {
@@ -46,13 +73,6 @@ type liveSession struct {
 	wtBranch   string
 	baseCommit string
 }
-
-var (
-	sessionsMu sync.Mutex
-	sessions   = map[string]*liveSession{}
-	// names reserved by launches still between duplicate-check and insertion
-	pendingNames = map[string]bool{}
-)
 
 var (
 	ansiRE = regexp.MustCompile(`\x1b\[[0-9;?]*[a-zA-Z]|\x1b\][^\x07]*\x07?`)
@@ -86,12 +106,12 @@ func lastMeaningfulLine(log []string) string {
 
 // lifecycle fan-out: in-process bus (SSE, wait=ready), configured webhook
 // subscribers, and the per-launch callbackUrl — one payload shape for all
-func announce(event string, s Session, killed bool) {
+func (a *app) announce(event string, s Session, killed bool) {
 	where := filepath.Base(s.Folder)
 	if s.Branch != nil {
 		where += " @ " + *s.Branch
 	}
-	failed := event == "session.exit" && !killed && (s.ExitCode == nil || *s.ExitCode != 0 || s.State == "error")
+	failed := event == evSessionExit && !killed && (s.ExitCode == nil || *s.ExitCode != 0 || s.State == stateError)
 	pairing := "null"
 	if s.PairingURL != nil {
 		pairing = *s.PairingURL
@@ -105,22 +125,22 @@ func announce(event string, s Session, killed bool) {
 	if failed {
 		exitTitle = "session failed: " + s.Name
 		suffix := ""
-		if s.State == "error" {
+		if s.State == stateError {
 			suffix = " (died before ready)"
 		}
 		exitMessage = fmt.Sprintf("%s exited with code %s%s", where, code, suffix)
 	}
 	titles := map[string]string{
-		"session.start": "session started: " + s.Name,
-		"session.ready": "session ready: " + s.Name,
-		"session.kill":  "session killed: " + s.Name,
-		"session.exit":  exitTitle,
+		evSessionStart: "session started: " + s.Name,
+		evSessionReady: "session ready: " + s.Name,
+		evSessionKill:  "session killed: " + s.Name,
+		evSessionExit:  exitTitle,
 	}
 	messages := map[string]string{
-		"session.start": where,
-		"session.ready": where + " — " + pairing,
-		"session.kill":  where,
-		"session.exit":  exitMessage,
+		evSessionStart: where,
+		evSessionReady: where + " — " + pairing,
+		evSessionKill:  where,
+		evSessionExit:  exitMessage,
 	}
 	title, ok := titles[event]
 	if !ok {
@@ -129,11 +149,11 @@ func announce(event string, s Session, killed bool) {
 	message := messages[event]
 	alsoMatch := []string{}
 	if failed {
-		alsoMatch = []string{"session.failed"}
+		alsoMatch = []string{evSessionFailed}
 	}
-	emit(event, map[string]any{"session": s}, emitOpts{title: title, message: message, alsoMatch: alsoMatch})
-	if s.CallbackURL != nil && event != "session.start" {
-		deliverWebhook(*s.CallbackURL, LifecycleEvent{
+	a.emit(event, map[string]any{"session": s}, emitOpts{title: title, message: message, alsoMatch: alsoMatch})
+	if s.CallbackURL != nil && event != evSessionStart {
+		a.deliverWebhook(*s.CallbackURL, LifecycleEvent{
 			Event:   event,
 			At:      nowISO(),
 			Title:   title,
@@ -174,17 +194,17 @@ func pathExists(p string) bool {
 	return err == nil
 }
 
-func recentLaunches(limit int) []RecentLaunch {
+func (a *app) recentLaunches(limit int) []RecentLaunch {
 	seen := map[string]bool{}
 	out := []RecentLaunch{}
-	entries := readJournal()
+	entries := a.readJournal()
 	for i := len(entries) - 1; i >= 0 && len(out) < limit; i-- {
 		e := entries[i]
 		folder := jStr(e, "folder")
-		if jStr(e, "event") != "session.start" || folder == "" {
+		if jStr(e, "event") != evSessionStart || folder == "" {
 			continue
 		}
-		if !pathExists(folder) || !withinRoots(folder) {
+		if !pathExists(folder) || !a.withinRoots(folder) {
 			continue
 		}
 		branch := jStr(e, "branch")
@@ -194,9 +214,9 @@ func recentLaunches(limit int) []RecentLaunch {
 			continue
 		}
 		seen[key] = true
-		spawnMode := rawSpawnMode
-		if spawnMode == "" {
-			spawnMode = "same-dir"
+		mode := rawSpawnMode
+		if mode == "" {
+			mode = string(spawnSameDir)
 		}
 		permissionMode := jStr(e, "permissionMode")
 		if permissionMode == "" {
@@ -206,7 +226,7 @@ func recentLaunches(limit int) []RecentLaunch {
 			Folder:         folder,
 			Name:           jStr(e, "name"),
 			Branch:         strPtr(branch),
-			SpawnMode:      spawnMode,
+			SpawnMode:      mode,
 			PermissionMode: permissionMode,
 			At:             jStr(e, "at"),
 			Stale:          branch != "" && !branchExists(folder, branch),
@@ -215,32 +235,26 @@ func recentLaunches(limit int) []RecentLaunch {
 	return out
 }
 
-var (
-	lostMu       sync.Mutex
-	lostCache    []LostSession
-	lostComputed bool
-)
-
-func listLostSessions() []LostSession {
+func (a *app) listLostSessions() []LostSession {
 	// snapshot live ids before taking lostMu — never hold both locks
 	liveIDs := map[string]bool{}
-	sessionsMu.Lock()
-	for id := range sessions {
+	a.sessionsMu.Lock()
+	for id := range a.sessions {
 		liveIDs[id] = true
 	}
-	sessionsMu.Unlock()
+	a.sessionsMu.Unlock()
 
-	lostMu.Lock()
-	defer lostMu.Unlock()
-	if lostComputed {
+	a.lostMu.Lock()
+	defer a.lostMu.Unlock()
+	if a.lostComputed {
 		// copy: a dismissal splicing lostCache must not race a caller still marshaling
-		return append([]LostSession(nil), lostCache...)
+		return append([]LostSession(nil), a.lostCache...)
 	}
-	entries := readJournal()
+	entries := a.readJournal()
 	terminated := map[string]bool{}
 	for _, e := range entries {
 		ev := jStr(e, "event")
-		if (ev == "session.exit" || ev == "session.kill") && jStr(e, "id") != "" {
+		if (ev == evSessionExit || ev == evSessionKill) && jStr(e, "id") != "" {
 			terminated[jStr(e, "id")] = true
 		}
 	}
@@ -249,7 +263,7 @@ func listLostSessions() []LostSession {
 	for _, e := range entries {
 		id := jStr(e, "id")
 		folder := jStr(e, "folder")
-		if jStr(e, "event") != "session.start" || id == "" || folder == "" {
+		if jStr(e, "event") != evSessionStart || id == "" || folder == "" {
 			continue
 		}
 		if terminated[id] || liveIDs[id] {
@@ -263,13 +277,13 @@ func listLostSessions() []LostSession {
 		if t, err := time.Parse(time.RFC3339, at); err == nil && t.Before(cutoff) {
 			continue
 		}
-		if !pathExists(folder) || !withinRoots(folder) {
+		if !pathExists(folder) || !a.withinRoots(folder) {
 			continue
 		}
 		branch := jStr(e, "branch")
-		spawnMode := jStr(e, "spawnMode")
-		if spawnMode == "" {
-			spawnMode = "same-dir"
+		mode := jStr(e, "spawnMode")
+		if mode == "" {
+			mode = string(spawnSameDir)
 		}
 		permissionMode := jStr(e, "permissionMode")
 		if permissionMode == "" {
@@ -281,16 +295,16 @@ func listLostSessions() []LostSession {
 				Folder:         folder,
 				Name:           jStr(e, "name"),
 				Branch:         strPtr(branch),
-				SpawnMode:      spawnMode,
+				SpawnMode:      mode,
 				PermissionMode: permissionMode,
 				At:             at,
 				Stale:          branch != "" && !branchExists(folder, branch),
 			},
 		})
 	}
-	lostCache = out
-	lostComputed = true
-	return append([]LostSession(nil), lostCache...)
+	a.lostCache = out
+	a.lostComputed = true
+	return append([]LostSession(nil), a.lostCache...)
 }
 
 /* ---------- kept worktrees (dirty orphans the sweeps refused to delete) ---------- */
@@ -303,27 +317,27 @@ type KeptWorktree struct {
 	Dirty  bool    `json:"dirty"`
 }
 
-func listKeptWorktrees() []KeptWorktree {
+func (a *app) listKeptWorktrees() []KeptWorktree {
 	out := []KeptWorktree{}
-	if !pathExists(wtBase) {
+	if !pathExists(a.wtBase) {
 		return out
 	}
 	live := map[string]bool{}
-	sessionsMu.Lock()
-	for _, s := range sessions {
+	a.sessionsMu.Lock()
+	for _, s := range a.sessions {
 		if s.WorktreePath != nil && *s.WorktreePath != "" {
 			live[*s.WorktreePath] = true
 		}
 	}
-	sessionsMu.Unlock()
-	repos, _ := os.ReadDir(wtBase)
+	a.sessionsMu.Unlock()
+	repos, _ := os.ReadDir(a.wtBase)
 	for _, repo := range repos {
-		ids, err := os.ReadDir(filepath.Join(wtBase, repo.Name()))
+		ids, err := os.ReadDir(filepath.Join(a.wtBase, repo.Name()))
 		if err != nil {
 			continue
 		}
 		for _, id := range ids {
-			wtPath := filepath.Join(wtBase, repo.Name(), id.Name())
+			wtPath := filepath.Join(a.wtBase, repo.Name(), id.Name())
 			if live[wtPath] {
 				continue // belongs to a running session
 			}
@@ -339,9 +353,9 @@ func listKeptWorktrees() []KeptWorktree {
 	return out
 }
 
-func forceRemoveWorktree(wtPath string) error {
+func (a *app) forceRemoveWorktree(wtPath string) error {
 	resolved := filepath.Clean(wtPath) // normalize
-	if !strings.HasPrefix(resolved, wtBase+"/") {
+	if !strings.HasPrefix(resolved, a.wtBase+"/") {
 		return errors.New("not a runner-managed worktree")
 	}
 	commonDir, err := gitOut(resolved, 5*time.Second, "rev-parse", "--path-format=absolute", "--git-common-dir")
@@ -364,35 +378,35 @@ func forceRemoveWorktree(wtPath string) error {
 		// unmerged work — keep the branch
 		_ = gitRun(mainRoot, 5*time.Second, "branch", "-d", wtBranch)
 	}
-	journal(map[string]any{"event": "worktree.force-removed", "wtPath": resolved})
+	a.journal(map[string]any{"event": "worktree.force-removed", "wtPath": resolved})
 	return nil
 }
 
-func listSessions() []Session {
-	sessionsMu.Lock()
-	out := make([]Session, 0, len(sessions))
-	for _, s := range sessions {
+func (a *app) listSessions() []Session {
+	a.sessionsMu.Lock()
+	out := make([]Session, 0, len(a.sessions))
+	for _, s := range a.sessions {
 		out = append(out, s.Session)
 	}
-	sessionsMu.Unlock()
+	a.sessionsMu.Unlock()
 	sort.Slice(out, func(i, j int) bool { return out[i].StartedAt > out[j].StartedAt })
 	return out
 }
 
-func getSession(id string) *Session {
-	sessionsMu.Lock()
-	defer sessionsMu.Unlock()
-	if s, ok := sessions[id]; ok {
+func (a *app) getSession(id string) *Session {
+	a.sessionsMu.Lock()
+	defer a.sessionsMu.Unlock()
+	if s, ok := a.sessions[id]; ok {
 		snap := s.Session
 		return &snap
 	}
 	return nil
 }
 
-func getSessionLog(id string) *string {
-	sessionsMu.Lock()
-	defer sessionsMu.Unlock()
-	if s, ok := sessions[id]; ok {
+func (a *app) getSessionLog(id string) *string {
+	a.sessionsMu.Lock()
+	defer a.sessionsMu.Unlock()
+	if s, ok := a.sessions[id]; ok {
 		joined := strings.Join(s.log, "")
 		return &joined
 	}
@@ -401,13 +415,13 @@ func getSessionLog(id string) *string {
 
 // Boot sweep: sessions are in-memory, so any worktree on disk at startup is an
 // orphan from a previous runner. Remove the clean ones; keep dirty ones and journal.
-func sweepOrphanWorktrees() {
-	if !pathExists(wtBase) {
+func (a *app) sweepOrphanWorktrees() {
+	if !pathExists(a.wtBase) {
 		return
 	}
-	repos, _ := os.ReadDir(wtBase)
+	repos, _ := os.ReadDir(a.wtBase)
 	for _, repo := range repos {
-		repoDir := filepath.Join(wtBase, repo.Name())
+		repoDir := filepath.Join(a.wtBase, repo.Name())
 		ids, err := os.ReadDir(repoDir)
 		if err != nil {
 			continue
@@ -436,9 +450,9 @@ func sweepOrphanWorktrees() {
 				return true
 			}()
 			if swept {
-				journal(map[string]any{"event": "worktree.swept", "wtPath": wtPath})
+				a.journal(map[string]any{"event": "worktree.swept", "wtPath": wtPath})
 			} else {
-				journal(map[string]any{"event": "worktree.kept", "wtPath": wtPath, "reason": "orphan is dirty or unresolvable"})
+				a.journal(map[string]any{"event": "worktree.kept", "wtPath": wtPath, "reason": "orphan is dirty or unresolvable"})
 			}
 		}
 	}
@@ -448,16 +462,16 @@ type createSessionOpts struct {
 	folder, name, spawnMode, branch, permissionMode, callbackURL, actor string
 }
 
-func createSession(opts createSessionOpts) (Session, error) {
+func (a *app) createSession(opts createSessionOpts) (Session, error) {
 	name := strings.TrimSpace(opts.name)
 	if name == "" {
 		name = filepath.Base(opts.folder) + "-" + randomID(4)
 	}
-	sessionsMu.Lock()
-	duplicate := pendingNames[name]
+	a.sessionsMu.Lock()
+	duplicate := a.pendingNames[name]
 	if !duplicate {
-		for _, s := range sessions {
-			if s.Name == name && s.State != "exited" && s.State != "error" {
+		for _, s := range a.sessions {
+			if s.Name == name && s.State != stateExited && s.State != stateError {
 				duplicate = true
 				break
 			}
@@ -466,21 +480,22 @@ func createSession(opts createSessionOpts) (Session, error) {
 	if !duplicate {
 		// reserve the name across the slow worktree/switch/spawn work below, so two
 		// concurrent launches can't both pass the duplicate check
-		pendingNames[name] = true
+		a.pendingNames[name] = true
 	}
-	sessionsMu.Unlock()
+	a.sessionsMu.Unlock()
 	if duplicate {
 		return Session{}, fmt.Errorf("a live session named \"%s\" already exists", name)
 	}
 	defer func() {
-		sessionsMu.Lock()
-		delete(pendingNames, name)
-		sessionsMu.Unlock()
+		a.sessionsMu.Lock()
+		delete(a.pendingNames, name)
+		a.sessionsMu.Unlock()
 	}()
 
-	spawnMode := "same-dir"
-	if opts.spawnMode == "worktree" {
-		spawnMode = "worktree"
+	// opts carries the raw request string; everything past here is typed
+	mode := spawnSameDir
+	if opts.spawnMode == string(spawnWorktree) {
+		mode = spawnWorktree
 	}
 	permissionMode := opts.permissionMode
 	if permissionMode == "" {
@@ -494,7 +509,7 @@ func createSession(opts createSessionOpts) (Session, error) {
 	baseCommit := ""
 	cwd := opts.folder
 	repoRootForCleanup := ""
-	if spawnMode == "worktree" {
+	if mode == spawnWorktree {
 		if opts.branch == "" {
 			return Session{}, errors.New("worktree mode requires a branch")
 		}
@@ -504,7 +519,7 @@ func createSession(opts createSessionOpts) (Session, error) {
 		}
 		branch = opts.branch
 		repoRootForCleanup = root
-		wt, err := addWorktree(root, branch, id) // worktree of the nearest repo root, cleaned up on exit
+		wt, err := a.addWorktree(root, branch, id) // worktree of the nearest repo root, cleaned up on exit
 		if err != nil {
 			return Session{}, err
 		}
@@ -539,7 +554,8 @@ func createSession(opts createSessionOpts) (Session, error) {
 		}
 	}
 
-	args := []string{"remote-control", "--name", name, "--spawn", "same-dir", "--permission-mode", permissionMode}
+	// always --spawn same-dir: the runner already handled worktree creation itself
+	args := []string{"remote-control", "--name", name, "--spawn", string(spawnSameDir), "--permission-mode", permissionMode}
 	// real PTY: the CLI prints its pairing URL and stays alive as it would in a terminal
 	cmd := exec.Command("claude", args...)
 	cmd.Dir = cwd
@@ -547,7 +563,7 @@ func createSession(opts createSessionOpts) (Session, error) {
 	ptmx, err := pty.StartWithSize(cmd, &pty.Winsize{Rows: 40, Cols: 120})
 	if err != nil {
 		if worktreePath != "" {
-			removeWorktree(repoRootForCleanup, worktreePath, wtBranch, baseCommit)
+			a.removeWorktree(repoRootForCleanup, worktreePath, wtBranch, baseCommit)
 		}
 		return Session{}, err
 	}
@@ -557,11 +573,11 @@ func createSession(opts createSessionOpts) (Session, error) {
 			ID:             id,
 			Name:           name,
 			Folder:         opts.folder,
-			SpawnMode:      spawnMode,
+			SpawnMode:      mode,
 			Branch:         strPtr(branch),
 			WorktreePath:   strPtr(worktreePath),
 			PermissionMode: permissionMode,
-			State:          "starting",
+			State:          stateStarting,
 			PairingURL:     nil,
 			CallbackURL:    strPtr(opts.callbackURL),
 			StartedAt:      nowISO(),
@@ -576,32 +592,32 @@ func createSession(opts createSessionOpts) (Session, error) {
 		wtBranch:   wtBranch,
 		baseCommit: baseCommit,
 	}
-	sessionsMu.Lock()
-	sessions[id] = s
+	a.sessionsMu.Lock()
+	a.sessions[id] = s
 	snap := s.Session
-	sessionsMu.Unlock()
+	a.sessionsMu.Unlock()
 
 	entry := map[string]any{
-		"event":          "session.start",
+		"event":          evSessionStart,
 		"id":             id,
 		"name":           name,
 		"folder":         opts.folder,
-		"spawnMode":      spawnMode,
+		"spawnMode":      mode,
 		"branch":         strPtr(branch),
 		"permissionMode": permissionMode,
 	}
 	if opts.actor != "" {
 		entry["actor"] = opts.actor
 	}
-	journal(entry)
-	announce("session.start", snap, false)
+	a.journal(entry)
+	a.announce(evSessionStart, snap, false)
 
-	go readLoop(s)
+	go a.readLoop(s)
 
 	return snap, nil
 }
 
-func readLoop(s *liveSession) {
+func (a *app) readLoop(s *liveSession) {
 	buf := make([]byte, 4096)
 	for {
 		n, err := s.ptmx.Read(buf)
@@ -609,7 +625,7 @@ func readLoop(s *liveSession) {
 			chunk := string(buf[:n])
 			var readySnap *Session
 			var readyURL string
-			sessionsMu.Lock()
+			a.sessionsMu.Lock()
 			s.LastOutputAt = strPtr(nowISO())
 			text := ansiRE.ReplaceAllString(chunk, "")
 			s.log = append(s.log, text)
@@ -623,17 +639,17 @@ func readLoop(s *liveSession) {
 				if m := urlRE.FindString(strings.Join(s.log, "")); m != "" {
 					url := trailingRE.ReplaceAllString(m, "")
 					s.PairingURL = &url
-					s.State = "ready"
+					s.State = stateReady
 					readyURL = url
 					snap := s.Session
 					readySnap = &snap
 				}
 			}
 			id := s.ID
-			sessionsMu.Unlock()
+			a.sessionsMu.Unlock()
 			if readySnap != nil {
-				journal(map[string]any{"event": "session.ready", "id": id, "pairingUrl": readyURL})
-				announce("session.ready", *readySnap, false)
+				a.journal(map[string]any{"event": evSessionReady, "id": id, "pairingUrl": readyURL})
+				a.announce(evSessionReady, *readySnap, false)
 			}
 		}
 		if err != nil {
@@ -656,11 +672,11 @@ func readLoop(s *liveSession) {
 		}
 	}
 
-	sessionsMu.Lock()
-	if s.State == "starting" {
-		s.State = "error"
+	a.sessionsMu.Lock()
+	if s.State == stateStarting {
+		s.State = stateError
 	} else {
-		s.State = "exited"
+		s.State = stateExited
 	}
 	s.ExitedAt = strPtr(nowISO())
 	s.ExitCode = intPtr(exitCode)
@@ -677,20 +693,20 @@ func readLoop(s *liveSession) {
 	}
 	wtBranch, baseCommit := s.wtBranch, s.baseCommit
 	snap := s.Session
-	sessionsMu.Unlock()
+	a.sessionsMu.Unlock()
 
 	if wtPath != "" {
-		removeWorktree(cleanupRoot, wtPath, wtBranch, baseCommit)
+		a.removeWorktree(cleanupRoot, wtPath, wtBranch, baseCommit)
 	}
-	journal(map[string]any{"event": "session.exit", "id": id, "code": exitCode})
-	announce("session.exit", snap, killed)
+	a.journal(map[string]any{"event": evSessionExit, "id": id, "code": exitCode})
+	a.announce(evSessionExit, snap, killed)
 }
 
-func killSession(id, actor string) *Session {
-	sessionsMu.Lock()
-	s, ok := sessions[id]
+func (a *app) killSession(id, actor string) *Session {
+	a.sessionsMu.Lock()
+	s, ok := a.sessions[id]
 	if !ok {
-		sessionsMu.Unlock()
+		a.sessionsMu.Unlock()
 		return nil
 	}
 	s.killed = true // set before the kill so onExit never notifies for user-initiated stops
@@ -698,37 +714,37 @@ func killSession(id, actor string) *Session {
 		_ = s.cmd.Process.Signal(syscall.SIGTERM) // pty close also HUPs the whole session tree; already gone is fine
 	}
 	snap := s.Session
-	sessionsMu.Unlock()
+	a.sessionsMu.Unlock()
 
-	entry := map[string]any{"event": "session.kill", "id": id}
+	entry := map[string]any{"event": evSessionKill, "id": id}
 	if actor != "" {
 		entry["actor"] = actor
 	}
-	journal(entry)
-	announce("session.kill", snap, true)
+	a.journal(entry)
+	a.announce(evSessionKill, snap, true)
 	return &snap
 }
 
-func removeSession(id string) (bool, error) {
-	sessionsMu.Lock()
-	s, ok := sessions[id]
+func (a *app) removeSession(id string) (bool, error) {
+	a.sessionsMu.Lock()
+	s, ok := a.sessions[id]
 	if !ok {
-		sessionsMu.Unlock()
+		a.sessionsMu.Unlock()
 		// lost-session headstones dismiss through the same endpoint
-		lostMu.Lock()
-		defer lostMu.Unlock()
-		for i, l := range lostCache {
+		a.lostMu.Lock()
+		defer a.lostMu.Unlock()
+		for i, l := range a.lostCache {
 			if l.ID == id {
-				lostCache = append(lostCache[:i], lostCache[i+1:]...)
+				a.lostCache = append(a.lostCache[:i], a.lostCache[i+1:]...)
 				return true, nil
 			}
 		}
 		return false, nil
 	}
-	defer sessionsMu.Unlock()
-	if s.State != "exited" && s.State != "error" {
+	defer a.sessionsMu.Unlock()
+	if s.State != stateExited && s.State != stateError {
 		return false, errors.New("session is still live; kill it first")
 	}
-	delete(sessions, id)
+	delete(a.sessions, id)
 	return true, nil
 }

@@ -2,12 +2,14 @@ package main
 
 import (
 	"context"
+	"crypto/subtle"
 	"encoding/json"
+	"errors"
 	"fmt"
 	"io"
-	"math"
 	"net/http"
 	"os"
+	"reflect"
 	"regexp"
 	"strconv"
 	"strings"
@@ -22,11 +24,21 @@ import (
 // invalid_param, invalid_path, invalid_config, outside_roots, not_found, not_ready,
 // ready_timeout, launch_failed, session_live, job_live, worktree_error, not_implemented.
 
-var allScopes = []string{"read", "launch", "admin"}
+// scope names one capability a token can grant; the wire format stays the
+// plain string ("read" etc.) in config files and error messages.
+type scope string
+
+const (
+	scopeRead   scope = "read"   // browse, inspect, watch events
+	scopeLaunch scope = "launch" // spawn and kill sessions and jobs
+	scopeAdmin  scope = "admin"  // config writes, worktree force-removal
+)
+
+var allScopes = []scope{scopeRead, scopeLaunch, scopeAdmin}
 
 type apiActor struct {
 	name   string
-	scopes map[string]bool
+	scopes map[scope]bool
 }
 
 type actorCtxKey struct{}
@@ -35,11 +47,11 @@ func actorOf(r *http.Request) apiActor {
 	if a, ok := r.Context().Value(actorCtxKey{}).(apiActor); ok {
 		return a
 	}
-	return apiActor{name: "anonymous", scopes: map[string]bool{}}
+	return apiActor{name: "anonymous", scopes: map[scope]bool{}}
 }
 
-func scopeSet(scopes []string) map[string]bool {
-	set := make(map[string]bool, len(scopes))
+func scopeSet(scopes []scope) map[scope]bool {
+	set := make(map[scope]bool, len(scopes))
 	for _, s := range scopes {
 		set[s] = true
 	}
@@ -77,76 +89,6 @@ func writeText(w http.ResponseWriter, status int, s string) {
 
 var httpURL = regexp.MustCompile(`^https?://`)
 
-// jsTruthy mirrors JS truthiness for a decoded JSON value: null/false/0/NaN/""
-// are falsy, everything else (including empty arrays and objects) is truthy.
-func jsTruthy(v any) bool {
-	switch x := v.(type) {
-	case nil:
-		return false
-	case bool:
-		return x
-	case float64:
-		return x != 0 && !math.IsNaN(x)
-	case string:
-		return x != ""
-	default:
-		return true
-	}
-}
-
-// jsNumberOr mirrors `Number(v) || fallback`: NaN and 0 both yield the fallback.
-func jsNumberOr(v any, fallback float64) float64 {
-	var n float64
-	switch x := v.(type) {
-	case float64:
-		n = x
-	case bool:
-		if x {
-			n = 1
-		}
-	case string:
-		s := strings.TrimSpace(x)
-		if s == "" {
-			n = 0
-		} else if f, err := strconv.ParseFloat(s, 64); err == nil {
-			n = f
-		} else {
-			return fallback // NaN
-		}
-	default: // null/undefined/objects → NaN or 0; either way falsy
-		return fallback
-	}
-	if n == 0 || math.IsNaN(n) {
-		return fallback
-	}
-	return n
-}
-
-// jsDisplay renders a decoded JSON value the way a JS template literal would —
-// used only inside error messages.
-func jsDisplay(v any) string {
-	switch x := v.(type) {
-	case nil:
-		// JSON null interpolates as "null" in TS template literals (undefined
-		// can never arrive through JSON)
-		return "null"
-	case string:
-		return x
-	case float64:
-		return strconv.FormatFloat(x, 'f', -1, 64)
-	case bool:
-		return strconv.FormatBool(x)
-	default:
-		b, _ := json.Marshal(x)
-		return string(b)
-	}
-}
-
-func strField(v any) string {
-	s, _ := v.(string)
-	return s
-}
-
 // nonNil guarantees JSON `[]` (never `null`) for list responses.
 func nonNil[T any](s []T) []T {
 	if s == nil {
@@ -155,39 +97,58 @@ func nonNil[T any](s []T) []T {
 	return s
 }
 
-// readJSONBody mirrors `await c.req.json().catch(() => null)` followed by the
-// `!body` gate: a parse failure or a falsy top-level value means invalid_json.
-// A truthy non-object parses fine in JS but every property read is undefined,
-// so it comes back as an empty map here.
-func readJSONBody(r *http.Request) (map[string]any, bool) {
+// decodeBody unmarshals the request body into dst and writes the 400 itself
+// on failure: malformed JSON (or a non-object body) is invalid_json, a field
+// of the wrong JSON type is invalid_param. Unknown fields are ignored.
+func decodeBody(w http.ResponseWriter, r *http.Request, dst any) bool {
 	data, err := io.ReadAll(r.Body)
 	if err != nil {
-		return nil, false
+		apiErr(w, 400, "invalid_json", "request body must be valid JSON")
+		return false
 	}
-	var v any
-	if err := json.Unmarshal(data, &v); err != nil {
-		return nil, false
+	if err := json.Unmarshal(data, dst); err != nil {
+		var typeErr *json.UnmarshalTypeError
+		if errors.As(err, &typeErr) && typeErr.Field != "" {
+			apiErr(w, 400, "invalid_param", fmt.Sprintf("%s must be a JSON %s", typeErr.Field, jsonTypeName(typeErr.Type)))
+		} else {
+			apiErr(w, 400, "invalid_json", "request body must be valid JSON")
+		}
+		return false
 	}
-	if !jsTruthy(v) {
-		return nil, false
+	return true
+}
+
+// jsonTypeName names the Go target type in the client's vocabulary — error
+// messages should say "array", not "[]string".
+func jsonTypeName(t reflect.Type) string {
+	switch t.Kind() {
+	case reflect.Bool:
+		return "boolean"
+	case reflect.Float32, reflect.Float64,
+		reflect.Int, reflect.Int8, reflect.Int16, reflect.Int32, reflect.Int64,
+		reflect.Uint, reflect.Uint8, reflect.Uint16, reflect.Uint32, reflect.Uint64:
+		return "number"
+	case reflect.String:
+		return "string"
+	case reflect.Slice, reflect.Array:
+		return "array"
+	case reflect.Map, reflect.Struct:
+		return "object"
+	default:
+		return t.String()
 	}
-	m, ok := v.(map[string]any)
-	if !ok {
-		m = map[string]any{}
-	}
-	return m, true
 }
 
 // block until the session pairs, dies, or the deadline passes — 300ms poll is
 // plenty against a multi-second provision and immune to event races
-func waitForReady(id string, timeout time.Duration) string {
+func (a *app) waitForReady(id string, timeout time.Duration) string {
 	deadline := time.Now().Add(timeout)
 	for {
-		s := getSession(id)
-		if s == nil || s.State == "exited" || s.State == "error" {
+		s := a.getSession(id)
+		if s == nil || s.State == stateExited || s.State == stateError {
 			return "dead"
 		}
-		if s.State == "ready" {
+		if s.State == stateReady {
 			return "ready"
 		}
 		if !time.Now().Before(deadline) {
@@ -198,11 +159,11 @@ func waitForReady(id string, timeout time.Duration) string {
 }
 
 // known token, missing scope → 403 (vs 401 for no/unknown token)
-func need(scope string, h http.HandlerFunc) http.HandlerFunc {
+func need(s scope, h http.HandlerFunc) http.HandlerFunc {
 	return func(w http.ResponseWriter, r *http.Request) {
 		act := actorOf(r)
-		if !act.scopes[scope] {
-			apiErr(w, 403, "insufficient_scope", fmt.Sprintf("token \"%s\" lacks the %s scope", act.name, scope))
+		if !act.scopes[s] {
+			apiErr(w, 403, "insufficient_scope", fmt.Sprintf("token \"%s\" lacks the %s scope", act.name, s))
 			return
 		}
 		h(w, r)
@@ -234,16 +195,23 @@ func qrSVG(content string) (string, error) {
 	return b.String(), nil
 }
 
+// tokenEqual compares in constant time so response latency can't confirm a
+// partially-guessed token. Length still leaks (ConstantTimeCompare bails on
+// mismatched lengths) — fine, tokens are random, not structured.
+func tokenEqual(a, b string) bool {
+	return subtle.ConstantTimeCompare([]byte(a), []byte(b)) == 1
+}
+
 // Every route requires a token when any is configured; the resolved actor
 // (name + scopes) travels on the request context and into the journal.
 // ?token= is accepted too because <img> tags (the QR) and EventSource can't send headers.
-func authMiddleware(cfg *Config, next http.Handler) http.Handler {
+func (a *app) authMiddleware(next http.Handler) http.Handler {
 	return http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
-		configMu.Lock()
-		authToken := cfg.AuthToken
-		tokens := make([]TokenConfig, len(cfg.Tokens))
-		copy(tokens, cfg.Tokens)
-		configMu.Unlock()
+		a.configMu.Lock()
+		authToken := a.cfg.AuthToken
+		tokens := make([]TokenConfig, len(a.cfg.Tokens))
+		copy(tokens, a.cfg.Tokens)
+		a.configMu.Unlock()
 
 		var act apiActor
 		if authToken == "" && len(tokens) == 0 {
@@ -257,15 +225,16 @@ func authMiddleware(cfg *Config, next http.Handler) http.Handler {
 				token = r.URL.Query().Get("token")
 			}
 			switch {
-			case token != "" && authToken != "" && token == authToken:
+			case token != "" && authToken != "" && tokenEqual(token, authToken):
 				act = apiActor{name: "owner", scopes: scopeSet(allScopes)}
 			default:
 				var entry *TokenConfig
 				if token != "" {
+					// compare against every entry — no early exit on match, so
+					// timing doesn't narrow down which entry (if any) it was
 					for i := range tokens {
-						if tokens[i].Token == token {
+						if tokenEqual(token, tokens[i].Token) && entry == nil {
 							entry = &tokens[i]
-							break
 						}
 					}
 				}
@@ -274,11 +243,11 @@ func authMiddleware(cfg *Config, next http.Handler) http.Handler {
 					return
 				}
 				// unknown scope strings are filtered out rather than rejected
-				scopes := map[string]bool{}
+				scopes := map[scope]bool{}
 				for _, s := range entry.Scopes {
 					for _, known := range allScopes {
-						if s == known {
-							scopes[s] = true
+						if scope(s) == known {
+							scopes[known] = true
 						}
 					}
 				}
@@ -290,23 +259,55 @@ func authMiddleware(cfg *Config, next http.Handler) http.Handler {
 	})
 }
 
+type createSessionRequest struct {
+	Folder         string `json:"folder"`
+	Name           string `json:"name"`
+	SpawnMode      string `json:"spawnMode"`
+	Branch         string `json:"branch"`
+	PermissionMode string `json:"permissionMode"`
+	// pointers so "sent but empty/zero" still fails validation while "absent"
+	// falls back cleanly
+	CallbackURL *string  `json:"callbackUrl"`
+	TimeoutMs   *float64 `json:"timeoutMs"` // only meaningful with ?wait=ready
+}
+
+type createJobRequest struct {
+	Folder         string   `json:"folder"`
+	Prompt         string   `json:"prompt"`
+	SpawnMode      string   `json:"spawnMode"`
+	Branch         string   `json:"branch"`
+	PermissionMode string   `json:"permissionMode"`
+	CallbackURL    *string  `json:"callbackUrl"`
+	TimeoutMs      *float64 `json:"timeoutMs"`
+	// the launch console's wired-for-v1 toggles: accepted, never silently ignored
+	Isolation bool `json:"isolation"`
+	Docker    bool `json:"docker"`
+}
+
+type putConfigRequest struct {
+	// pointers keep present-vs-absent apart — PUT /config is a partial update
+	Roots      *[]string        `json:"roots"`
+	ShowHidden *bool            `json:"showHidden"`
+	Webhooks   *[]WebhookConfig `json:"webhooks"`
+}
+
 // One sub-handler, mounted at /api/v1 (canonical) and /api (deprecated alias for one release).
-func createAPI(cfg *Config, persistConfig func()) http.Handler {
+func (a *app) createAPI() http.Handler {
 	mux := http.NewServeMux()
 
-	mux.HandleFunc("GET /roots", need("read", func(w http.ResponseWriter, r *http.Request) {
+	mux.HandleFunc("GET /roots", need(scopeRead, func(w http.ResponseWriter, r *http.Request) {
 		writeJSON(w, 200, struct {
 			Roots []FolderEntry `json:"roots"`
-		}{nonNil(listRoots())})
+		}{nonNil(a.listRoots())})
 	}))
 
-	mux.HandleFunc("GET /browse", need("read", func(w http.ResponseWriter, r *http.Request) {
+	mux.HandleFunc("GET /browse", need(scopeRead, func(w http.ResponseWriter, r *http.Request) {
 		path := r.URL.Query().Get("path")
 		if path == "" {
 			apiErr(w, 400, "missing_param", "path required")
 			return
 		}
-		result, err := browse(path)
+		result, err := a.browse(path)
 		if err != nil {
 			apiErr(w, 400, "invalid_path", err.Error())
 			return
@@ -314,13 +315,13 @@ func createAPI(cfg *Config, persistConfig func()) http.Handler {
 		writeJSON(w, 200, result)
 	}))
 
-	mux.HandleFunc("GET /branches", need("read", func(w http.ResponseWriter, r *http.Request) {
+	mux.HandleFunc("GET /branches", need(scopeRead, func(w http.ResponseWriter, r *http.Request) {
 		path := r.URL.Query().Get("path")
 		if path == "" {
 			apiErr(w, 400, "missing_param", "path required")
 			return
 		}
-		list, err := branchList(path)
+		list, err := a.branchList(path)
 		if err != nil {
 			apiErr(w, 400, "invalid_path", err.Error())
 			return
@@ -330,12 +331,12 @@ func createAPI(cfg *Config, persistConfig func()) http.Handler {
 		}{nonNil(list)})
 	}))
 
-	mux.HandleFunc("GET /config", need("read", func(w http.ResponseWriter, r *http.Request) {
-		configMu.Lock()
-		roots := append([]string(nil), cfg.Roots...)
-		showHidden := cfg.ShowHidden
-		webhooks := append([]WebhookConfig(nil), cfg.Webhooks...)
-		configMu.Unlock()
+	mux.HandleFunc("GET /config", need(scopeRead, func(w http.ResponseWriter, r *http.Request) {
+		a.configMu.Lock()
+		roots := append([]string(nil), a.cfg.Roots...)
+		showHidden := a.cfg.ShowHidden
+		webhooks := append([]WebhookConfig(nil), a.cfg.Webhooks...)
+		a.configMu.Unlock()
 		if webhooks == nil {
 			webhooks = []WebhookConfig{}
 		}
@@ -346,99 +347,78 @@ func createAPI(cfg *Config, persistConfig func()) http.Handler {
 		}{nonNil(roots), showHidden, webhooks})
 	}))
 
-	mux.HandleFunc("PUT /config", need("admin", func(w http.ResponseWriter, r *http.Request) {
-		body, ok := readJSONBody(r)
-		if !ok {
-			apiErr(w, 400, "invalid_json", "request body must be valid JSON")
+	mux.HandleFunc("PUT /config", need(scopeAdmin, func(w http.ResponseWriter, r *http.Request) {
+		var req putConfigRequest
+		if !decodeBody(w, r, &req) {
 			return
 		}
 
-		configMu.Lock()
-		defer configMu.Unlock()
-
-		if rootsV, present := body["roots"]; present {
-			arr, isArr := rootsV.([]any)
-			if !isArr || len(arr) == 0 {
+		// validate everything before touching cfg so a bad field can't leave
+		// a half-applied config in memory
+		if req.Roots != nil {
+			if len(*req.Roots) == 0 {
 				apiErr(w, 400, "invalid_config", "roots must be a non-empty list")
 				return
 			}
-			roots := make([]string, 0, len(arr))
-			for _, rv := range arr {
-				s, isStr := rv.(string)
-				if !isStr || !strings.HasPrefix(s, "/") {
-					apiErr(w, 400, "invalid_config", fmt.Sprintf("root must be an absolute path: %s", jsDisplay(rv)))
+			for _, root := range *req.Roots {
+				if !strings.HasPrefix(root, "/") {
+					apiErr(w, 400, "invalid_config", fmt.Sprintf("root must be an absolute path: %s", root))
 					return
 				}
-				if st, err := os.Stat(s); err != nil || !st.IsDir() {
-					apiErr(w, 400, "invalid_config", fmt.Sprintf("not a directory: %s", s))
+				if st, err := os.Stat(root); err != nil || !st.IsDir() {
+					apiErr(w, 400, "invalid_config", fmt.Sprintf("not a directory: %s", root))
 					return
 				}
-				roots = append(roots, s)
 			}
-			cfg.Roots = roots
 		}
-		if shV, present := body["showHidden"]; present {
-			cfg.ShowHidden = jsTruthy(shV)
-		}
-		if whV, present := body["webhooks"]; present {
-			arr, isArr := whV.([]any)
-			if !isArr {
-				apiErr(w, 400, "invalid_config", "webhooks must be a list")
-				return
-			}
-			hooks := make([]WebhookConfig, 0, len(arr))
-			for _, wv := range arr {
-				wm, _ := wv.(map[string]any)
-				var urlV any
-				if wm != nil {
-					urlV = wm["url"]
-				}
-				u, isStr := urlV.(string)
-				if !isStr || !httpURL.MatchString(u) {
-					apiErr(w, 400, "invalid_config", fmt.Sprintf("webhook url must be http(s): %s", jsDisplay(urlV)))
+		if req.Webhooks != nil {
+			for _, hook := range *req.Webhooks {
+				if !httpURL.MatchString(hook.URL) {
+					apiErr(w, 400, "invalid_config", fmt.Sprintf("webhook url must be http(s): %s", hook.URL))
 					return
 				}
-				hook := WebhookConfig{URL: u}
-				if evV, evPresent := wm["events"]; evPresent {
-					evArr, evIsArr := evV.([]any)
-					if !evIsArr {
+				if hook.Events == nil {
+					continue
+				}
+				for _, e := range *hook.Events {
+					if strings.TrimSpace(e) == "" {
 						apiErr(w, 400, "invalid_config", "webhook events must be a list of non-empty strings")
 						return
 					}
-					events := make([]string, 0, len(evArr))
-					for _, e := range evArr {
-						s, isStr := e.(string)
-						if !isStr || strings.TrimSpace(s) == "" {
-							apiErr(w, 400, "invalid_config", "webhook events must be a list of non-empty strings")
-							return
-						}
-						events = append(events, s)
-					}
-					hook.Events = &events
 				}
-				hooks = append(hooks, hook)
 			}
-			cfg.Webhooks = hooks
 		}
-		persistConfig()
+
+		a.configMu.Lock()
+		defer a.configMu.Unlock()
+		if req.Roots != nil {
+			a.cfg.Roots = *req.Roots
+		}
+		if req.ShowHidden != nil {
+			a.cfg.ShowHidden = *req.ShowHidden
+		}
+		if req.Webhooks != nil {
+			a.cfg.Webhooks = *req.Webhooks
+		}
+		a.applyAndPersistConfig()
 		writeJSON(w, 200, struct {
 			OK bool `json:"ok"`
 		}{true})
 	}))
 
-	mux.HandleFunc("GET /worktrees", need("read", func(w http.ResponseWriter, r *http.Request) {
+	mux.HandleFunc("GET /worktrees", need(scopeRead, func(w http.ResponseWriter, r *http.Request) {
 		writeJSON(w, 200, struct {
 			Worktrees []KeptWorktree `json:"worktrees"`
-		}{nonNil(listKeptWorktrees())})
+		}{nonNil(a.listKeptWorktrees())})
 	}))
 
-	mux.HandleFunc("DELETE /worktrees", need("admin", func(w http.ResponseWriter, r *http.Request) {
+	mux.HandleFunc("DELETE /worktrees", need(scopeAdmin, func(w http.ResponseWriter, r *http.Request) {
 		path := r.URL.Query().Get("path")
 		if path == "" {
 			apiErr(w, 400, "missing_param", "path required")
 			return
 		}
-		if err := forceRemoveWorktree(path); err != nil {
+		if err := a.forceRemoveWorktree(path); err != nil {
 			apiErr(w, 400, "worktree_error", err.Error())
 			return
 		}
@@ -447,24 +427,31 @@ func createAPI(cfg *Config, persistConfig func()) http.Handler {
 		}{true})
 	}))
 
-	mux.HandleFunc("GET /sessions", need("read", func(w http.ResponseWriter, r *http.Request) {
+	mux.HandleFunc("GET /sessions", need(scopeRead, func(w http.ResponseWriter, r *http.Request) {
 		writeJSON(w, 200, struct {
 			Sessions []Session     `json:"sessions"`
 			Lost     []LostSession `json:"lost"`
-		}{nonNil(listSessions()), nonNil(listLostSessions())})
+		}{nonNil(a.listSessions()), nonNil(a.listLostSessions())})
 	}))
 
-	mux.HandleFunc("GET /journal/recent", need("read", func(w http.ResponseWriter, r *http.Request) {
-		// Ceil: a fractional ?limit=2.5 yields 3 entries, like the TS < comparison
-		limit := math.Ceil(math.Min(20, math.Max(1, jsNumberOr(r.URL.Query().Get("limit"), 5))))
+	mux.HandleFunc("GET /journal/recent", need(scopeRead, func(w http.ResponseWriter, r *http.Request) {
+		limit := 5
+		if q := r.URL.Query().Get("limit"); q != "" {
+			n, err := strconv.Atoi(q)
+			if err != nil {
+				apiErr(w, 400, "invalid_param", "limit must be an integer")
+				return
+			}
+			limit = min(20, max(1, n))
+		}
 		writeJSON(w, 200, struct {
 			Recent []RecentLaunch `json:"recent"`
-		}{nonNil(recentLaunches(int(limit)))})
+		}{nonNil(a.recentLaunches(limit))})
 	}))
 
 	// Live lifecycle stream (SSE): session.start/ready/exit/kill as they happen.
 	// No replay — reconnecting clients should re-list first; the journal is the history.
-	mux.HandleFunc("GET /events", need("read", func(w http.ResponseWriter, r *http.Request) {
+	mux.HandleFunc("GET /events", need(scopeRead, func(w http.ResponseWriter, r *http.Request) {
 		fl, ok := w.(http.Flusher)
 		if !ok {
 			http.Error(w, "streaming unsupported", http.StatusInternalServerError)
@@ -478,7 +465,7 @@ func createAPI(cfg *Config, persistConfig func()) http.Handler {
 		// buffered channel keeps the emit goroutine from ever blocking on a
 		// slow client; a full buffer drops frames (clients re-list on reconnect)
 		ch := make(chan LifecycleEvent, 64)
-		unsub := onEvent(func(e LifecycleEvent) {
+		unsub := a.onEvent(func(e LifecycleEvent) {
 			select {
 			case ch <- e:
 			default:
@@ -512,37 +499,34 @@ func createAPI(cfg *Config, persistConfig func()) http.Handler {
 		}
 	}))
 
-	mux.HandleFunc("POST /sessions", need("launch", func(w http.ResponseWriter, r *http.Request) {
-		body, ok := readJSONBody(r)
-		if !ok {
-			apiErr(w, 400, "invalid_json", "request body must be valid JSON")
+	mux.HandleFunc("POST /sessions", need(scopeLaunch, func(w http.ResponseWriter, r *http.Request) {
+		var req createSessionRequest
+		if !decodeBody(w, r, &req) {
 			return
 		}
-		if !jsTruthy(body["folder"]) {
+		if req.Folder == "" {
 			apiErr(w, 400, "missing_param", "folder required")
 			return
 		}
-		folder := strField(body["folder"])
-		if !withinRoots(folder) {
+		if !a.withinRoots(req.Folder) {
 			apiErr(w, 400, "outside_roots", "folder outside configured roots")
 			return
 		}
 		var callbackURL string
-		if cb, present := body["callbackUrl"]; present {
-			s, isStr := cb.(string)
-			if !isStr || !httpURL.MatchString(s) {
+		if req.CallbackURL != nil {
+			if !httpURL.MatchString(*req.CallbackURL) {
 				apiErr(w, 400, "invalid_param", "callbackUrl must be an http(s) URL")
 				return
 			}
-			callbackURL = s
+			callbackURL = *req.CallbackURL
 		}
 
-		session, err := createSession(createSessionOpts{
-			folder:         folder,
-			name:           strField(body["name"]),
-			spawnMode:      strField(body["spawnMode"]),
-			branch:         strField(body["branch"]),
-			permissionMode: strField(body["permissionMode"]),
+		session, err := a.createSession(createSessionOpts{
+			folder:         req.Folder,
+			name:           req.Name,
+			spawnMode:      req.SpawnMode,
+			branch:         req.Branch,
+			permissionMode: req.PermissionMode,
 			callbackURL:    callbackURL,
 			actor:          actorOf(r).name,
 		})
@@ -557,10 +541,13 @@ func createAPI(cfg *Config, persistConfig func()) http.Handler {
 		}
 
 		// ?wait=ready: one round-trip to a pairing URL for scripts and automations
-		timeoutMs := math.Min(300000, math.Max(1000, jsNumberOr(body["timeoutMs"], 60000)))
-		outcome := waitForReady(session.ID, time.Duration(timeoutMs*float64(time.Millisecond)))
+		timeoutMs := 60000.0
+		if req.TimeoutMs != nil {
+			timeoutMs = min(300000, max(1000, *req.TimeoutMs))
+		}
+		outcome := a.waitForReady(session.ID, time.Duration(timeoutMs*float64(time.Millisecond)))
 		latest := session
-		if s := getSession(session.ID); s != nil {
+		if s := a.getSession(session.ID); s != nil {
 			latest = *s
 		}
 		switch outcome {
@@ -583,51 +570,47 @@ func createAPI(cfg *Config, persistConfig func()) http.Handler {
 
 	/* ---------- headless jobs: claude -p, no phone in the loop ---------- */
 
-	mux.HandleFunc("POST /jobs", need("launch", func(w http.ResponseWriter, r *http.Request) {
-		body, ok := readJSONBody(r)
-		if !ok {
-			apiErr(w, 400, "invalid_json", "request body must be valid JSON")
+	mux.HandleFunc("POST /jobs", need(scopeLaunch, func(w http.ResponseWriter, r *http.Request) {
+		var req createJobRequest
+		if !decodeBody(w, r, &req) {
 			return
 		}
-		if !jsTruthy(body["folder"]) {
+		if req.Folder == "" {
 			apiErr(w, 400, "missing_param", "folder required")
 			return
 		}
-		prompt, isStr := body["prompt"].(string)
-		if !isStr || strings.TrimSpace(prompt) == "" {
+		if strings.TrimSpace(req.Prompt) == "" {
 			apiErr(w, 400, "missing_param", "prompt required")
 			return
 		}
-		folder := strField(body["folder"])
-		if !withinRoots(folder) {
+		if !a.withinRoots(req.Folder) {
 			apiErr(w, 400, "outside_roots", "folder outside configured roots")
 			return
 		}
 		var callbackURL string
-		if cb, present := body["callbackUrl"]; present {
-			s, isStr := cb.(string)
-			if !isStr || !httpURL.MatchString(s) {
+		if req.CallbackURL != nil {
+			if !httpURL.MatchString(*req.CallbackURL) {
 				apiErr(w, 400, "invalid_param", "callbackUrl must be an http(s) URL")
 				return
 			}
-			callbackURL = s
+			callbackURL = *req.CallbackURL
 		}
 		// honest about the launch console's wired-for-v1 toggle: accepted, never ignored
-		if jsTruthy(body["isolation"]) || jsTruthy(body["docker"]) {
+		if req.Isolation || req.Docker {
 			apiErr(w, 501, "not_implemented", "Docker isolation is not implemented yet — jobs run as the runner's user")
 			return
 		}
 		// absent → -1 so jobs.go applies its default; an explicit 0 clamps to the 1s floor
 		timeoutMs := -1
-		if v, present := body["timeoutMs"]; present && v != nil {
-			timeoutMs = int(jsNumberOr(v, 0))
+		if req.TimeoutMs != nil {
+			timeoutMs = int(*req.TimeoutMs)
 		}
-		job, err := createJob(createJobOpts{
-			folder:         folder,
-			prompt:         prompt,
-			spawnMode:      strField(body["spawnMode"]),
-			branch:         strField(body["branch"]),
-			permissionMode: strField(body["permissionMode"]),
+		job, err := a.createJob(createJobOpts{
+			folder:         req.Folder,
+			prompt:         req.Prompt,
+			spawnMode:      req.SpawnMode,
+			branch:         req.Branch,
+			permissionMode: req.PermissionMode,
 			timeoutMs:      timeoutMs,
 			callbackURL:    callbackURL,
 			actor:          actorOf(r).name,
@@ -639,14 +622,14 @@ func createAPI(cfg *Config, persistConfig func()) http.Handler {
 		writeJSON(w, 202, job)
 	}))
 
-	mux.HandleFunc("GET /jobs", need("read", func(w http.ResponseWriter, r *http.Request) {
+	mux.HandleFunc("GET /jobs", need(scopeRead, func(w http.ResponseWriter, r *http.Request) {
 		writeJSON(w, 200, struct {
 			Jobs []Job `json:"jobs"`
-		}{nonNil(listJobs())})
+		}{nonNil(a.listJobs())})
 	}))
 
-	mux.HandleFunc("GET /jobs/{id}", need("read", func(w http.ResponseWriter, r *http.Request) {
-		job := getJob(r.PathValue("id"))
+	mux.HandleFunc("GET /jobs/{id}", need(scopeRead, func(w http.ResponseWriter, r *http.Request) {
+		job := a.getJob(r.PathValue("id"))
 		if job == nil {
 			apiErr(w, 404, "not_found", "no such job")
 			return
@@ -654,8 +637,8 @@ func createAPI(cfg *Config, persistConfig func()) http.Handler {
 		writeJSON(w, 200, job)
 	}))
 
-	mux.HandleFunc("GET /jobs/{id}/log", need("read", func(w http.ResponseWriter, r *http.Request) {
-		log := getJobLog(r.PathValue("id"))
+	mux.HandleFunc("GET /jobs/{id}/log", need(scopeRead, func(w http.ResponseWriter, r *http.Request) {
+		log := a.getJobLog(r.PathValue("id"))
 		if log == nil {
 			apiErr(w, 404, "not_found", "no such job")
 			return
@@ -663,8 +646,8 @@ func createAPI(cfg *Config, persistConfig func()) http.Handler {
 		writeText(w, 200, *log)
 	}))
 
-	mux.HandleFunc("DELETE /jobs/{id}", need("launch", func(w http.ResponseWriter, r *http.Request) {
-		job := cancelJob(r.PathValue("id"), actorOf(r).name)
+	mux.HandleFunc("DELETE /jobs/{id}", need(scopeLaunch, func(w http.ResponseWriter, r *http.Request) {
+		job := a.cancelJob(r.PathValue("id"), actorOf(r).name)
 		if job == nil {
 			apiErr(w, 404, "not_found", "no such job")
 			return
@@ -672,8 +655,8 @@ func createAPI(cfg *Config, persistConfig func()) http.Handler {
 		writeJSON(w, 200, job)
 	}))
 
-	mux.HandleFunc("DELETE /jobs/{id}/record", need("launch", func(w http.ResponseWriter, r *http.Request) {
-		removed, err := removeJob(r.PathValue("id"))
+	mux.HandleFunc("DELETE /jobs/{id}/record", need(scopeLaunch, func(w http.ResponseWriter, r *http.Request) {
+		removed, err := a.removeJob(r.PathValue("id"))
 		if err != nil {
 			apiErr(w, 409, "job_live", err.Error())
 			return
@@ -687,8 +670,8 @@ func createAPI(cfg *Config, persistConfig func()) http.Handler {
 		}{true})
 	}))
 
-	mux.HandleFunc("GET /sessions/{id}", need("read", func(w http.ResponseWriter, r *http.Request) {
-		session := getSession(r.PathValue("id"))
+	mux.HandleFunc("GET /sessions/{id}", need(scopeRead, func(w http.ResponseWriter, r *http.Request) {
+		session := a.getSession(r.PathValue("id"))
 		if session == nil {
 			apiErr(w, 404, "not_found", "no such session")
 			return
@@ -696,8 +679,8 @@ func createAPI(cfg *Config, persistConfig func()) http.Handler {
 		writeJSON(w, 200, session)
 	}))
 
-	mux.HandleFunc("GET /sessions/{id}/qr", need("read", func(w http.ResponseWriter, r *http.Request) {
-		session := getSession(r.PathValue("id"))
+	mux.HandleFunc("GET /sessions/{id}/qr", need(scopeRead, func(w http.ResponseWriter, r *http.Request) {
+		session := a.getSession(r.PathValue("id"))
 		if session == nil {
 			apiErr(w, 404, "not_found", "no such session")
 			return
@@ -717,8 +700,8 @@ func createAPI(cfg *Config, persistConfig func()) http.Handler {
 		io.WriteString(w, svg)
 	}))
 
-	mux.HandleFunc("GET /sessions/{id}/log", need("read", func(w http.ResponseWriter, r *http.Request) {
-		log := getSessionLog(r.PathValue("id"))
+	mux.HandleFunc("GET /sessions/{id}/log", need(scopeRead, func(w http.ResponseWriter, r *http.Request) {
+		log := a.getSessionLog(r.PathValue("id"))
 		if log == nil {
 			apiErr(w, 404, "not_found", "no such session")
 			return
@@ -726,8 +709,8 @@ func createAPI(cfg *Config, persistConfig func()) http.Handler {
 		writeText(w, 200, *log)
 	}))
 
-	mux.HandleFunc("DELETE /sessions/{id}", need("launch", func(w http.ResponseWriter, r *http.Request) {
-		session := killSession(r.PathValue("id"), actorOf(r).name)
+	mux.HandleFunc("DELETE /sessions/{id}", need(scopeLaunch, func(w http.ResponseWriter, r *http.Request) {
+		session := a.killSession(r.PathValue("id"), actorOf(r).name)
 		if session == nil {
 			apiErr(w, 404, "not_found", "no such session")
 			return
@@ -735,8 +718,8 @@ func createAPI(cfg *Config, persistConfig func()) http.Handler {
 		writeJSON(w, 200, session)
 	}))
 
-	mux.HandleFunc("DELETE /sessions/{id}/record", need("launch", func(w http.ResponseWriter, r *http.Request) {
-		removed, err := removeSession(r.PathValue("id"))
+	mux.HandleFunc("DELETE /sessions/{id}/record", need(scopeLaunch, func(w http.ResponseWriter, r *http.Request) {
+		removed, err := a.removeSession(r.PathValue("id"))
 		if err != nil {
 			apiErr(w, 409, "session_live", err.Error())
 			return
@@ -750,5 +733,5 @@ func createAPI(cfg *Config, persistConfig func()) http.Handler {
 		}{true})
 	}))
 
-	return authMiddleware(cfg, mux)
+	return a.authMiddleware(mux)
 }

@@ -9,6 +9,7 @@
 </p>
 
 <p align="center">
+  <a href="https://github.com/connorbell133/groundcontrol/actions/workflows/ci.yml"><img src="https://img.shields.io/github/actions/workflow/status/connorbell133/groundcontrol/ci.yml?branch=main&style=flat-square&label=CI&labelColor=1c1a14" alt="CI status"></a>
   <img src="https://img.shields.io/badge/license-MIT-1c1a14?style=flat-square" alt="MIT license">
   <img src="https://img.shields.io/badge/go-%E2%89%A51.24-1c1a14?style=flat-square" alt="Go 1.24+">
   <img src="https://img.shields.io/badge/PWA-installable-d8451f?style=flat-square" alt="Installable PWA">
@@ -160,6 +161,10 @@ Design notes, for the curious: the UI is a "paper dispatch" theme — Instrument
 - **Not a chat UI.** All conversation happens in the official Claude app; the tower only clears launches and supervises.
 - **Not multi-tenant.** It's your machine and your token.
 - **Not containerized (yet).** Sessions run as your user on the host. The Docker isolation toggle in the launch console is honest about this — it's wired for v1.
+
+## Contributing
+
+PRs welcome — small and focused ones especially. [CONTRIBUTING.md](CONTRIBUTING.md) has the short version: what to install, how to run it, and what CI will hold you to.
 
 ## License
 

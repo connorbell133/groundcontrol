@@ -5,14 +5,12 @@ import (
 	"context"
 	"crypto/rand"
 	"encoding/hex"
-	"encoding/json"
 	"errors"
 	"fmt"
 	"os"
 	"os/exec"
 	"path/filepath"
 	"strings"
-	"sync"
 	"time"
 )
 
@@ -94,69 +92,7 @@ func gitRun(dir string, timeout time.Duration, args ...string) error {
 	return err
 }
 
-/* ---------- journal: append-only flight log, shared by sessions and jobs ---------- */
-
-var dataDir = filepath.Join(mustCwd(), "data")
-var journalPath = filepath.Join(dataDir, "journal.json")
-var journalMu sync.Mutex
-
-func journal(entry map[string]any) {
-	journalMu.Lock()
-	defer journalMu.Unlock()
-	_ = os.MkdirAll(dataDir, 0o755)
-	// []any, not []map[string]any: a stray non-object element must not wipe the
-	// whole history on the next append (TS JSON.parse preserved any array as-is)
-	var all []any
-	if raw, err := os.ReadFile(journalPath); err == nil {
-		if err := json.Unmarshal(raw, &all); err != nil {
-			all = nil // first write
-		}
-	}
-	e := make(map[string]any, len(entry)+1)
-	for k, v := range entry {
-		e[k] = v
-	}
-	e["at"] = nowISO()
-	all = append(all, e)
-	var buf bytes.Buffer
-	enc := json.NewEncoder(&buf)
-	enc.SetEscapeHTML(false)
-	enc.SetIndent("", "  ")
-	if err := enc.Encode(all); err != nil {
-		return
-	}
-	// JSON.stringify(all, null, 2): 2-space indent, no trailing newline
-	_ = os.WriteFile(journalPath, bytes.TrimRight(buf.Bytes(), "\n"), 0o644)
-}
-
-func readJournal() []map[string]any {
-	journalMu.Lock()
-	defer journalMu.Unlock()
-	raw, err := os.ReadFile(journalPath)
-	if err != nil {
-		return []map[string]any{}
-	}
-	var all []any
-	if err := json.Unmarshal(raw, &all); err != nil {
-		return []map[string]any{}
-	}
-	if len(all) > 2000 {
-		all = all[len(all)-2000:]
-	}
-	// non-object elements drop out here, like TS queries skipping entries
-	// whose fields come back undefined
-	out := make([]map[string]any, 0, len(all))
-	for _, v := range all {
-		if m, ok := v.(map[string]any); ok {
-			out = append(out, m)
-		}
-	}
-	return out
-}
-
 /* ---------- worktrees: one branch, one worktree, cleaned up honestly ---------- */
-
-var wtBase = filepath.Join(mustHome(), ".groundcontrol", "worktrees")
 
 type worktreeInfo struct {
 	wtPath, wtBranch, baseCommit string
@@ -186,9 +122,9 @@ func branchExists(folder, branch string) bool {
 	return resolveBranch(folder, branch) != ""
 }
 
-func addWorktree(folder, branch, id string) (worktreeInfo, error) {
-	wtPath := filepath.Join(wtBase, filepath.Base(folder), id)
-	if err := os.MkdirAll(filepath.Join(wtBase, filepath.Base(folder)), 0o755); err != nil {
+func (a *app) addWorktree(folder, branch, id string) (worktreeInfo, error) {
+	wtPath := filepath.Join(a.wtBase, filepath.Base(folder), id)
+	if err := os.MkdirAll(filepath.Join(a.wtBase, filepath.Base(folder)), 0o755); err != nil {
 		return worktreeInfo{}, err
 	}
 	base := resolveBranch(folder, branch)
@@ -214,10 +150,10 @@ func addWorktree(folder, branch, id string) (worktreeInfo, error) {
 
 // removeWorktree removes the worktree and, when the run branch never accumulated
 // commits, its gc/ branch too. wtBranch/baseCommit may be "" (skip branch deletion).
-func removeWorktree(folder, wtPath, wtBranch, baseCommit string) {
+func (a *app) removeWorktree(folder, wtPath, wtBranch, baseCommit string) {
 	if err := gitRun(folder, 15*time.Second, "worktree", "remove", wtPath); err != nil {
 		// dirty or already gone — keep it rather than destroy work, but make it visible
-		journal(map[string]any{"event": "worktree.kept", "folder": folder, "wtPath": wtPath, "reason": "dirty or removal failed"})
+		a.journal(map[string]any{"event": "worktree.kept", "folder": folder, "wtPath": wtPath, "reason": "dirty or removal failed"})
 		return
 	}
 	// the run branch outlives the worktree only if it accumulated commits

@@ -1,5 +1,5 @@
 #!/bin/sh
-# agent-runner pre-commit — secrets, private files, build sanity, JSON sanity.
+# groundcontrol pre-commit — secrets, private files, build sanity, JSON sanity.
 # Wire up with: git config core.hooksPath .githooks
 set -e
 

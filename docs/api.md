@@ -71,7 +71,7 @@ change; renaming one is breaking.
 | `invalid_path` | 400 | path outside roots, or not a directory |
 | `outside_roots` | 400 | launch folder is outside configured roots |
 | `invalid_config` | 400 | config write rejected (bad roots, bad webhooks block) |
-| `not_found` | 404 | no such session |
+| `not_found` | 404 | no such session or job |
 | `not_ready` | 409 | session exists but has no pairing URL yet |
 | `ready_timeout` | 504 | `?wait=ready` deadline passed — session still starting, keep polling |
 | `launch_failed` | 409 | spawn rejected — duplicate live name, unknown branch, dirty checkout on branch switch, worktree creation failed |
@@ -128,8 +128,9 @@ change; renaming one is breaking.
   if that would clobber local changes.
 - `permissionMode` — passed to `claude`: `default`, `acceptEdits`, `plan`, or
   `bypassPermissions`.
-- `callbackUrl` — this launch's own webhook: `session.ready` and
-  `session.exit` are POSTed to it (same payload shape as [events](#events--notifications)).
+- `callbackUrl` — this launch's own webhook: every lifecycle event except
+  `session.start` (`session.ready`, `session.kill`, `session.exit`) is POSTed
+  to it (same payload shape as [events](#events--notifications)).
 - `timeoutMs` — only meaningful with `?wait=ready` (below); clamped 1s–5min,
   default 60s.
 

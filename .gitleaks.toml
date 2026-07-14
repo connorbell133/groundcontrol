@@ -1,15 +1,16 @@
-# gitleaks config — extends the default ruleset with agent-runner specifics.
-title = "agent-runner"
+# gitleaks config — extends the default ruleset with groundcontrol specifics.
+title = "groundcontrol"
 
 [extend]
 useDefault = true
 
-# The runner's own bearer token: a hex string assigned to authToken.
-# config.json is gitignored AND hard-blocked by the pre-commit hook, but if a
-# token value ever gets pasted into code, docs, or an example, catch it here.
+# The tower's own bearer token: a hex string assigned to authToken or a
+# scoped tokens[].token entry. config.json is gitignored AND hard-blocked by
+# the pre-commit hook, but if a token value ever gets pasted into code, docs,
+# or an example, catch it here.
 [[rules]]
-id = "agent-runner-auth-token"
-description = "agent-runner authToken value"
+id = "groundcontrol-auth-token"
+description = "groundcontrol authToken/token value"
 regex = '''(?i)authtoken['"]?\s*[:=]\s*['"][0-9a-f]{16,}['"]'''
 keywords = ["authtoken"]
 

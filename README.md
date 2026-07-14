@@ -73,7 +73,7 @@ phone (PWA, vanilla JS) ──HTTPS via tailscale serve──▶ Go server (one 
                                      scrape pairing URL ─▶ QR ─▶ Claude app
 ```
 
-One static Go binary. The server spawns `claude remote-control` in a PTY, scrapes the pairing URL out of the output, and renders it as a QR. Session history lives in an append-only JSON journal that doubles as the recents list, the lost-session detector, and the audit trail. No database, no runtime dependencies, no framework — the server is one flat Go package leaning on the stdlib (plus a PTY and a QR library), the frontend three static files plus a 32-line service worker, embedded straight into the binary with `go:embed`.
+One static Go binary. The server spawns `claude remote-control` in a PTY, scrapes the pairing URL out of the output, and renders it as a QR. Session history lives in an append-only JSON journal that doubles as the recents list, the lost-session detector, and the audit trail. No database, no build tooling, no framework — the server is one flat Go package leaning on the stdlib plus two small libraries ([creack/pty](https://github.com/creack/pty), [skip2/go-qrcode](https://github.com/skip2/go-qrcode)), the frontend three static files plus a 32-line service worker, embedded straight into the binary with `go:embed`.
 
 ## Install
 
@@ -143,6 +143,7 @@ Wire up the repo's pre-commit hook with `git config core.hooksPath .githooks`; i
 - secrets — [gitleaks](https://github.com/gitleaks/gitleaks) over staged changes, extended with rules for this app's own token format and Claude pairing URLs (`brew install gitleaks`)
 - the private files — `config.json` and `data/` are blocked even if force-added past `.gitignore`
 - broken JSON or YAML
+- Go changes that don't build or `go vet` clean
 
 Design notes, for the curious: the UI is a "paper dispatch" theme — Instrument Serif and IBM Plex Mono on warm paper, vermillion for actions, stamp green for anything git. Light is the baseline; dark mode is the 2am safelight, opt-in from Settings.
 

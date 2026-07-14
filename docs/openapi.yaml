@@ -55,7 +55,7 @@ components:
         application/json:
           schema: { $ref: "#/components/schemas/Error" }
     NotFound:
-      description: No such session.
+      description: No such session or job.
       content:
         application/json:
           schema: { $ref: "#/components/schemas/Error" }
@@ -108,7 +108,7 @@ components:
           enum: [starting, ready, exited, error]
           description: error means the process died before a pairing URL appeared.
         pairingUrl: { type: [string, "null"] }
-        callbackUrl: { type: [string, "null"], description: "Per-launch webhook: session.ready and session.exit are POSTed here." }
+        callbackUrl: { type: [string, "null"], description: "Per-launch webhook: every lifecycle event except session.start is POSTed here." }
         startedAt: { type: string, format: date-time }
         exitedAt: { type: [string, "null"], format: date-time }
         exitCode: { type: [integer, "null"] }
@@ -128,7 +128,7 @@ components:
             Required in worktree mode (base for the private gc/<id> branch).
             In same-dir mode, switches the checkout first; refused if dirty.
         permissionMode: { type: string, default: default }
-        callbackUrl: { type: string, description: "http(s) URL — this launch's session.ready and session.exit events are POSTed to it." }
+        callbackUrl: { type: string, description: "http(s) URL — every lifecycle event for this launch except session.start is POSTed to it." }
         timeoutMs: { type: integer, default: 60000, minimum: 1000, maximum: 300000, description: "Only meaningful with ?wait=ready." }
 
     LifecycleEvent:
@@ -328,7 +328,7 @@ paths:
     put:
       summary: Update config (partial)
       description: >
-        Any subset of roots, showHidden, ntfy. Persists to config.json.
+        Any subset of roots, showHidden, webhooks. Persists to config.json.
         A token that can reach this route can widen roots — treat it as root
         on the box.
       requestBody:

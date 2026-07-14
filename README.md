@@ -73,7 +73,7 @@ phone (PWA, vanilla JS) ──HTTPS via tailscale serve──▶ Hono server (No
                                      scrape pairing URL ─▶ QR ─▶ Claude app
 ```
 
-One Node process. The server spawns `claude remote-control` in a PTY, scrapes the pairing URL out of the output, and renders it as a QR. Session history lives in an append-only JSON journal that doubles as the recents list, the lost-session detector, and the audit trail. No database, no build step, no framework — the frontend is three static files.
+One Node process. The server spawns `claude remote-control` in a PTY, scrapes the pairing URL out of the output, and renders it as a QR. Session history lives in an append-only JSON journal that doubles as the recents list, the lost-session detector, and the audit trail. No database, no build step, no framework — the server is three TypeScript files (~900 lines), the frontend three static files plus a 32-line service worker.
 
 ## Install
 

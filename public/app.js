@@ -1,5 +1,5 @@
-/* agent-runner mobile UI */
-const CLIENT_VERSION = "0.2.0"; // keep in step with package.json — healthz mismatch triggers a reload
+/* groundcontrol mobile UI */
+const CLIENT_VERSION = "0.3.0"; // keep in step with package.json — healthz mismatch triggers a reload
 const $ = (id) => document.getElementById(id);
 const authToken = () => localStorage.getItem("token") || "";
 const tokenQS = () => (authToken() ? `?token=${encodeURIComponent(authToken())}` : "");
@@ -318,6 +318,8 @@ async function launch() {
 const killing = new Set();
 // Ids whose runtime-log <details> is currently open — preserved across innerHTML rewrites.
 const openLogs = new Set();
+// Ids whose pairing-QR <details> is expanded — same trick, so a tap survives re-renders.
+const openQrs = new Set();
 let lastSyncAt = Date.now();
 
 // After a kill, poll a few times so the card lands on the real terminal
@@ -355,6 +357,7 @@ async function refreshSessions() {
 // change. Everything time-varying updates via data-* lookups in updateDynamic().
 function renderShell(card, s) {
   const logWasOpen = openLogs.has(s.id);
+  const qrWasOpen = openQrs.has(s.id);
   const shareBtn = navigator.share ? `<button class="log-tool" data-share-log="${s.id}">share</button>` : "";
   card.innerHTML = `
     <div class="session-head">
@@ -371,11 +374,21 @@ function renderShell(card, s) {
       <span class="meta-chip activity" data-activity hidden></span>
     </div>
     ${s.pairingUrl && s.state === "ready" ? `
-      <div class="qr-wrap">
-        <img class="qr-img" alt="Pairing QR code" src="/api/sessions/${s.id}/qr${tokenQS()}" />
-        <span class="qr-hint">Claude app · camera</span>
-        <span class="bracket bl"></span><span class="bracket br"></span>
-      </div>
+      <details class="qr-details" data-qr="${s.id}">
+        <summary class="qr-summary">
+          <img class="qr-thumb" alt="Pairing QR code" src="/api/sessions/${s.id}/qr${tokenQS()}" />
+          <span class="qr-summary-label">
+            <span class="qr-summary-title">Scan to pair</span>
+            <span class="qr-summary-sub">tap to expand</span>
+          </span>
+          <span class="qr-chevron">›</span>
+        </summary>
+        <div class="qr-wrap">
+          <img class="qr-img" alt="Pairing QR code" src="/api/sessions/${s.id}/qr${tokenQS()}" />
+          <span class="qr-hint">Claude app · camera</span>
+          <span class="bracket bl"></span><span class="bracket br"></span>
+        </div>
+      </details>
       <div class="session-actions">
         <a class="btn primary" href="${esc(s.pairingUrl)}" target="_blank" rel="noopener">Open link</a>
         <button class="btn danger" data-kill="${s.id}">Kill</button>
@@ -394,6 +407,10 @@ function renderShell(card, s) {
   if (logWasOpen) {
     const details = card.querySelector(".session-log");
     if (details) details.open = true; // fires the toggle listener, which refills the log
+  }
+  if (qrWasOpen) {
+    const qr = card.querySelector(".qr-details");
+    if (qr) qr.open = true; // re-adds to openQrs via the toggle listener; harmless
   }
 }
 
@@ -489,6 +506,7 @@ function renderSessions() {
     const id = card.dataset.id;
     if (!state.sessions.some((s) => s.id === id) && !state.lost.some((l) => l.id === id)) {
       openLogs.delete(id);
+      openQrs.delete(id);
       card.remove();
     }
   });
@@ -522,6 +540,12 @@ async function tailLogs() {
 }
 
 document.addEventListener("toggle", async (e) => {
+  const qrId = e.target.dataset?.qr;
+  if (qrId) {
+    if (e.target.open) openQrs.add(qrId);
+    else openQrs.delete(qrId);
+    return;
+  }
   const pre = e.target.querySelector?.("pre[data-log]");
   if (!pre) return;
   const id = pre.dataset.log;
@@ -624,17 +648,24 @@ function switchTab(tab) {
   document.querySelectorAll(".tab").forEach((t) => t.classList.toggle("active", t.dataset.tab === tab));
   $("view-browse").hidden = tab !== "browse";
   $("view-sessions").hidden = tab !== "sessions";
+  $("view-settings").hidden = tab !== "settings";
   syncFab();
   if (tab === "sessions") refreshSessions();
+  if (tab === "settings") openSettings();
 }
 
 async function health() {
   const el = $("health");
+  const pop = $("statusPop");
   try {
     const h = await api("/healthz");
     el.classList.remove("err");
     el.classList.add("ok");
+    pop.classList.remove("err");
+    pop.classList.add("ok");
     $("readoutState").textContent = "live";
+    $("readoutSessions").textContent = String(h.sessions ?? 0);
+    $("readoutVersion").textContent = h.version ? `v${h.version}` : "—";
     lastSyncAt = Date.now();
     // stale-client self-heal: a warm PWA can run old JS for days; reload once per server version
     if (h.version && h.version !== CLIENT_VERSION && sessionStorage.getItem("reloaded-for") !== h.version) {
@@ -644,20 +675,20 @@ async function health() {
   } catch {
     el.classList.remove("ok");
     el.classList.add("err");
+    pop.classList.remove("ok");
+    pop.classList.add("err");
     $("readoutState").textContent = "offline";
   }
 }
 
 // 1s tick: relative ages on cards + staleness readout. Text-node mutations only.
 function secondTick() {
-  const sync = $("readoutSync");
   const age = Math.round((Date.now() - lastSyncAt) / 1000);
-  if (age > 10) {
-    sync.hidden = false;
-    sync.textContent = `sync ${age}s`;
-  } else {
-    sync.hidden = true;
-  }
+  const stale = age > 10;
+  // no text in the topbar anymore — staleness shows as an amber dot, details in the popup
+  $("health").classList.toggle("stale", stale);
+  $("syncRow").hidden = !stale;
+  if (stale) $("readoutSync").textContent = `${age}s ago`;
   if (state.tab !== "sessions" || document.hidden) return;
   const list = $("sessionList");
   for (const s of state.sessions) {
@@ -774,21 +805,6 @@ async function openSettings() {
   } catch {
     toast("could not load server config", true);
   }
-  $("settingsSheet").hidden = false;
-  $("scrim").hidden = false;
-  requestAnimationFrame(() => {
-    $("settingsSheet").classList.add("show");
-    $("scrim").classList.add("show");
-  });
-}
-
-function closeSettings() {
-  $("settingsSheet").classList.remove("show");
-  if (!$("sheet").classList.contains("show")) $("scrim").classList.remove("show");
-  setTimeout(() => {
-    $("settingsSheet").hidden = true;
-    if (!$("sheet").classList.contains("show")) $("scrim").hidden = true;
-  }, 340);
 }
 
 async function saveSettings() {
@@ -813,14 +829,21 @@ async function saveSettings() {
       }),
     });
     toast("Settings saved");
-    closeSettings();
     loadFolder(state.path).catch(() => loadFolder(null).catch(() => {}));
   } catch (e) {
     toast(e.message, true);
   }
 }
 
-$("gearBtn").onclick = openSettings;
+/* status popup — tap the dot for details, tap anywhere else to dismiss */
+$("health").onclick = (e) => {
+  e.stopPropagation();
+  $("statusPop").hidden = !$("statusPop").hidden;
+};
+document.addEventListener("click", (e) => {
+  const pop = $("statusPop");
+  if (!pop.hidden && !pop.contains(e.target)) pop.hidden = true;
+});
 $("settingsSave").onclick = saveSettings;
 $("rootAddBtn").onclick = (e) => {
   e.preventDefault();
@@ -842,12 +865,9 @@ $("authInput").addEventListener("keydown", (e) => {
   if (e.key === "Enter") $("authSubmit").click();
 });
 
-document.querySelectorAll(".tab").forEach((t) => (t.onclick = () => switchTab(t.dataset.tab)));
+document.querySelectorAll(".tab[data-tab]").forEach((t) => (t.onclick = () => switchTab(t.dataset.tab)));
 $("launchBar").onclick = () => openSheet();
-$("scrim").onclick = () => {
-  closeSheet();
-  closeSettings();
-};
+$("scrim").onclick = closeSheet;
 $("launchBtn").onclick = launch;
 wireSegment("optSpawn", "spawnMode", syncBranchField);
 wireSegment("optPerm", "permissionMode");

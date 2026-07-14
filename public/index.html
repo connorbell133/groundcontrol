@@ -7,7 +7,7 @@
   <meta name="mobile-web-app-capable" content="yes" />
   <meta name="apple-mobile-web-app-capable" content="yes" />
   <meta name="apple-mobile-web-app-status-bar-style" content="default" />
-  <title>agent·runner</title>
+  <title>ground·control</title>
   <link rel="manifest" href="/manifest.webmanifest" />
   <link rel="icon" type="image/png" sizes="192x192" href="/icons/icon-192.png" />
   <link rel="apple-touch-icon" href="/icons/apple-touch-icon.png" />
@@ -22,19 +22,19 @@
   <div class="bg-grain" aria-hidden="true"></div>
 
   <header class="topbar">
-    <div class="wordmark">agent<span class="wordmark-dot">·</span>runner</div>
-    <div class="topbar-right">
-      <div class="readout" id="health">
-        <span class="led"></span>
-        <span class="readout-state" id="readoutState">boot</span>
-        <span class="readout-sync" id="readoutSync" hidden></span>
-        <span class="readout-host" id="readoutHost"></span>
-      </div>
-      <button class="gear" id="gearBtn" aria-label="Settings">
-        <svg viewBox="0 0 24 24" width="17" height="17" fill="none" stroke="currentColor" stroke-width="1.7"><circle cx="12" cy="12" r="3.2"/><path d="M12 3.5v2.2M12 18.3v2.2M3.5 12h2.2M18.3 12h2.2M6 6l1.6 1.6M16.4 16.4 18 18M18 6l-1.6 1.6M7.6 16.4 6 18" stroke-linecap="round"/></svg>
-      </button>
-    </div>
+    <div class="wordmark">ground<span class="wordmark-dot">·</span>control</div>
+    <button class="status-dot" id="health" aria-label="Runner status">
+      <span class="led"></span>
+    </button>
   </header>
+
+  <div class="status-pop" id="statusPop" hidden>
+    <div class="status-row"><span class="status-key">state</span><span class="readout-state" id="readoutState">boot</span></div>
+    <div class="status-row"><span class="status-key">host</span><span id="readoutHost"></span></div>
+    <div class="status-row"><span class="status-key">sessions</span><span id="readoutSessions">–</span></div>
+    <div class="status-row"><span class="status-key">server</span><span id="readoutVersion">–</span></div>
+    <div class="status-row" id="syncRow" hidden><span class="status-key">last sync</span><span class="readout-sync" id="readoutSync"></span></div>
+  </div>
 
   <main id="view-browse" class="view">
     <div class="pathbar-wrap">
@@ -80,6 +80,10 @@
       <svg viewBox="0 0 24 24" width="20" height="20" fill="none" stroke="currentColor" stroke-width="1.7"><circle cx="11" cy="11" r="7.5"/><circle cx="11" cy="11" r="2.6" fill="currentColor" stroke="none"/></svg>
       <span>Sessions</span>
       <span class="tab-badge" id="sessionCount" hidden>0</span>
+    </button>
+    <button class="tab" data-tab="settings" id="gearBtn">
+      <svg viewBox="0 0 24 24" width="20" height="20" fill="none" stroke="currentColor" stroke-width="1.7" stroke-linecap="round"><path d="M4 7h9.3M18.7 7H20M4 12h3.3M12.7 12H20M4 17h8.3M17.7 17H20"/><circle cx="16" cy="7" r="2.4"/><circle cx="10" cy="12" r="2.4"/><circle cx="15" cy="17" r="2.4"/></svg>
+      <span>Settings</span>
     </button>
   </nav>
 
@@ -138,8 +142,7 @@
     </button>
   </section>
 
-  <section class="sheet" id="settingsSheet" hidden aria-label="Settings">
-    <div class="sheet-grab"></div>
+  <main class="view view-settings" id="view-settings" hidden aria-label="Settings">
     <div class="sheet-head">
       <span class="sheet-kicker">Settings</span>
       <h2 class="sheet-title">Preferences</h2>
@@ -224,7 +227,7 @@
     <div id="worktreeList"></div>
 
     <button class="cta" id="settingsSave">Save settings</button>
-  </section>
+  </main>
 
   <div class="auth-gate" id="authGate" hidden>
     <div class="auth-card">

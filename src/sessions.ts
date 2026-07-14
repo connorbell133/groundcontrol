@@ -204,7 +204,7 @@ export interface KeptWorktree {
   dirty: boolean;
 }
 
-const WT_BASE = join(homedir(), ".agent-runner", "worktrees");
+const WT_BASE = join(homedir(), ".groundcontrol", "worktrees");
 
 export function listKeptWorktrees(): KeptWorktree[] {
   if (!existsSync(WT_BASE)) return [];
@@ -265,8 +265,8 @@ export function getSessionLog(id: string): string | null {
 }
 
 function addWorktree(folder: string, branch: string, id: string): string {
-  const wtPath = join(homedir(), ".agent-runner", "worktrees", basename(folder), id);
-  mkdirSync(join(homedir(), ".agent-runner", "worktrees", basename(folder)), { recursive: true });
+  const wtPath = join(homedir(), ".groundcontrol", "worktrees", basename(folder), id);
+  mkdirSync(join(homedir(), ".groundcontrol", "worktrees", basename(folder)), { recursive: true });
   try {
     execFileSync("git", ["-C", folder, "worktree", "add", wtPath, branch], {
       encoding: "utf8",
@@ -293,7 +293,7 @@ function removeWorktree(folder: string, wtPath: string) {
 // Boot sweep: sessions are in-memory, so any worktree on disk at startup is an
 // orphan from a previous runner. Remove the clean ones; keep dirty ones and journal.
 export function sweepOrphanWorktrees() {
-  const base = join(homedir(), ".agent-runner", "worktrees");
+  const base = join(homedir(), ".groundcontrol", "worktrees");
   if (!existsSync(base)) return;
   for (const repo of readdirSync(base)) {
     const repoDir = join(base, repo);

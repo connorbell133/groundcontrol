@@ -1,11 +1,11 @@
 <p align="center">
-  <img src="public/icons/icon-512.png" width="120" alt="agent-runner icon">
+  <img src="assets/logo.png" width="130" alt="groundcontrol — the tower">
 </p>
 
-<h1 align="center">agent·runner</h1>
+<h1 align="center">ground·control</h1>
 
 <p align="center">
-  <em>The laptop is upstairs. The agent launches anyway.</em>
+  <em>This is ground control. Your agent is go for launch.</em>
 </p>
 
 <p align="center">
@@ -24,9 +24,7 @@
 
 You know the moment. You're on the couch, you think of the fix, and the thought dies because starting a [Claude Code](https://claude.com/claude-code) session means: find the laptop, SSH in, `cd` three directories deep, run `claude remote-control`, and squint at a QR code rendered in terminal characters.
 
-agent-runner puts that whole ritual behind two taps on your phone.
-
-It's a small home-screen app served off your own machine: browse your real filesystem, tap a folder, launch a session — optionally in a fresh git worktree off any branch — and scan a proper QR into the Claude app. The runner is never in the interaction path; once paired, you're talking straight to Claude Code. The runner just holds the processes, the worktrees, and the receipts.
+groundcontrol is the tower. It's a small home-screen app served off your own machine: browse your real filesystem, tap a folder, clear an agent for launch — optionally in a fresh git worktree off any branch — and scan a proper QR into the Claude app. The tower is never in the conversation; once paired, you're talking straight to Claude Code. groundcontrol just tracks what's in flight, holds the worktrees, and keeps the flight log.
 
 ## Before / after
 
@@ -52,11 +50,11 @@ After: open the app, tap the folder, tap **Launch**, scan.
 ## What it does
 
 - **Browses your actual filesystem** from configured roots — no repo allowlist to maintain. Git repos get a branch chip; subfolders of a repo inherit its git context, so launching from `src/` still offers the repo's branches.
-- **Worktree launches off any branch.** Pick *In folder* or *Worktree*; worktrees are created under `~/.agent-runner/worktrees/`, and dirty ones are never force-deleted — they're kept, listed in Settings, and cleaned only when you say so.
+- **Worktree launches off any branch.** Pick *In folder* or *Worktree*; worktrees are created under `~/.groundcontrol/worktrees/`, and dirty ones are never force-deleted — they're kept, listed in Settings, and cleaned only when you say so.
 - **Permission modes per launch:** Ask, accept-Edits, Plan, or YOLO (`--dangerously-skip-permissions`). YOLO in a folder with no git history takes a deliberate second tap — no undo exists there, so the button makes you mean it.
 - **Live session cards** with pairing QR, one-tap open-in-Claude-app, runtime log tail, uptime and last-output age, and a kill switch that updates instantly.
 - **Recent dispatches:** your last launches as one-tap relaunch chips, with staleness detection — if the branch is gone, the chip says so and degrades gracefully.
-- **Survives restarts honestly.** Sessions the runner lost track of show up as *lost* cards from the journal instead of silently vanishing.
+- **Survives restarts honestly.** Sessions the tower lost track of show up as *lost* cards from the flight log instead of silently vanishing.
 - **ntfy notifications** when a session pairs or dies, so you can put the phone down while it provisions.
 - **Installable PWA** — add to home screen, standalone window, offline shell, and it self-reloads when the server ships a new version.
 
@@ -77,8 +75,8 @@ One Node process. The server spawns `claude remote-control` in a PTY, scrapes th
 You need [Node 20+](https://nodejs.org), git, and the [Claude Code CLI](https://claude.com/claude-code) logged in on the host machine (`claude` must work in a terminal there — Remote Control needs full login credentials, not an API key).
 
 ```bash
-git clone https://github.com/connorbell133/agent-runner.git
-cd agent-runner
+git clone https://github.com/connorbell133/groundcontrol.git
+cd groundcontrol
 npm install
 cp config.example.json config.json
 ```
@@ -93,7 +91,7 @@ Open `http://localhost:3020`, paste your token when asked, launch something.
 
 ### Reaching it from your phone
 
-The runner binds to your LAN, but the pleasant way is [Tailscale](https://tailscale.com):
+The tower binds to your LAN, but the pleasant way is [Tailscale](https://tailscale.com):
 
 ```bash
 tailscale serve --bg 3020
@@ -130,7 +128,7 @@ Design notes, for the curious: the UI is a "paper dispatch" theme — Instrument
 
 ## What it deliberately isn't
 
-- **Not a chat UI.** All conversation happens in the official Claude app; the runner only spawns and supervises.
+- **Not a chat UI.** All conversation happens in the official Claude app; the tower only clears launches and supervises.
 - **Not multi-tenant.** It's your machine and your token.
 - **Not containerized (yet).** Sessions run as your user on the host. The Docker isolation toggle in the launch console is honest about this — it's wired for v1.
 

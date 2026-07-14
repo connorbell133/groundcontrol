@@ -1,6 +1,6 @@
 {
-  "name": "agent·runner",
-  "short_name": "runner",
+  "name": "ground·control",
+  "short_name": "control",
   "description": "Launch and pair Claude Code agents in any folder on your box.",
   "id": "/",
   "start_url": "/",

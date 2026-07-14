@@ -186,5 +186,5 @@ app.use("/*", serveStatic({ root: "./public" }));
 
 const host = config.host ?? "127.0.0.1";
 serve({ fetch: app.fetch, port: config.port, hostname: host }, (info) => {
-  console.log(`agent-runner listening on http://${host}:${info.port}`);
+  console.log(`groundcontrol listening on http://${host}:${info.port}`);
 });

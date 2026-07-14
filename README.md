@@ -22,6 +22,10 @@
 
 ---
 
+<p align="center">
+  <a href="#before--after"><img src="assets/demo-banner.png" alt="90-second demo — the SSH ritual: a minute of typing. ground·control: two taps and a scan." width="920"></a>
+</p>
+
 You know the moment. You're on the couch, you think of the fix, and the thought dies because starting a [Claude Code](https://claude.com/claude-code) session means: find the laptop, SSH in, `cd` three directories deep, run `claude remote-control`, and squint at a QR code rendered in terminal characters.
 
 groundcontrol is the tower. It's a small home-screen app served off your own machine: browse your real filesystem, tap a folder, clear an agent for launch — optionally in a fresh git worktree off any branch — and scan a proper QR into the Claude app. The tower is never in the conversation; once paired, you're talking straight to Claude Code. groundcontrol just tracks what's in flight, holds the worktrees, and keeps the flight log.

@@ -116,6 +116,10 @@ That gives you a stable HTTPS URL on your tailnet — which also unlocks PWA ins
 
 Everything user-facing — theme, launch defaults, roots, ntfy, kept-worktree cleanup — is also editable from the ⚙ Settings sheet in the app itself.
 
+## API
+
+Everything the app does is a bearer-token HTTP API at `/api/v1` — the PWA is just the first client. Spawn a session from a script or an n8n workflow with `POST /api/v1/sessions`, poll it to `ready`, grab the pairing URL, tail the log, kill it. [docs/api.md](docs/api.md) is the guide with a curl cookbook; [docs/openapi.yaml](docs/openapi.yaml) is the machine contract. Errors are a stable envelope (`{"error":{"code","message"}}`) — key off `code`.
+
 ## Development
 
 ```bash
@@ -127,7 +131,7 @@ npm run typecheck    # tsc --noEmit
 
 - secrets — [gitleaks](https://github.com/gitleaks/gitleaks) over staged changes, extended with rules for this app's own token format and Claude pairing URLs (`brew install gitleaks`)
 - the private files — `config.json` and `data/` are blocked even if force-added past `.gitignore`
-- broken JSON or TypeScript that doesn't typecheck
+- broken JSON or YAML, and TypeScript that doesn't typecheck
 
 Design notes, for the curious: the UI is a "paper dispatch" theme — Instrument Serif and IBM Plex Mono on warm paper, vermillion for actions, stamp green for anything git. Light is the baseline; dark mode is the 2am safelight, opt-in from Settings.
 

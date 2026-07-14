@@ -30,7 +30,13 @@ for f in $(echo "$STAGED" | grep '\.json$' || true); do
   node -e "JSON.parse(require('fs').readFileSync('$f','utf8'))" || fail "$f is not valid JSON"
 done
 
-# 4. TypeScript must typecheck when server code changes.
+# 4. Staged YAML must parse (docs/openapi.yaml keeps the API contract).
+for f in $(echo "$STAGED" | grep '\.ya\?ml$' || true); do
+  step "yaml: $f"
+  npx --yes js-yaml "$f" >/dev/null || fail "$f is not valid YAML"
+done
+
+# 5. TypeScript must typecheck when server code changes.
 if echo "$STAGED" | grep -q '^src/.*\.ts$\|^tsconfig.json$'; then
   step "tsc --noEmit"
   npx tsc --noEmit || fail "typecheck failed"

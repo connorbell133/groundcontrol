@@ -1,101 +1,57 @@
 package main
 
 import (
+	"context"
 	"embed"
-	"encoding/json"
+	"flag"
 	"fmt"
 	"io/fs"
 	"log"
 	"mime"
 	"net"
 	"net/http"
-	"os"
+	"os/signal"
 	"path"
-	"path/filepath"
 	"strconv"
 	"strings"
-	"sync"
+	"syscall"
+	"time"
 )
 
-type Config struct {
-	Port       int             `json:"port"`
-	Host       string          `json:"host,omitempty"`
-	Roots      []string        `json:"roots"`
-	ShowHidden bool            `json:"showHidden"`
-	Webhooks   []WebhookConfig `json:"webhooks,omitempty"`
-	Jobs       *JobsConfig     `json:"jobs,omitempty"`
-	AuthToken  string          `json:"authToken,omitempty"`
-	Tokens     []TokenConfig   `json:"tokens,omitempty"`
-}
-
-// Scoped tokens for automations: read (browse/inspect), launch (spawn/kill
-// sessions and jobs), admin (config writes, worktree force-removal). The
-// legacy authToken keeps full scope — an n8n token gets read,launch and can
-// never widen roots.
-type TokenConfig struct {
-	Name   string   `json:"name"`
-	Token  string   `json:"token"`
-	Scopes []string `json:"scopes"`
-}
-
-const version = "0.4.0"
-
-// configMu guards the shared *Config. The PUT /config handler in api.go
-// mutates the config and calls persistConfig while holding this lock; readers
-// (auth middleware, GET /config) take it briefly to snapshot.
-var configMu sync.Mutex
+// release builds override this via -ldflags "-X main.version=..."
+var version = "0.4.0"
 
 //go:embed all:public
 var publicEmbed embed.FS
 
 func main() {
-	cwd, err := os.Getwd()
-	if err != nil {
-		log.Fatalf("cannot determine working directory: %v", err)
-	}
-	configPath := filepath.Join(cwd, "config.json")
-	raw, err := os.ReadFile(configPath)
-	if err != nil {
-		log.Fatalf("failed to read %s: %v", configPath, err)
-	}
-	var cfg Config
-	if err := json.Unmarshal(raw, &cfg); err != nil {
-		log.Fatalf("failed to parse %s: %v", configPath, err)
-	}
-	var rawKeys map[string]json.RawMessage
-	if err := json.Unmarshal(raw, &rawKeys); err == nil {
-		if _, ok := rawKeys["ntfy"]; ok {
-			fmt.Fprintln(os.Stderr, "config.ntfy is no longer used — notifications are generic webhooks now; see the webhooks key in README")
-		}
+	configPath := flag.String("config", "config.json", "path to the config file")
+	showVersion := flag.Bool("version", false, "print version and exit")
+	flag.Parse()
+
+	if *showVersion {
+		fmt.Println("groundcontrol " + version)
+		return
 	}
 
-	configureBrowser(cfg.Roots, cfg.ShowHidden)
-	configureWebhooks(cfg.Webhooks)
-	configureJobs(cfg.Jobs)
-	sweepOrphanWorktrees()
-
-	// re-apply the live parts of the config, then persist to disk; the caller
-	// (PUT /config) holds configMu across the mutation and this call
-	applyAndPersistConfig := func() {
-		configureBrowser(cfg.Roots, cfg.ShowHidden)
-		configureWebhooks(cfg.Webhooks)
-		out, err := json.MarshalIndent(&cfg, "", "  ")
-		if err != nil {
-			log.Printf("failed to serialize config: %v", err)
-			return
-		}
-		if err := os.WriteFile(configPath, append(out, '\n'), 0o644); err != nil {
-			log.Printf("failed to write %s: %v", configPath, err)
-		}
+	cfg, err := loadConfig(*configPath)
+	if err != nil {
+		log.Fatal(err)
 	}
+
+	a := newApp(*configPath, cfg)
+	a.configureBrowser(cfg.Roots, cfg.ShowHidden)
+	a.configureWebhooks(cfg.Webhooks)
+	a.configureJobs(cfg.Jobs)
+	a.sweepOrphanWorktrees()
 
 	mux := http.NewServeMux()
 
 	// unauthenticated by design (uptime probes)
 	mux.HandleFunc("GET /healthz", func(w http.ResponseWriter, r *http.Request) {
 		ready := 0
-		for _, s := range listSessions() {
-			if s.State == "ready" {
+		for _, s := range a.listSessions() {
+			if s.State == stateReady {
 				ready++
 			}
 		}
@@ -106,7 +62,7 @@ func main() {
 		}{true, version, ready})
 	})
 
-	api := createAPI(&cfg, applyAndPersistConfig)
+	api := a.createAPI()
 	mux.Handle("/api/v1/", http.StripPrefix("/api/v1", api)) // canonical, documented in docs/api.md
 	mux.Handle("/api/", http.StripPrefix("/api", api))       // deprecated alias for pinned clients — kept for one release
 
@@ -144,5 +100,78 @@ func main() {
 		port = addr.Port
 	}
 	fmt.Printf("groundcontrol listening on http://%s:%d\n", host, port)
-	log.Fatal(http.Serve(ln, mux))
+
+	ctx, stop := signal.NotifyContext(context.Background(), syscall.SIGINT, syscall.SIGTERM)
+	defer stop()
+
+	srv := &http.Server{
+		Handler:           mux,
+		ReadHeaderTimeout: 10 * time.Second,
+		IdleTimeout:       2 * time.Minute,
+		// No ReadTimeout/WriteTimeout: /api/v1/events is a long-lived SSE
+		// response, and WriteTimeout would kill the stream mid-flight.
+
+		// Tie request contexts to the signal context so the SSE handler's
+		// r.Context().Done() fires on shutdown — otherwise srv.Shutdown would
+		// hang forever waiting on never-ending SSE responses.
+		BaseContext: func(net.Listener) context.Context { return ctx },
+	}
+
+	serveErr := make(chan error, 1)
+	go func() { serveErr <- srv.Serve(ln) }()
+
+	select {
+	case err := <-serveErr:
+		log.Fatalf("server error: %v", err)
+	case <-ctx.Done():
+	}
+	stop() // restore default signal handling so a second ^C force-kills
+
+	log.Println("signal received, shutting down")
+	shutdownCtx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
+	defer cancel()
+	if err := srv.Shutdown(shutdownCtx); err != nil {
+		log.Printf("graceful shutdown timed out, closing: %v", err)
+		srv.Close()
+	}
+
+	// Kill live work explicitly: sessions hold PTYs and worktrees whose
+	// cleanup runs on their exit path, so we drive them to exit rather than
+	// abandoning them to die with the process.
+	for _, s := range a.listSessions() {
+		if s.State == "starting" || s.State == "ready" {
+			a.killSession(s.ID, "shutdown")
+		}
+	}
+	for _, j := range a.listJobs() {
+		if j.State == "queued" || j.State == "running" {
+			a.cancelJob(j.ID, "shutdown")
+		}
+	}
+
+	// Wait for the readLoop/finishJob paths to finish worktree cleanup before
+	// exiting; bounded so a wedged PTY can't hold shutdown hostage.
+	deadline := time.Now().Add(10 * time.Second)
+	for {
+		live := 0
+		for _, s := range a.listSessions() {
+			if s.State != "exited" && s.State != "error" {
+				live++
+			}
+		}
+		for _, j := range a.listJobs() {
+			if j.State == "queued" || j.State == "running" {
+				live++
+			}
+		}
+		if live == 0 {
+			break
+		}
+		if time.Now().After(deadline) {
+			log.Printf("shutdown wait deadline passed with %d sessions/jobs still live", live)
+			break
+		}
+		time.Sleep(200 * time.Millisecond)
+	}
+	log.Println("shutdown complete")
 }

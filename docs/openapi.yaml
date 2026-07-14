@@ -192,6 +192,8 @@ components:
         permissionMode: { type: string, default: acceptEdits, description: Real autonomy usually wants an explicit bypassPermissions. }
         timeoutMs: { type: integer, description: "Kill deadline; default from the jobs config key (15 min), max 2h." }
         callbackUrl: { type: string, description: POSTed the job.exit event on completion. }
+        isolation: { type: boolean, description: "true is rejected with 501 not_implemented — jobs run as the runner's user." }
+        docker: { type: boolean, description: "Alias for isolation; same 501." }
 
     FolderEntry:
       type: object
@@ -578,7 +580,7 @@ paths:
       description: >
         Runs claude -p <prompt> --output-format json to completion — no PTY,
         no pairing, no human. FIFO queue, bounded concurrency (default 2).
-        An isolation/docker field is rejected with 501 not_implemented.
+        isolation/docker set to true is rejected with 501 not_implemented.
       requestBody:
         required: true
         content:

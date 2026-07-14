@@ -7,7 +7,6 @@ import (
 	"regexp"
 	"sort"
 	"strings"
-	"sync"
 	"time"
 )
 
@@ -28,35 +27,44 @@ type BrowseResult struct {
 	Folders  []FolderEntry `json:"folders"`
 }
 
-var browserMu sync.RWMutex
-var browserCfg struct {
-	roots      []string
-	showHidden bool
-}
-
-func configureBrowser(roots []string, showHidden bool) {
+func (a *app) configureBrowser(roots []string, showHidden bool) {
 	abs := make([]string, 0, len(roots))
 	for _, r := range roots {
-		a, err := filepath.Abs(r)
+		// roots are stored symlink-resolved so withinRoots compares like with like:
+		// e.g. /tmp on macOS is a symlink to /private/tmp, and resolved candidates
+		// land on the /private form. Fall back to Abs when the root doesn't exist yet.
+		resolved, err := filepath.EvalSymlinks(r)
 		if err != nil {
-			a = r
+			resolved, err = filepath.Abs(r)
+			if err != nil {
+				resolved = r
+			}
 		}
-		abs = append(abs, a)
+		abs = append(abs, resolved)
 	}
-	browserMu.Lock()
-	browserCfg.roots = abs
-	browserCfg.showHidden = showHidden
-	browserMu.Unlock()
+	a.browserMu.Lock()
+	a.browserCfg.roots = abs
+	a.browserCfg.showHidden = showHidden
+	a.browserMu.Unlock()
 }
 
-func withinRoots(path string) bool {
-	resolved, err := filepath.Abs(path)
+func (a *app) withinRoots(path string) bool {
+	// containment is decided on the symlink-RESOLVED path — a lexical prefix check
+	// alone lets a symlink inside a root (e.g. root/link -> /etc) escape, since its
+	// Abs path sits "inside" the root while its target can be anywhere on disk.
+	resolved, err := filepath.EvalSymlinks(path)
 	if err != nil {
-		return false
+		// path doesn't exist (or is unresolvable): fall back to the lexical Abs
+		// form. Limitation: a not-yet-created path under a symlinked subdir can't
+		// be checked against its real target here; it's re-checked once it exists.
+		resolved, err = filepath.Abs(path)
+		if err != nil {
+			return false
+		}
 	}
-	browserMu.RLock()
-	defer browserMu.RUnlock()
-	for _, root := range browserCfg.roots {
+	a.browserMu.RLock()
+	defer a.browserMu.RUnlock()
+	for _, root := range a.browserCfg.roots {
 		if resolved == root || strings.HasPrefix(resolved, root+"/") {
 			return true
 		}
@@ -91,10 +99,10 @@ func isGitFolder(path string) bool {
 	return err == nil
 }
 
-func listRoots() []FolderEntry {
-	browserMu.RLock()
-	roots := append([]string(nil), browserCfg.roots...)
-	browserMu.RUnlock()
+func (a *app) listRoots() []FolderEntry {
+	a.browserMu.RLock()
+	roots := append([]string(nil), a.browserCfg.roots...)
+	a.browserMu.RUnlock()
 	entries := []FolderEntry{}
 	for _, root := range roots {
 		git := isGitFolder(root)
@@ -107,12 +115,19 @@ func listRoots() []FolderEntry {
 	return entries
 }
 
-func browse(path string) (BrowseResult, error) {
+func (a *app) browse(path string) (BrowseResult, error) {
 	resolved, err := filepath.Abs(path)
 	if err != nil {
 		return BrowseResult{}, err
 	}
-	if !withinRoots(resolved) {
+	// resolve symlinks so the atRoot comparison (and returned paths) line up with
+	// the symlink-resolved roots stored by configureBrowser — e.g. browsing /tmp
+	// must count as being at the /private/tmp root on macOS. A failure means the
+	// path doesn't exist; keep the Abs form and let os.Stat report the error.
+	if r, err := filepath.EvalSymlinks(resolved); err == nil {
+		resolved = r
+	}
+	if !a.withinRoots(resolved) {
 		return BrowseResult{}, errors.New("path outside configured roots")
 	}
 	st, err := os.Stat(resolved)
@@ -123,15 +138,15 @@ func browse(path string) (BrowseResult, error) {
 		return BrowseResult{}, errors.New("not a directory")
 	}
 
-	browserMu.RLock()
-	showHidden := browserCfg.showHidden
+	a.browserMu.RLock()
+	showHidden := a.browserCfg.showHidden
 	atRoot := false
-	for _, root := range browserCfg.roots {
+	for _, root := range a.browserCfg.roots {
 		if root == resolved {
 			atRoot = true
 		}
 	}
-	browserMu.RUnlock()
+	a.browserMu.RUnlock()
 
 	dirEntries, err := os.ReadDir(resolved)
 	if err != nil {
@@ -158,8 +173,10 @@ func browse(path string) (BrowseResult, error) {
 		if !fi.IsDir() {
 			continue
 		}
-		// symlinks must still resolve inside the roots
-		if isSymlink && !withinRoots(full) {
+		// symlinks must still resolve inside the roots — withinRoots resolves the
+		// link target, so root/link -> /etc is filtered even though `full` is
+		// lexically inside the root
+		if isSymlink && !a.withinRoots(full) {
 			continue
 		}
 		git := isGitFolder(full)
@@ -210,8 +227,8 @@ func browse(path string) (BrowseResult, error) {
 var remoteRefRe = regexp.MustCompile(`^refs/remotes/[^/]+/`)
 
 // branchList is the TS `branches()` — renamed to avoid clashing with git terms.
-func branchList(path string) ([]string, error) {
-	if !withinRoots(path) {
+func (a *app) branchList(path string) ([]string, error) {
+	if !a.withinRoots(path) {
 		return nil, errors.New("path outside configured roots")
 	}
 	out, err := gitOut(path, 3*time.Second, "for-each-ref", "--format=%(refname)", "--sort=-committerdate", "refs/heads/", "refs/remotes/")

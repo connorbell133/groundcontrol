@@ -7,7 +7,6 @@ import (
 	"io"
 	"net/http"
 	"strings"
-	"sync"
 	"time"
 )
 
@@ -34,34 +33,27 @@ type eventListener struct {
 	fn func(LifecycleEvent)
 }
 
-var (
-	eventsMu       sync.Mutex
-	webhooks       []WebhookConfig
-	eventListeners []eventListener
-	nextListenerID int
-)
-
-func configureWebhooks(cfg []WebhookConfig) {
-	eventsMu.Lock()
-	defer eventsMu.Unlock()
+func (a *app) configureWebhooks(cfg []WebhookConfig) {
+	a.eventsMu.Lock()
+	defer a.eventsMu.Unlock()
 	if cfg == nil {
 		cfg = []WebhookConfig{}
 	}
-	webhooks = cfg
+	a.webhooks = cfg
 }
 
-func onEvent(fn func(LifecycleEvent)) func() {
-	eventsMu.Lock()
-	defer eventsMu.Unlock()
-	nextListenerID++
-	id := nextListenerID
-	eventListeners = append(eventListeners, eventListener{id: id, fn: fn})
+func (a *app) onEvent(fn func(LifecycleEvent)) func() {
+	a.eventsMu.Lock()
+	defer a.eventsMu.Unlock()
+	a.nextListenerID++
+	id := a.nextListenerID
+	a.eventListeners = append(a.eventListeners, eventListener{id: id, fn: fn})
 	return func() {
-		eventsMu.Lock()
-		defer eventsMu.Unlock()
-		for i, l := range eventListeners {
+		a.eventsMu.Lock()
+		defer a.eventsMu.Unlock()
+		for i, l := range a.eventListeners {
 			if l.id == id {
-				eventListeners = append(eventListeners[:i], eventListeners[i+1:]...)
+				a.eventListeners = append(a.eventListeners[:i], a.eventListeners[i+1:]...)
 				break
 			}
 		}
@@ -100,7 +92,7 @@ type emitOpts struct {
 	alsoMatch      []string
 }
 
-func emit(event string, data map[string]any, opts emitOpts) {
+func (a *app) emit(event string, data map[string]any, opts emitOpts) {
 	title := opts.title
 	if title == "" {
 		title = event
@@ -112,12 +104,12 @@ func emit(event string, data map[string]any, opts emitOpts) {
 		Message: opts.message,
 		Data:    data,
 	}
-	eventsMu.Lock()
-	ls := make([]eventListener, len(eventListeners))
-	copy(ls, eventListeners)
-	hooks := make([]WebhookConfig, len(webhooks))
-	copy(hooks, webhooks)
-	eventsMu.Unlock()
+	a.eventsMu.Lock()
+	ls := make([]eventListener, len(a.eventListeners))
+	copy(ls, a.eventListeners)
+	hooks := make([]WebhookConfig, len(a.webhooks))
+	copy(hooks, a.webhooks)
+	a.eventsMu.Unlock()
 	for _, l := range ls {
 		func() {
 			// one bad subscriber must not break the others
@@ -132,7 +124,7 @@ func emit(event string, data map[string]any, opts emitOpts) {
 			filter = *hook.Events
 		}
 		if matches(filter, tokens) {
-			deliverWebhook(hook.URL, e)
+			a.deliverWebhook(hook.URL, e)
 		}
 	}
 }
@@ -140,7 +132,7 @@ func emit(event string, data map[string]any, opts emitOpts) {
 // Fire-and-forget POST: same contract as the old ntfy path — bounded, and a
 // hanging endpoint must never delay lifecycle handling. Failures are journaled
 // so silent drops stay diagnosable.
-func deliverWebhook(url string, payload LifecycleEvent) {
+func (a *app) deliverWebhook(url string, payload LifecycleEvent) {
 	body, err := json.Marshal(payload)
 	if err != nil {
 		return
@@ -151,19 +143,19 @@ func deliverWebhook(url string, payload LifecycleEvent) {
 		req, err := http.NewRequestWithContext(ctx, http.MethodPost, url, bytes.NewReader(body))
 		if err != nil {
 			// invalid URL slipped through validation — journal so the drop stays diagnosable
-			journal(map[string]any{"event": "webhook.failed", "url": url, "reason": err.Error(), "for": payload.Event})
+			a.journal(map[string]any{"event": "webhook.failed", "url": url, "reason": err.Error(), "for": payload.Event})
 			return
 		}
 		req.Header.Set("content-type", "application/json")
 		res, err := http.DefaultClient.Do(req)
 		if err != nil {
-			journal(map[string]any{"event": "webhook.failed", "url": url, "reason": err.Error(), "for": payload.Event})
+			a.journal(map[string]any{"event": "webhook.failed", "url": url, "reason": err.Error(), "for": payload.Event})
 			return
 		}
 		defer res.Body.Close()
 		_, _ = io.Copy(io.Discard, res.Body)
 		if res.StatusCode < 200 || res.StatusCode >= 300 {
-			journal(map[string]any{"event": "webhook.failed", "url": url, "status": res.StatusCode, "for": payload.Event})
+			a.journal(map[string]any{"event": "webhook.failed", "url": url, "status": res.StatusCode, "for": payload.Event})
 		}
 	}()
 }

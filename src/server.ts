@@ -6,6 +6,7 @@ import { join } from "node:path";
 import { createApi, type Config } from "./api.js";
 import { configureWebhooks } from "./events.js";
 import { configureBrowser } from "./folders.js";
+import { configureJobs } from "./jobs.js";
 import { listSessions, sweepOrphanWorktrees } from "./sessions.js";
 
 const CONFIG_PATH = join(process.cwd(), "config.json");
@@ -15,6 +16,7 @@ if ((config as unknown as Record<string, unknown>).ntfy !== undefined) {
 }
 configureBrowser(config.roots, config.showHidden);
 configureWebhooks(config.webhooks);
+configureJobs(config.jobs);
 sweepOrphanWorktrees();
 
 function applyAndPersistConfig() {

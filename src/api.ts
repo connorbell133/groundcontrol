@@ -5,6 +5,7 @@ import { existsSync, statSync } from "node:fs";
 import QRCode from "qrcode";
 import { onEvent, type WebhookConfig } from "./events.js";
 import { browse, branches, listRoots, withinRoots } from "./folders.js";
+import { cancelJob, createJob, getJob, getJobLog, listJobs, removeJob, type JobsConfig } from "./jobs.js";
 import {
   createSession,
   forceRemoveWorktree,
@@ -24,6 +25,7 @@ export interface Config {
   roots: string[];
   showHidden: boolean;
   webhooks?: WebhookConfig[];
+  jobs?: JobsConfig;
   authToken?: string;
 }
 
@@ -42,7 +44,9 @@ export type ApiErrorCode =
   | "ready_timeout"
   | "launch_failed"
   | "session_live"
-  | "worktree_error";
+  | "job_live"
+  | "worktree_error"
+  | "not_implemented";
 
 function err(c: Context, status: ContentfulStatusCode, code: ApiErrorCode, message: string) {
   return c.json({ error: { code, message } }, status);
@@ -215,6 +219,60 @@ export function createApi(config: Config, persistConfig: () => void): Hono {
         `session ${session.id} exited before pairing${latest.exitCode !== null ? ` (code ${latest.exitCode})` : ""}${latest.lastLine ? ` — ${latest.lastLine}` : ""}`
       );
     return err(c, 504, "ready_timeout", `session ${session.id} not ready after ${timeoutMs}ms — still starting; poll GET /sessions/${session.id}`);
+  });
+
+  /* ---------- headless jobs: claude -p, no phone in the loop ---------- */
+
+  api.post("/jobs", async (c) => {
+    const body = await c.req.json().catch(() => null);
+    if (!body) return err(c, 400, "invalid_json", "request body must be valid JSON");
+    if (!body.folder) return err(c, 400, "missing_param", "folder required");
+    if (typeof body.prompt !== "string" || !body.prompt.trim()) return err(c, 400, "missing_param", "prompt required");
+    if (!withinRoots(body.folder)) return err(c, 400, "outside_roots", "folder outside configured roots");
+    if (body.callbackUrl !== undefined && (typeof body.callbackUrl !== "string" || !HTTP_URL.test(body.callbackUrl)))
+      return err(c, 400, "invalid_param", "callbackUrl must be an http(s) URL");
+    // honest about the launch console's wired-for-v1 toggle: accepted, never ignored
+    if (body.isolation || body.docker)
+      return err(c, 501, "not_implemented", "Docker isolation is not implemented yet — jobs run as the runner's user");
+    try {
+      const job = createJob({
+        folder: body.folder,
+        prompt: body.prompt,
+        spawnMode: body.spawnMode,
+        branch: body.branch,
+        permissionMode: body.permissionMode,
+        timeoutMs: body.timeoutMs,
+        callbackUrl: body.callbackUrl,
+      });
+      return c.json(job, 202);
+    } catch (e) {
+      return err(c, 409, "launch_failed", (e as Error).message);
+    }
+  });
+
+  api.get("/jobs", (c) => c.json({ jobs: listJobs() }));
+
+  api.get("/jobs/:id", (c) => {
+    const job = getJob(c.req.param("id"));
+    return job ? c.json(job) : err(c, 404, "not_found", "no such job");
+  });
+
+  api.get("/jobs/:id/log", (c) => {
+    const log = getJobLog(c.req.param("id"));
+    return log === null ? err(c, 404, "not_found", "no such job") : c.text(log);
+  });
+
+  api.delete("/jobs/:id", (c) => {
+    const job = cancelJob(c.req.param("id"));
+    return job ? c.json(job) : err(c, 404, "not_found", "no such job");
+  });
+
+  api.delete("/jobs/:id/record", (c) => {
+    try {
+      return removeJob(c.req.param("id")) ? c.json({ ok: true }) : err(c, 404, "not_found", "no such job");
+    } catch (e) {
+      return err(c, 409, "job_live", (e as Error).message);
+    }
   });
 
   api.get("/sessions/:id", (c) => {

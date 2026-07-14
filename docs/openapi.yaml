@@ -77,7 +77,9 @@ components:
                 - ready_timeout
                 - launch_failed
                 - session_live
+                - job_live
                 - worktree_error
+                - not_implemented
             message:
               type: string
 
@@ -124,13 +126,13 @@ components:
       type: object
       required: [event, at, title, message, data]
       properties:
-        event: { type: string, description: "session.start | session.ready | session.exit | session.kill" }
+        event: { type: string, description: "session.start | session.ready | session.exit | session.kill | job.start | job.exit" }
         at: { type: string, format: date-time }
         title: { type: string, description: Ready-made human summary line. }
         message: { type: string }
         data:
           type: object
-          description: The full session object under a "session" key.
+          description: The full session object under a "session" key, or the job under a "job" key.
 
     WebhookConfig:
       type: object
@@ -143,6 +145,44 @@ components:
           description: >
             Filter tokens: exact names, prefix wildcards (session.*), "*" or
             omitted for everything, and the derived token session.failed.
+
+    Job:
+      type: object
+      required: [id, folder, prompt, spawnMode, branch, permissionMode, timeoutMs, callbackUrl, state, createdAt, startedAt, finishedAt, exitCode, result, costUsd, durationMs, numTurns, worktreePath]
+      properties:
+        id: { type: string }
+        folder: { type: string }
+        prompt: { type: string }
+        spawnMode: { type: string, enum: [same-dir, worktree] }
+        branch: { type: [string, "null"] }
+        permissionMode: { type: string }
+        timeoutMs: { type: integer }
+        callbackUrl: { type: [string, "null"] }
+        state: { type: string, enum: [queued, running, succeeded, failed, timeout, canceled] }
+        createdAt: { type: string, format: date-time }
+        startedAt: { type: [string, "null"], format: date-time }
+        finishedAt: { type: [string, "null"], format: date-time }
+        exitCode: { type: [integer, "null"] }
+        result: { type: [string, "null"], description: "Claude's final text, or the launch/kill reason." }
+        costUsd: { type: [number, "null"] }
+        durationMs: { type: [integer, "null"] }
+        numTurns: { type: [integer, "null"] }
+        worktreePath: { type: [string, "null"] }
+
+    CreateJob:
+      type: object
+      required: [folder, prompt]
+      properties:
+        folder: { type: string, description: Absolute path inside a configured root. }
+        prompt: { type: string }
+        spawnMode:
+          type: string
+          enum: [same-dir, worktree]
+          description: Defaults to worktree for git folders — autonomous runs get a fresh checkout.
+        branch: { type: string, description: Worktree base; defaults to the repo's current branch. }
+        permissionMode: { type: string, default: acceptEdits, description: Real autonomy usually wants an explicit bypassPermissions. }
+        timeoutMs: { type: integer, description: "Kill deadline; default from the jobs config key (15 min), max 2h." }
+        callbackUrl: { type: string, description: POSTed the job.exit event on completion. }
 
     FolderEntry:
       type: object
@@ -491,6 +531,115 @@ paths:
             text/event-stream:
               schema: { type: string }
         "401": { $ref: "#/components/responses/Unauthorized" }
+
+  /jobs:
+    get:
+      summary: List jobs
+      responses:
+        "200":
+          description: All jobs this runner knows, newest first.
+          content:
+            application/json:
+              schema:
+                type: object
+                required: [jobs]
+                properties:
+                  jobs:
+                    type: array
+                    items: { $ref: "#/components/schemas/Job" }
+        "401": { $ref: "#/components/responses/Unauthorized" }
+    post:
+      summary: Queue a headless job
+      description: >
+        Runs claude -p <prompt> --output-format json to completion — no PTY,
+        no pairing, no human. FIFO queue, bounded concurrency (default 2).
+        An isolation/docker field is rejected with 501 not_implemented.
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema: { $ref: "#/components/schemas/CreateJob" }
+      responses:
+        "202":
+          description: Queued (or already running if a slot was free).
+          content:
+            application/json:
+              schema: { $ref: "#/components/schemas/Job" }
+        "400": { $ref: "#/components/responses/BadRequest" }
+        "401": { $ref: "#/components/responses/Unauthorized" }
+        "409":
+          description: "launch_failed: not a git repo in worktree mode, or detached with no branch given."
+          content:
+            application/json:
+              schema: { $ref: "#/components/schemas/Error" }
+        "501":
+          description: "not_implemented: Docker isolation requested."
+          content:
+            application/json:
+              schema: { $ref: "#/components/schemas/Error" }
+
+  /jobs/{id}:
+    get:
+      summary: Inspect a job
+      parameters:
+        - $ref: "#/components/parameters/sessionId"
+      responses:
+        "200":
+          description: The job with result, cost, duration, turns once finished.
+          content:
+            application/json:
+              schema: { $ref: "#/components/schemas/Job" }
+        "401": { $ref: "#/components/responses/Unauthorized" }
+        "404": { $ref: "#/components/responses/NotFound" }
+    delete:
+      summary: Cancel a job
+      description: Dequeues a queued job, kills a running one's whole process group; a no-op on finished jobs.
+      parameters:
+        - $ref: "#/components/parameters/sessionId"
+      responses:
+        "200":
+          description: The job as of the cancel.
+          content:
+            application/json:
+              schema: { $ref: "#/components/schemas/Job" }
+        "401": { $ref: "#/components/responses/Unauthorized" }
+        "404": { $ref: "#/components/responses/NotFound" }
+
+  /jobs/{id}/log:
+    get:
+      summary: Job log (raw stdout+stderr)
+      parameters:
+        - $ref: "#/components/parameters/sessionId"
+      responses:
+        "200":
+          description: Log text.
+          content:
+            text/plain:
+              schema: { type: string }
+        "401": { $ref: "#/components/responses/Unauthorized" }
+        "404": { $ref: "#/components/responses/NotFound" }
+
+  /jobs/{id}/record:
+    delete:
+      summary: Drop a finished job from the list
+      parameters:
+        - $ref: "#/components/parameters/sessionId"
+      responses:
+        "200":
+          description: Dropped.
+          content:
+            application/json:
+              schema:
+                type: object
+                properties:
+                  ok: { type: boolean }
+        "401": { $ref: "#/components/responses/Unauthorized" }
+        "404": { $ref: "#/components/responses/NotFound" }
+        "409":
+          description: "job_live: still queued or running — cancel it first."
+          content:
+            application/json:
+              schema: { $ref: "#/components/schemas/Error" }
 
   /journal/recent:
     get:

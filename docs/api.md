@@ -54,7 +54,9 @@ change; renaming one is breaking.
 | `ready_timeout` | 504 | `?wait=ready` deadline passed — session still starting, keep polling |
 | `launch_failed` | 409 | spawn rejected — duplicate live name, unknown branch, dirty checkout on branch switch, worktree creation failed |
 | `session_live` | 409 | tried to dismiss a session that's still running |
+| `job_live` | 409 | tried to dismiss a job that's still queued/running — cancel it first |
 | `worktree_error` | 400 | kept-worktree removal failed or path isn't runner-managed |
+| `not_implemented` | 501 | the field is real but the feature isn't (Docker isolation) — rejected rather than silently ignored |
 
 ## Endpoints
 
@@ -118,6 +120,57 @@ if the deadline passed while still provisioning.
 Session states: `starting` → `ready` (pairing URL scraped) → `exited`;
 `error` means it died before ever becoming ready.
 
+### Jobs (headless agents)
+
+Sessions need a phone to finish the loop; jobs don't. `POST /jobs` runs
+`claude -p <prompt> --output-format json` to completion — the resource n8n
+and cron-shaped automations talk to.
+
+| method + path | what |
+|---|---|
+| `GET /jobs` | all jobs this runner knows, newest first |
+| `POST /jobs` | queue a headless run — see below; returns `202` immediately |
+| `GET /jobs/:id` | status, result, cost, duration, turns |
+| `GET /jobs/:id/log` | raw stdout+stderr |
+| `DELETE /jobs/:id` | cancel — dequeues a queued job, kills a running one (whole process group); a no-op on finished jobs |
+| `DELETE /jobs/:id/record` | drop a finished job from the list |
+
+`POST /jobs` body:
+
+```json
+{
+  "folder": "/home/you/repos/checkout-service",
+  "prompt": "run the test suite and fix the first failing test; commit the fix",
+  "branch": "main",
+  "spawnMode": "worktree",
+  "permissionMode": "acceptEdits",
+  "timeoutMs": 900000,
+  "callbackUrl": "http://n8n.local:5678/webhook/gc-jobs"
+}
+```
+
+- `prompt` (required) — what the agent should do.
+- `spawnMode` — **defaults to `worktree`** for git folders (an autonomous run
+  should not dirty a checkout you might be standing in); `branch` defaults to
+  the repo's current branch. Non-git folders run in place.
+- `permissionMode` — defaults to `acceptEdits`: file edits flow, anything
+  else a non-interactive run can't approve is denied. Real autonomy (running
+  commands, git pushes) usually wants an explicit `bypassPermissions` — say
+  it, mean it.
+- `timeoutMs` — kill deadline, default 15 min (configurable via the `jobs`
+  config key), max 2h. A timed-out job ends in state `timeout`.
+- `callbackUrl` — POSTed the `job.exit` event when the run finishes.
+- `isolation` / `docker` — accepted and rejected with `501 not_implemented`;
+  jobs currently run as the runner's user, same as sessions.
+
+Job states: `queued` → `running` → `succeeded` | `failed` | `timeout` |
+`canceled`. Concurrency is bounded (default 2, FIFO queue) by the `jobs`
+config key: `{ "concurrency": 2, "timeoutMs": 900000 }`. On completion,
+`result` carries claude's final text, plus `costUsd`, `durationMs`, and
+`numTurns` parsed from the JSON output. The journal stores a prompt hash and
+an 80-char preview, never the full prompt — the full text lives on the job
+record until dismissed.
+
 ## Events & notifications
 
 One mechanism, one payload. Every lifecycle transition becomes an event:
@@ -135,7 +188,8 @@ One mechanism, one payload. Every lifecycle transition becomes an event:
 `event`/`data` are for machines; `title`/`message` are ready-made human
 strings so notification receivers don't have to compose their own.
 
-Events: `session.start`, `session.ready`, `session.exit`, `session.kill`.
+Events: `session.start`, `session.ready`, `session.exit`, `session.kill`,
+`job.start`, `job.exit` (with `data.job` instead of `data.session`).
 
 Three ways to consume them:
 
@@ -159,12 +213,13 @@ URL plus an optional event filter; every matching event is POSTed as JSON
 ]
 ```
 
-Filter tokens: exact event names, prefix wildcards (`session.*`), `*` (or
-omit `events`) for everything, and the derived token `session.failed` — a
-`session.exit` whose process failed (nonzero exit or died before ready, and
-wasn't killed on purpose) also matches it, so "failures only" needs no
-client-side logic. No receiver is special: n8n consumes the JSON raw; ntfy
-renders it via its `?template=yes` query params as shown above.
+Filter tokens: exact event names, prefix wildcards (`session.*`, `job.*`),
+`*` (or omit `events`) for everything, and the derived tokens
+`session.failed` / `job.failed` — an exit whose run failed (nonzero exit,
+died before ready, or timed out; not killed on purpose) also matches them, so
+"failures only" needs no client-side logic. No receiver is special: n8n
+consumes the JSON raw; ntfy renders it via its `?template=yes` query params
+as shown above.
 
 **3. Per-launch `callbackUrl`** — scoped to one session, delivered regardless
 of the global subscriber list. Right for job-style automations that only care
@@ -224,6 +279,17 @@ List everything in flight:
 
 ```bash
 curl -sf -H "$AUTH" $GC/sessions | jq '.sessions[] | {id, name, state, folder, branch}'
+```
+
+Fire a headless job from n8n (HTTP node) and get the result on your webhook:
+
+```bash
+curl -sf -H "$AUTH" -X POST $GC/jobs -d '{
+  "folder": "/home/you/repos/checkout-service",
+  "prompt": "update CHANGELOG.md from the last 5 commits and commit it",
+  "permissionMode": "bypassPermissions",
+  "callbackUrl": "http://n8n.local:5678/webhook/gc-jobs"
+}'
 ```
 
 Relaunch the most recent launch config:

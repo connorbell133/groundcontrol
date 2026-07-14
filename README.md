@@ -111,6 +111,7 @@ That gives you a stable HTTPS URL on your tailnet — which also unlocks PWA ins
 | `roots` | absolute paths the folder browser can see (and the only places sessions may launch) |
 | `authToken` | bearer token required on every API call; empty disables auth (don't) |
 | `webhooks` | notification subscribers: `[{url, events?}]` — each lifecycle event is POSTed as JSON to every matching URL; filter with exact names, `session.*`, `session.failed`, or `*` |
+| `jobs` | headless-job bounds: `{concurrency, timeoutMs}` (default 2 parallel, 15 min) |
 | `showHidden` | show dotfolders in the browser |
 | `port`, `host` | where the server listens |
 
@@ -118,7 +119,7 @@ Everything user-facing — theme, launch defaults, roots, the notification webho
 
 ## API
 
-Everything the app does is a bearer-token HTTP API at `/api/v1` — the PWA is just the first client. Spawn a session from a script or an n8n workflow with `POST /api/v1/sessions?wait=ready` and get the pairing URL in one round-trip; tail the log; kill it; follow every lifecycle event live over SSE (`GET /api/v1/events`) or per-launch `callbackUrl` webhooks. [docs/api.md](docs/api.md) is the guide with a curl cookbook; [docs/openapi.yaml](docs/openapi.yaml) is the machine contract. Errors are a stable envelope (`{"error":{"code","message"}}`) — key off `code`.
+Everything the app does is a bearer-token HTTP API at `/api/v1` — the PWA is just the first client. Spawn a session from a script or an n8n workflow with `POST /api/v1/sessions?wait=ready` and get the pairing URL in one round-trip; run a fully headless agent with `POST /api/v1/jobs` (`claude -p` in a fresh worktree, result + cost on your webhook); follow every lifecycle event live over SSE (`GET /api/v1/events`). [docs/api.md](docs/api.md) is the guide with a curl cookbook; [docs/openapi.yaml](docs/openapi.yaml) is the machine contract. Errors are a stable envelope (`{"error":{"code","message"}}`) — key off `code`.
 
 ## Development
 

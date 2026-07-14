@@ -106,19 +106,38 @@ export interface RecentLaunch {
   spawnMode: string;
   permissionMode: string;
   at: string;
-  stale: boolean; // worktree config whose branch no longer exists
+  stale: boolean; // launch config whose branch no longer exists
 }
 
-function branchExists(folder: string, branch: string): boolean {
+// resolve a picked branch name to a checkout-able ref: local branch as-is, else the
+// remote-tracking ref (the picker offers remote branches a fresh clone never checked out)
+function resolveBranch(folder: string, branch: string): string | null {
   try {
     execFileSync("git", ["-C", folder, "rev-parse", "--verify", "--quiet", `refs/heads/${branch}`], {
       stdio: "ignore",
       timeout: 2000,
     });
-    return true;
+    return branch;
   } catch {
-    return false;
+    /* not a local branch */
   }
+  try {
+    const remote = execFileSync(
+      "git",
+      ["-C", folder, "for-each-ref", "--format=%(refname:short)", `refs/remotes/*/${branch}`],
+      { encoding: "utf8", timeout: 2000 }
+    )
+      .trim()
+      .split("\n")
+      .filter(Boolean)[0];
+    return remote || null;
+  } catch {
+    return null;
+  }
+}
+
+function branchExists(folder: string, branch: string): boolean {
+  return resolveBranch(folder, branch) !== null;
 }
 
 export interface LostSession extends RecentLaunch {
@@ -156,7 +175,7 @@ export function recentLaunches(limit: number): RecentLaunch[] {
       spawnMode,
       permissionMode: e.permissionMode ?? "default",
       at: e.at ?? "",
-      stale: spawnMode === "worktree" && !!branch && !branchExists(e.folder, branch),
+      stale: !!branch && !branchExists(e.folder, branch),
     });
   }
   return out;
@@ -188,7 +207,7 @@ export function listLostSessions(): LostSession[] {
       spawnMode,
       permissionMode: e.permissionMode ?? "default",
       at: e.at,
-      stale: spawnMode === "worktree" && !!branch && !branchExists(e.folder, branch),
+      stale: !!branch && !branchExists(e.folder, branch),
     });
   }
   lostCache = out;
@@ -243,8 +262,26 @@ export function forceRemoveWorktree(wtPath: string): void {
     stdio: ["ignore", "pipe", "ignore"],
   }).trim();
   const mainRoot = commonDir.endsWith("/.git") ? commonDir.slice(0, -5) : commonDir;
+  let wtBranch = "";
+  try {
+    wtBranch = execFileSync("git", ["-C", resolved, "branch", "--show-current"], {
+      encoding: "utf8",
+      timeout: 5000,
+      stdio: ["ignore", "pipe", "ignore"],
+    }).trim();
+  } catch {
+    /* detached or unreadable — nothing to release */
+  }
   execFileSync("git", ["-C", mainRoot, "worktree", "remove", "--force", resolved], { timeout: 15000, stdio: "ignore" });
   execFileSync("git", ["-C", mainRoot, "worktree", "prune"], { timeout: 15000, stdio: "ignore" });
+  // safe delete only: commits on the session branch stay reachable after a force-clean
+  if (wtBranch.startsWith("gc/")) {
+    try {
+      execFileSync("git", ["-C", mainRoot, "branch", "-d", wtBranch], { timeout: 5000, stdio: "ignore" });
+    } catch {
+      /* unmerged work — keep the branch */
+    }
+  }
   journal({ event: "worktree.force-removed", wtPath: resolved });
 }
 
@@ -264,29 +301,50 @@ export function getSessionLog(id: string): string | null {
   return s ? s.log.join("") : null;
 }
 
-function addWorktree(folder: string, branch: string, id: string): string {
+function addWorktree(folder: string, branch: string, id: string): { wtPath: string; wtBranch: string; baseCommit: string } {
   const wtPath = join(homedir(), ".groundcontrol", "worktrees", basename(folder), id);
   mkdirSync(join(homedir(), ".groundcontrol", "worktrees", basename(folder)), { recursive: true });
+  const base = resolveBranch(folder, branch);
+  if (!base) throw new Error(`branch ${branch} not found locally or on a remote`);
+  const wtBranch = `gc/${id}`;
   try {
-    execFileSync("git", ["-C", folder, "worktree", "add", wtPath, branch], {
+    // each session works on its own branch cut from the base: the base may be checked
+    // out in the main folder (git refuses a second checkout) or exist only on a remote
+    execFileSync("git", ["-C", folder, "worktree", "add", "-b", wtBranch, wtPath, base], {
       encoding: "utf8",
       timeout: 15000,
       stdio: ["ignore", "pipe", "pipe"],
     });
   } catch (err) {
     const stderr = (err as { stderr?: string }).stderr?.trim();
-    // git's own message is the most useful thing to surface (e.g. "already checked out")
+    // git's own message is the most useful thing to surface
     throw new Error(stderr?.split("\n").pop() || `could not create worktree for ${branch}`);
   }
-  return wtPath;
+  const baseCommit = execFileSync("git", ["-C", wtPath, "rev-parse", "HEAD"], { encoding: "utf8", timeout: 5000 }).trim();
+  return { wtPath, wtBranch, baseCommit };
 }
 
-function removeWorktree(folder: string, wtPath: string) {
+function removeWorktree(folder: string, wtPath: string, wtBranch?: string | null, baseCommit?: string | null) {
   try {
     execFileSync("git", ["-C", folder, "worktree", "remove", wtPath], { timeout: 15000, stdio: "ignore" });
   } catch {
     // dirty or already gone — keep it rather than destroy work, but make it visible
     journal({ event: "worktree.kept", folder, wtPath, reason: "dirty or removal failed" });
+    return;
+  }
+  // the session branch outlives the worktree only if it accumulated commits
+  if (wtBranch && baseCommit) {
+    try {
+      const tip = execFileSync("git", ["-C", folder, "rev-parse", `refs/heads/${wtBranch}`], {
+        encoding: "utf8",
+        timeout: 5000,
+      }).trim();
+      if (tip === baseCommit) {
+        execFileSync("git", ["-C", folder, "branch", "-D", wtBranch], { timeout: 5000, stdio: "ignore" });
+      }
+    } catch {
+      /* branch already gone */
+    }
   }
 }
 
@@ -312,7 +370,21 @@ export function sweepOrphanWorktrees() {
           stdio: ["ignore", "pipe", "ignore"],
         }).trim();
         const mainRoot = commonDir.endsWith("/.git") ? commonDir.slice(0, -5) : commonDir;
+        const wtBranch = execFileSync("git", ["-C", wtPath, "branch", "--show-current"], {
+          encoding: "utf8",
+          timeout: 5000,
+          stdio: ["ignore", "pipe", "ignore"],
+        }).trim();
         execFileSync("git", ["-C", mainRoot, "worktree", "remove", wtPath], { timeout: 15000, stdio: "ignore" });
+        // -d not -D: an orphan's base commit is unknown, so only drop the session
+        // branch when git agrees it holds nothing unmerged
+        if (wtBranch.startsWith("gc/")) {
+          try {
+            execFileSync("git", ["-C", mainRoot, "branch", "-d", wtBranch], { timeout: 5000, stdio: "ignore" });
+          } catch {
+            /* unmerged work — the branch keeps it reachable */
+          }
+        }
         journal({ event: "worktree.swept", wtPath });
       } catch {
         journal({ event: "worktree.kept", wtPath, reason: "orphan is dirty or unresolvable" });
@@ -338,6 +410,8 @@ export function createSession(opts: {
 
   let worktreePath: string | null = null;
   let branch: string | null = null;
+  let wtBranch: string | null = null;
+  let baseCommit: string | null = null;
   let cwd = opts.folder;
   let repoRootForCleanup: string | null = null;
   if (spawnMode === "worktree") {
@@ -346,11 +420,43 @@ export function createSession(opts: {
     if (!root) throw new Error("folder is not inside a git repository");
     branch = opts.branch;
     repoRootForCleanup = root;
-    worktreePath = addWorktree(root, branch, id); // worktree of the nearest repo root, cleaned up on exit
+    const wt = addWorktree(root, branch, id); // worktree of the nearest repo root, cleaned up on exit
+    worktreePath = wt.wtPath;
+    wtBranch = wt.wtBranch;
+    baseCommit = wt.baseCommit;
     // land in the equivalent subfolder inside the worktree when it exists on that branch
     const rel = relative(root, opts.folder);
     const sub = rel ? join(worktreePath, rel) : worktreePath;
     cwd = existsSync(sub) ? sub : worktreePath;
+  } else if (opts.branch) {
+    // in-folder launch on a chosen branch: switch the checkout first — git refuses if
+    // that would clobber local changes, and DWIMs a local branch for remote-only picks
+    const root = gitRoot(opts.folder);
+    if (root) {
+      let current = "";
+      try {
+        current = execFileSync("git", ["-C", root, "branch", "--show-current"], {
+          encoding: "utf8",
+          timeout: 5000,
+          stdio: ["ignore", "pipe", "ignore"],
+        }).trim();
+      } catch {
+        /* detached or unborn — let switch decide */
+      }
+      if (current !== opts.branch) {
+        try {
+          execFileSync("git", ["-C", root, "switch", opts.branch], {
+            encoding: "utf8",
+            timeout: 15000,
+            stdio: ["ignore", "pipe", "pipe"],
+          });
+        } catch (err) {
+          const stderr = (err as { stderr?: string }).stderr?.trim();
+          throw new Error(stderr?.split("\n").pop() || `could not switch to branch ${opts.branch}`);
+        }
+      }
+      branch = opts.branch;
+    }
   }
 
   const args = ["remote-control", "--name", name, "--spawn", "same-dir", "--permission-mode", permissionMode];
@@ -413,7 +519,7 @@ export function createSession(opts: {
     session.exitedAt = new Date().toISOString();
     session.exitCode = exitCode;
     session.proc = null;
-    if (session.worktreePath) removeWorktree(repoRootForCleanup ?? session.folder, session.worktreePath);
+    if (session.worktreePath) removeWorktree(repoRootForCleanup ?? session.folder, session.worktreePath, wtBranch, baseCommit);
     journal({ event: "session.exit", id, code: exitCode });
     if (!session.killed && ntfy && ntfy.notifyExit !== "never") {
       const failed = exitCode !== 0 || session.state === "error";

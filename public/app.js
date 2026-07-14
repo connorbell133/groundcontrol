@@ -181,7 +181,17 @@ async function relaunchFromRecent(cfg) {
 
 /* ---------- launch sheet ---------- */
 function syncBranchField() {
-  $("branchField").hidden = state.opts.spawnMode !== "worktree" || !state.current.isGit;
+  // visible in any git repo with branches; the mode only changes what picking one means
+  $("branchField").hidden = !state.current?.isGit || state.branchCount === 0;
+  const worktree = state.opts.spawnMode === "worktree";
+  $("branchLabel").textContent = worktree ? "Base branch" : "Branch";
+  const note = worktree
+    ? state.current?.repoRoot && state.current.repoRoot !== state.current.path
+      ? `worktree of ${state.current.repoName}`
+      : "worktree is created from this branch"
+    : "checked out in the folder at launch";
+  const n = state.branchCount;
+  $("branchHint").textContent = n ? `${note} · ${n} branch${n === 1 ? "" : "es"}` : note;
 }
 
 async function loadBranches(folder) {
@@ -189,8 +199,9 @@ async function loadBranches(folder) {
   select.innerHTML = "";
   try {
     const { branches } = await api(`/api/branches?path=${encodeURIComponent(folder)}`);
+    state.branchCount = branches.length;
     if (branches.length === 0) {
-      // repo with no commits yet: worktrees are impossible, so remove the option
+      // repo with no commits yet: no branches to pick and worktrees are impossible
       if (state.opts.spawnMode === "worktree") state.opts.spawnMode = "same-dir";
       syncSegment("optSpawn", state.opts.spawnMode);
       $("spawnField").hidden = true;
@@ -206,9 +217,7 @@ async function loadBranches(folder) {
     // saved choice if the branch still exists, else the repo's current branch
     const preferred = [state.opts.branch, state.current.branch].find((b) => b && branches.includes(b));
     if (preferred) select.value = preferred;
-    const repoNote = state.current.repoRoot && state.current.repoRoot !== state.current.path
-      ? `worktree of ${state.current.repoName}` : "worktree is created from this branch";
-    $("branchHint").textContent = `${repoNote} · ${branches.length} branches`;
+    syncBranchField();
   } catch {
     $("branchHint").textContent = "could not load branches";
   }
@@ -230,6 +239,7 @@ function openSheet(prefill) {
   if (!git && state.opts.spawnMode === "worktree") state.opts.spawnMode = "same-dir";
   syncSegment("optSpawn", state.opts.spawnMode);
   syncSegment("optPerm", state.opts.permissionMode);
+  state.branchCount = undefined; // unknown until this folder's branches load
   syncBranchField();
   if (git) loadBranches(folder);
 
@@ -287,7 +297,7 @@ async function launch() {
   btn.disabled = true;
   btn.innerHTML = `<span class="cta-glyph">◴</span> Launching…`;
   try {
-    const branch = state.opts.spawnMode === "worktree" ? $("optBranch").value || undefined : undefined;
+    const branch = state.current.isGit ? $("optBranch").value || undefined : undefined;
     state.opts.branch = branch;
     localStorage.setItem(`opts:${state.path}`, JSON.stringify(state.opts));
     await api("/api/sessions", {

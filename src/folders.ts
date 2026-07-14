@@ -109,14 +109,27 @@ export function browse(path: string): BrowseResult {
 export function branches(path: string): string[] {
   if (!withinRoots(path)) throw new Error("path outside configured roots");
   try {
-    return execFileSync(
+    const refs = execFileSync(
       "git",
-      ["-C", path, "for-each-ref", "--format=%(refname:short)", "refs/heads/", "--sort=-committerdate"],
+      ["-C", path, "for-each-ref", "--format=%(refname)", "--sort=-committerdate", "refs/heads/", "refs/remotes/"],
       { encoding: "utf8", timeout: 3000 }
     )
       .trim()
       .split("\n")
       .filter(Boolean);
+    // remote-tracking refs collapse to plain branch names so a fresh clone (one local
+    // branch) still offers everything on origin; first occurrence wins the dedup
+    const seen = new Set<string>();
+    const names: string[] = [];
+    for (const ref of refs) {
+      const name = ref.startsWith("refs/heads/")
+        ? ref.slice("refs/heads/".length)
+        : ref.replace(/^refs\/remotes\/[^/]+\//, "");
+      if (name === "HEAD" || seen.has(name)) continue;
+      seen.add(name);
+      names.push(name);
+    }
+    return names;
   } catch {
     return [];
   }

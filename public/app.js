@@ -725,9 +725,26 @@ function wireSetSegment(id, key) {
     };
   });
 }
-for (const pair of ["setTheme:theme", "setSpawn:spawnMode", "setPerm:permissionMode", "setNtfyReady:ntfyReady", "setNtfyExit:ntfyExit", "setHidden:hidden"]) {
+for (const pair of ["setTheme:theme", "setSpawn:spawnMode", "setPerm:permissionMode", "setHookEvents:hookEvents", "setHidden:hidden"]) {
   const [id, key] = pair.split(":");
   wireSetSegment(id, key);
+}
+
+// the settings sheet edits the first webhook; extra subscribers set up via
+// config.json or the API are preserved untouched on save
+const HOOK_PRESETS = {
+  failures: ["session.failed", "job.failed"],
+  ready: ["session.ready", "session.failed", "job.failed"],
+  all: ["*"],
+};
+let webhooksDraft = [];
+function hookPresetFor(events) {
+  if (!events || !events.length) return "all";
+  const key = [...events].sort().join(",");
+  for (const [name, set] of Object.entries(HOOK_PRESETS)) {
+    if ([...set].sort().join(",") === key) return name;
+  }
+  return "custom"; // hand-edited filter — shown unhighlighted, preserved on save
 }
 
 let rootsDraft = [];
@@ -802,15 +819,13 @@ async function openSettings() {
   renderWorktrees();
   try {
     const cfg = await api("/api/v1/config");
-    setVals.ntfyReady = cfg.ntfy.notifyReady ? "on" : "off";
-    setVals.ntfyExit = cfg.ntfy.notifyExit;
+    webhooksDraft = Array.isArray(cfg.webhooks) ? [...cfg.webhooks] : [];
+    setVals.hookEvents = hookPresetFor(webhooksDraft[0]?.events);
     setVals.hidden = cfg.showHidden ? "on" : "off";
-    $("setNtfyTopic").value = cfg.ntfy.topic;
-    $("setNtfyUrl").value = cfg.ntfy.url;
+    $("setHookUrl").value = webhooksDraft[0]?.url || "";
     rootsDraft = [...cfg.roots];
     renderRootChips();
-    syncSegment("setNtfyReady", setVals.ntfyReady);
-    syncSegment("setNtfyExit", setVals.ntfyExit);
+    syncSegment("setHookEvents", setVals.hookEvents);
     syncSegment("setHidden", setVals.hidden);
   } catch {
     toast("could not load server config", true);
@@ -829,12 +844,13 @@ async function saveSettings() {
       headers: { "content-type": "application/json" },
       body: JSON.stringify({
         showHidden: setVals.hidden === "on",
-        ntfy: {
-          url: $("setNtfyUrl").value.trim() || "https://ntfy.sh",
-          topic: $("setNtfyTopic").value.trim(),
-          notifyReady: setVals.ntfyReady === "on",
-          notifyExit: setVals.ntfyExit || "errors",
-        },
+        webhooks: (() => {
+          const url = $("setHookUrl").value.trim();
+          const rest = webhooksDraft.slice(1);
+          if (!url) return rest;
+          const events = setVals.hookEvents === "custom" ? webhooksDraft[0]?.events : HOOK_PRESETS[setVals.hookEvents || "failures"];
+          return [{ url, ...(events && !events.includes("*") ? { events } : {}) }, ...rest];
+        })(),
         roots: rootsDraft,
       }),
     });

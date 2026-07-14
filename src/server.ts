@@ -4,18 +4,22 @@ import { Hono } from "hono";
 import { readFileSync, writeFileSync } from "node:fs";
 import { join } from "node:path";
 import { createApi, type Config } from "./api.js";
+import { configureWebhooks } from "./events.js";
 import { configureBrowser } from "./folders.js";
-import { configureNtfy, listSessions, sweepOrphanWorktrees } from "./sessions.js";
+import { listSessions, sweepOrphanWorktrees } from "./sessions.js";
 
 const CONFIG_PATH = join(process.cwd(), "config.json");
 const config: Config = JSON.parse(readFileSync(CONFIG_PATH, "utf8"));
+if ((config as unknown as Record<string, unknown>).ntfy !== undefined) {
+  console.warn("config.ntfy is no longer used — notifications are generic webhooks now; see the webhooks key in README");
+}
 configureBrowser(config.roots, config.showHidden);
-configureNtfy(config.ntfy);
+configureWebhooks(config.webhooks);
 sweepOrphanWorktrees();
 
 function applyAndPersistConfig() {
   configureBrowser(config.roots, config.showHidden);
-  configureNtfy(config.ntfy);
+  configureWebhooks(config.webhooks);
   writeFileSync(CONFIG_PATH, JSON.stringify(config, null, 2) + "\n");
 }
 

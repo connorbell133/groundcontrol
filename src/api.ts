@@ -1,7 +1,9 @@
 import { Hono, type Context } from "hono";
+import { streamSSE } from "hono/streaming";
 import type { ContentfulStatusCode } from "hono/utils/http-status";
 import { existsSync, statSync } from "node:fs";
 import QRCode from "qrcode";
+import { onEvent, type WebhookConfig } from "./events.js";
 import { browse, branches, listRoots, withinRoots } from "./folders.js";
 import {
   createSession,
@@ -14,7 +16,6 @@ import {
   listSessions,
   recentLaunches,
   removeSession,
-  type NtfyConfig,
 } from "./sessions.js";
 
 export interface Config {
@@ -22,7 +23,7 @@ export interface Config {
   host?: string;
   roots: string[];
   showHidden: boolean;
-  ntfy?: NtfyConfig;
+  webhooks?: WebhookConfig[];
   authToken?: string;
 }
 
@@ -32,11 +33,13 @@ export type ApiErrorCode =
   | "unauthorized"
   | "invalid_json"
   | "missing_param"
+  | "invalid_param"
   | "invalid_path"
   | "invalid_config"
   | "outside_roots"
   | "not_found"
   | "not_ready"
+  | "ready_timeout"
   | "launch_failed"
   | "session_live"
   | "worktree_error";
@@ -45,12 +48,27 @@ function err(c: Context, status: ContentfulStatusCode, code: ApiErrorCode, messa
   return c.json({ error: { code, message } }, status);
 }
 
+const HTTP_URL = /^https?:\/\//;
+
+// block until the session pairs, dies, or the deadline passes — 300ms poll is
+// plenty against a multi-second provision and immune to event races
+async function waitForReady(id: string, timeoutMs: number): Promise<"ready" | "dead" | "timeout"> {
+  const deadline = Date.now() + timeoutMs;
+  for (;;) {
+    const s = getSession(id);
+    if (!s || s.state === "exited" || s.state === "error") return "dead";
+    if (s.state === "ready") return "ready";
+    if (Date.now() >= deadline) return "timeout";
+    await new Promise((r) => setTimeout(r, 300));
+  }
+}
+
 // One sub-app, mounted at /api/v1 (canonical) and /api (deprecated alias for one release).
 export function createApi(config: Config, persistConfig: () => void): Hono {
   const api = new Hono();
 
   // Every route requires the bearer token when one is configured.
-  // ?token= is accepted too because <img> tags (the QR) can't send headers.
+  // ?token= is accepted too because <img> tags (the QR) and EventSource can't send headers.
   api.use("*", async (c, next) => {
     if (!config.authToken) return next();
     const header = c.req.header("authorization");
@@ -85,7 +103,7 @@ export function createApi(config: Config, persistConfig: () => void): Hono {
     c.json({
       roots: config.roots,
       showHidden: config.showHidden,
-      ntfy: config.ntfy ?? { url: "https://ntfy.sh", topic: "", notifyReady: true, notifyExit: "errors" },
+      webhooks: config.webhooks ?? [],
     })
   );
 
@@ -104,12 +122,17 @@ export function createApi(config: Config, persistConfig: () => void): Hono {
       config.roots = body.roots;
     }
     if (body.showHidden !== undefined) config.showHidden = !!body.showHidden;
-    if (body.ntfy !== undefined) {
-      const n = body.ntfy;
-      if (typeof n?.url !== "string" || typeof n?.topic !== "string" || !["errors", "all", "never"].includes(n?.notifyExit)) {
-        return err(c, 400, "invalid_config", "invalid ntfy config");
+    if (body.webhooks !== undefined) {
+      if (!Array.isArray(body.webhooks)) return err(c, 400, "invalid_config", "webhooks must be a list");
+      const hooks: WebhookConfig[] = [];
+      for (const w of body.webhooks) {
+        if (typeof w?.url !== "string" || !HTTP_URL.test(w.url))
+          return err(c, 400, "invalid_config", `webhook url must be http(s): ${w?.url}`);
+        if (w.events !== undefined && (!Array.isArray(w.events) || w.events.some((t: unknown) => typeof t !== "string" || !t.trim())))
+          return err(c, 400, "invalid_config", "webhook events must be a list of non-empty strings");
+        hooks.push({ url: w.url, ...(w.events ? { events: w.events } : {}) });
       }
-      config.ntfy = { url: n.url.replace(/\/+$/, "") || "https://ntfy.sh", topic: n.topic.trim(), notifyReady: !!n.notifyReady, notifyExit: n.notifyExit };
+      config.webhooks = hooks;
     }
     persistConfig();
     return c.json({ ok: true });
@@ -135,23 +158,63 @@ export function createApi(config: Config, persistConfig: () => void): Hono {
     return c.json({ recent: recentLaunches(limit) });
   });
 
+  // Live lifecycle stream (SSE): session.start/ready/exit/kill as they happen.
+  // No replay — reconnecting clients should re-list first; the journal is the history.
+  api.get("/events", (c) =>
+    streamSSE(c, async (stream) => {
+      let live = true;
+      const unsub = onEvent((e) => {
+        if (live) stream.writeSSE({ event: e.event, data: JSON.stringify(e) }).catch(() => {});
+      });
+      stream.onAbort(() => {
+        live = false;
+        unsub();
+      });
+      await stream.writeSSE({ event: "hello", data: JSON.stringify({ at: new Date().toISOString() }) });
+      while (live) {
+        await stream.sleep(25000);
+        if (live) await stream.writeSSE({ event: "ping", data: "" }).catch(() => {});
+      }
+    })
+  );
+
   api.post("/sessions", async (c) => {
     const body = await c.req.json().catch(() => null);
     if (!body) return err(c, 400, "invalid_json", "request body must be valid JSON");
     if (!body.folder) return err(c, 400, "missing_param", "folder required");
     if (!withinRoots(body.folder)) return err(c, 400, "outside_roots", "folder outside configured roots");
+    if (body.callbackUrl !== undefined && (typeof body.callbackUrl !== "string" || !HTTP_URL.test(body.callbackUrl)))
+      return err(c, 400, "invalid_param", "callbackUrl must be an http(s) URL");
+
+    let session;
     try {
-      const session = createSession({
+      session = createSession({
         folder: body.folder,
         name: body.name,
         spawnMode: body.spawnMode,
         branch: body.branch,
         permissionMode: body.permissionMode,
+        callbackUrl: body.callbackUrl,
       });
-      return c.json(session, 201);
     } catch (e) {
       return err(c, 409, "launch_failed", (e as Error).message);
     }
+
+    if (c.req.query("wait") !== "ready") return c.json(session, 201);
+
+    // ?wait=ready: one round-trip to a pairing URL for scripts and automations
+    const timeoutMs = Math.min(300000, Math.max(1000, Number(body.timeoutMs) || 60000));
+    const outcome = await waitForReady(session.id, timeoutMs);
+    const latest = getSession(session.id) ?? session;
+    if (outcome === "ready") return c.json(latest, 201);
+    if (outcome === "dead")
+      return err(
+        c,
+        409,
+        "launch_failed",
+        `session ${session.id} exited before pairing${latest.exitCode !== null ? ` (code ${latest.exitCode})` : ""}${latest.lastLine ? ` — ${latest.lastLine}` : ""}`
+      );
+    return err(c, 504, "ready_timeout", `session ${session.id} not ready after ${timeoutMs}ms — still starting; poll GET /sessions/${session.id}`);
   });
 
   api.get("/sessions/:id", (c) => {

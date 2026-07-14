@@ -1,10 +1,11 @@
 import { spawn as ptySpawn, type IPty } from "node-pty";
 import { execFileSync } from "node:child_process";
-import { existsSync, mkdirSync, readdirSync, readFileSync, writeFileSync } from "node:fs";
-import { homedir } from "node:os";
+import { existsSync, readdirSync } from "node:fs";
 import { basename, join, relative } from "node:path";
 import { randomUUID } from "node:crypto";
+import { deliverWebhook, emit } from "./events.js";
 import { gitRoot, withinRoots } from "./folders.js";
+import { addWorktree, branchExists, currentBranch, journal, readJournal, removeWorktree, WT_BASE } from "./workspace.js";
 
 export type SessionState = "starting" | "ready" | "exited" | "error";
 
@@ -18,6 +19,7 @@ export interface Session {
   permissionMode: string;
   state: SessionState;
   pairingUrl: string | null;
+  callbackUrl: string | null;
   startedAt: string;
   exitedAt: string | null;
   exitCode: number | null;
@@ -32,8 +34,6 @@ interface LiveSession extends Session {
 }
 
 const sessions = new Map<string, LiveSession>();
-const DATA_DIR = join(process.cwd(), "data");
-const JOURNAL = join(DATA_DIR, "journal.json");
 const ANSI = /\x1b\[[0-9;?]*[a-zA-Z]|\x1b\][^\x07]*\x07?/g;
 const URL_RE = /https:\/\/[^\s"'\x1b]+/;
 // box-drawing, blocks, braille spinners, and ASCII rule/spinner chars — lines of only these are visual noise
@@ -49,52 +49,43 @@ function lastMeaningfulLine(log: string[]): string | null {
   return null;
 }
 
-function journal(entry: Record<string, unknown>) {
-  mkdirSync(DATA_DIR, { recursive: true });
-  let all: unknown[] = [];
-  try {
-    all = JSON.parse(readFileSync(JOURNAL, "utf8"));
-  } catch {
-    /* first write */
-  }
-  all.push({ ...entry, at: new Date().toISOString() });
-  writeFileSync(JOURNAL, JSON.stringify(all, null, 2));
-}
-
 function publicView(s: LiveSession): Session {
   const { proc: _proc, log: _log, killed: _killed, ...rest } = s;
   return rest;
 }
 
-/* ---------- ntfy ---------- */
-export interface NtfyConfig {
-  url: string;
-  topic: string;
-  notifyReady: boolean;
-  notifyExit: "errors" | "all" | "never";
-}
-
-let ntfy: NtfyConfig | undefined;
-
-export function configureNtfy(cfg?: NtfyConfig) {
-  ntfy = cfg;
-}
-
-function notify(opts: { title: string; body: string; priority?: string; tags?: string; click?: string }) {
-  if (!ntfy?.topic) return;
-  try {
-    const headers: Record<string, string> = { Title: opts.title.replace(/[^\x20-\x7e]/g, "?") };
-    if (opts.priority) headers.Priority = opts.priority;
-    if (opts.tags) headers.Tags = opts.tags;
-    if (opts.click) headers.Click = opts.click;
-    fetch(`${ntfy.url}/${ntfy.topic}`, {
-      method: "POST",
-      body: opts.body,
-      headers,
-      signal: AbortSignal.timeout(5000),
-    }).catch(() => {});
-  } catch {
-    /* notification failure must never break the session lifecycle */
+// lifecycle fan-out: in-process bus (SSE, wait=ready), configured webhook
+// subscribers, and the per-launch callbackUrl — one payload shape for all
+function announce(event: string, s: LiveSession) {
+  const where = basename(s.folder) + (s.branch ? ` @ ${s.branch}` : "");
+  const failed = event === "session.exit" && !s.killed && (s.exitCode !== 0 || s.state === "error");
+  const titles: Record<string, string> = {
+    "session.start": `session started: ${s.name}`,
+    "session.ready": `session ready: ${s.name}`,
+    "session.kill": `session killed: ${s.name}`,
+    "session.exit": failed ? `session failed: ${s.name}` : `session exited: ${s.name}`,
+  };
+  const messages: Record<string, string> = {
+    "session.start": where,
+    "session.ready": `${where} — ${s.pairingUrl}`,
+    "session.kill": where,
+    "session.exit": failed
+      ? `${where} exited with code ${s.exitCode}${s.state === "error" ? " (died before ready)" : ""}`
+      : `${where} exited cleanly`,
+  };
+  emit(event, { session: publicView(s) }, {
+    title: titles[event] ?? event,
+    message: messages[event] ?? "",
+    alsoMatch: failed ? ["session.failed"] : [],
+  });
+  if (s.callbackUrl && event !== "session.start") {
+    deliverWebhook(s.callbackUrl, {
+      event,
+      at: new Date().toISOString(),
+      title: titles[event] ?? event,
+      message: messages[event] ?? "",
+      data: { session: publicView(s) },
+    });
   }
 }
 
@@ -109,51 +100,11 @@ export interface RecentLaunch {
   stale: boolean; // launch config whose branch no longer exists
 }
 
-// resolve a picked branch name to a checkout-able ref: local branch as-is, else the
-// remote-tracking ref (the picker offers remote branches a fresh clone never checked out)
-function resolveBranch(folder: string, branch: string): string | null {
-  try {
-    execFileSync("git", ["-C", folder, "rev-parse", "--verify", "--quiet", `refs/heads/${branch}`], {
-      stdio: "ignore",
-      timeout: 2000,
-    });
-    return branch;
-  } catch {
-    /* not a local branch */
-  }
-  try {
-    const remote = execFileSync(
-      "git",
-      ["-C", folder, "for-each-ref", "--format=%(refname:short)", `refs/remotes/*/${branch}`],
-      { encoding: "utf8", timeout: 2000 }
-    )
-      .trim()
-      .split("\n")
-      .filter(Boolean)[0];
-    return remote || null;
-  } catch {
-    return null;
-  }
-}
-
-function branchExists(folder: string, branch: string): boolean {
-  return resolveBranch(folder, branch) !== null;
-}
-
 export interface LostSession extends RecentLaunch {
   id: string;
 }
 
 const LOST_WINDOW_MS = 7 * 24 * 60 * 60 * 1000;
-
-function readJournal(): Record<string, unknown>[] {
-  try {
-    const all = JSON.parse(readFileSync(JOURNAL, "utf8"));
-    return Array.isArray(all) ? all.slice(-2000) : [];
-  } catch {
-    return [];
-  }
-}
 
 export function recentLaunches(limit: number): RecentLaunch[] {
   const seen = new Set<string>();
@@ -223,8 +174,6 @@ export interface KeptWorktree {
   dirty: boolean;
 }
 
-const WT_BASE = join(homedir(), ".groundcontrol", "worktrees");
-
 export function listKeptWorktrees(): KeptWorktree[] {
   if (!existsSync(WT_BASE)) return [];
   const live = new Set([...sessions.values()].map((s) => s.worktreePath).filter(Boolean));
@@ -242,7 +191,7 @@ export function listKeptWorktrees(): KeptWorktree[] {
       let branch: string | null = null;
       let dirty = false;
       try {
-        branch = execFileSync("git", ["-C", wtPath, "branch", "--show-current"], { encoding: "utf8", timeout: 3000 }).trim() || null;
+        branch = currentBranch(wtPath);
         dirty = execFileSync("git", ["-C", wtPath, "status", "--porcelain"], { encoding: "utf8", timeout: 5000 }).trim().length > 0;
       } catch {
         /* unreadable — still listed so it can be cleaned */
@@ -262,16 +211,7 @@ export function forceRemoveWorktree(wtPath: string): void {
     stdio: ["ignore", "pipe", "ignore"],
   }).trim();
   const mainRoot = commonDir.endsWith("/.git") ? commonDir.slice(0, -5) : commonDir;
-  let wtBranch = "";
-  try {
-    wtBranch = execFileSync("git", ["-C", resolved, "branch", "--show-current"], {
-      encoding: "utf8",
-      timeout: 5000,
-      stdio: ["ignore", "pipe", "ignore"],
-    }).trim();
-  } catch {
-    /* detached or unreadable — nothing to release */
-  }
+  const wtBranch = currentBranch(resolved) ?? "";
   execFileSync("git", ["-C", mainRoot, "worktree", "remove", "--force", resolved], { timeout: 15000, stdio: "ignore" });
   execFileSync("git", ["-C", mainRoot, "worktree", "prune"], { timeout: 15000, stdio: "ignore" });
   // safe delete only: commits on the session branch stay reachable after a force-clean
@@ -301,60 +241,12 @@ export function getSessionLog(id: string): string | null {
   return s ? s.log.join("") : null;
 }
 
-function addWorktree(folder: string, branch: string, id: string): { wtPath: string; wtBranch: string; baseCommit: string } {
-  const wtPath = join(homedir(), ".groundcontrol", "worktrees", basename(folder), id);
-  mkdirSync(join(homedir(), ".groundcontrol", "worktrees", basename(folder)), { recursive: true });
-  const base = resolveBranch(folder, branch);
-  if (!base) throw new Error(`branch ${branch} not found locally or on a remote`);
-  const wtBranch = `gc/${id}`;
-  try {
-    // each session works on its own branch cut from the base: the base may be checked
-    // out in the main folder (git refuses a second checkout) or exist only on a remote
-    execFileSync("git", ["-C", folder, "worktree", "add", "-b", wtBranch, wtPath, base], {
-      encoding: "utf8",
-      timeout: 15000,
-      stdio: ["ignore", "pipe", "pipe"],
-    });
-  } catch (err) {
-    const stderr = (err as { stderr?: string }).stderr?.trim();
-    // git's own message is the most useful thing to surface
-    throw new Error(stderr?.split("\n").pop() || `could not create worktree for ${branch}`);
-  }
-  const baseCommit = execFileSync("git", ["-C", wtPath, "rev-parse", "HEAD"], { encoding: "utf8", timeout: 5000 }).trim();
-  return { wtPath, wtBranch, baseCommit };
-}
-
-function removeWorktree(folder: string, wtPath: string, wtBranch?: string | null, baseCommit?: string | null) {
-  try {
-    execFileSync("git", ["-C", folder, "worktree", "remove", wtPath], { timeout: 15000, stdio: "ignore" });
-  } catch {
-    // dirty or already gone — keep it rather than destroy work, but make it visible
-    journal({ event: "worktree.kept", folder, wtPath, reason: "dirty or removal failed" });
-    return;
-  }
-  // the session branch outlives the worktree only if it accumulated commits
-  if (wtBranch && baseCommit) {
-    try {
-      const tip = execFileSync("git", ["-C", folder, "rev-parse", `refs/heads/${wtBranch}`], {
-        encoding: "utf8",
-        timeout: 5000,
-      }).trim();
-      if (tip === baseCommit) {
-        execFileSync("git", ["-C", folder, "branch", "-D", wtBranch], { timeout: 5000, stdio: "ignore" });
-      }
-    } catch {
-      /* branch already gone */
-    }
-  }
-}
-
 // Boot sweep: sessions are in-memory, so any worktree on disk at startup is an
 // orphan from a previous runner. Remove the clean ones; keep dirty ones and journal.
 export function sweepOrphanWorktrees() {
-  const base = join(homedir(), ".groundcontrol", "worktrees");
-  if (!existsSync(base)) return;
-  for (const repo of readdirSync(base)) {
-    const repoDir = join(base, repo);
+  if (!existsSync(WT_BASE)) return;
+  for (const repo of readdirSync(WT_BASE)) {
+    const repoDir = join(WT_BASE, repo);
     let ids: string[] = [];
     try {
       ids = readdirSync(repoDir);
@@ -370,11 +262,7 @@ export function sweepOrphanWorktrees() {
           stdio: ["ignore", "pipe", "ignore"],
         }).trim();
         const mainRoot = commonDir.endsWith("/.git") ? commonDir.slice(0, -5) : commonDir;
-        const wtBranch = execFileSync("git", ["-C", wtPath, "branch", "--show-current"], {
-          encoding: "utf8",
-          timeout: 5000,
-          stdio: ["ignore", "pipe", "ignore"],
-        }).trim();
+        const wtBranch = currentBranch(wtPath) ?? "";
         execFileSync("git", ["-C", mainRoot, "worktree", "remove", wtPath], { timeout: 15000, stdio: "ignore" });
         // -d not -D: an orphan's base commit is unknown, so only drop the session
         // branch when git agrees it holds nothing unmerged
@@ -399,6 +287,8 @@ export function createSession(opts: {
   spawnMode?: "same-dir" | "worktree";
   branch?: string;
   permissionMode?: string;
+  callbackUrl?: string;
+  actor?: string;
 }): Session {
   const name = opts.name?.trim() || `${basename(opts.folder)}-${randomUUID().slice(0, 4)}`;
   const duplicate = [...sessions.values()].some((s) => s.name === name && s.state !== "exited" && s.state !== "error");
@@ -433,16 +323,7 @@ export function createSession(opts: {
     // that would clobber local changes, and DWIMs a local branch for remote-only picks
     const root = gitRoot(opts.folder);
     if (root) {
-      let current = "";
-      try {
-        current = execFileSync("git", ["-C", root, "branch", "--show-current"], {
-          encoding: "utf8",
-          timeout: 5000,
-          stdio: ["ignore", "pipe", "ignore"],
-        }).trim();
-      } catch {
-        /* detached or unborn — let switch decide */
-      }
+      const current = currentBranch(root) ?? "";
       if (current !== opts.branch) {
         try {
           execFileSync("git", ["-C", root, "switch", opts.branch], {
@@ -479,6 +360,7 @@ export function createSession(opts: {
     permissionMode,
     state: "starting",
     pairingUrl: null,
+    callbackUrl: opts.callbackUrl ?? null,
     startedAt: new Date().toISOString(),
     exitedAt: null,
     exitCode: null,
@@ -489,7 +371,8 @@ export function createSession(opts: {
     killed: false,
   };
   sessions.set(id, session);
-  journal({ event: "session.start", id, name, folder: opts.folder, spawnMode, branch, permissionMode });
+  journal({ event: "session.start", id, name, folder: opts.folder, spawnMode, branch, permissionMode, actor: opts.actor });
+  announce("session.start", session);
 
   const onData = (chunk: string) => {
     session.lastOutputAt = new Date().toISOString();
@@ -503,13 +386,7 @@ export function createSession(opts: {
         session.pairingUrl = match[0].replace(/[).,]+$/, "");
         session.state = "ready";
         journal({ event: "session.ready", id, pairingUrl: session.pairingUrl });
-        if (ntfy?.notifyReady) {
-          notify({
-            title: `session ready: ${session.name}`,
-            body: basename(session.folder) + (session.branch ? ` @ ${session.branch}` : ""),
-            click: session.pairingUrl,
-          });
-        }
+        announce("session.ready", session);
       }
     }
   };
@@ -521,29 +398,13 @@ export function createSession(opts: {
     session.proc = null;
     if (session.worktreePath) removeWorktree(repoRootForCleanup ?? session.folder, session.worktreePath, wtBranch, baseCommit);
     journal({ event: "session.exit", id, code: exitCode });
-    if (!session.killed && ntfy && ntfy.notifyExit !== "never") {
-      const failed = exitCode !== 0 || session.state === "error";
-      if (failed) {
-        notify({
-          title: `session failed: ${session.name}`,
-          body: `${basename(session.folder)} exited with code ${exitCode}${session.state === "error" ? " (died before ready)" : ""}`,
-          priority: "high",
-          tags: "warning",
-        });
-      } else if (ntfy.notifyExit === "all") {
-        notify({
-          title: `session exited: ${session.name}`,
-          body: `${basename(session.folder)} exited cleanly`,
-          tags: "checkered_flag",
-        });
-      }
-    }
+    announce("session.exit", session);
   });
 
   return publicView(session);
 }
 
-export function killSession(id: string): Session | null {
+export function killSession(id: string, actor?: string): Session | null {
   const s = sessions.get(id);
   if (!s) return null;
   s.killed = true; // set before the kill so onExit never notifies for user-initiated stops
@@ -554,7 +415,8 @@ export function killSession(id: string): Session | null {
       /* already gone */
     }
   }
-  journal({ event: "session.kill", id });
+  journal({ event: "session.kill", id, actor });
+  announce("session.kill", s);
   return publicView(s);
 }
 

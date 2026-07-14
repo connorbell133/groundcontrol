@@ -68,11 +68,13 @@ components:
                 - unauthorized
                 - invalid_json
                 - missing_param
+                - invalid_param
                 - invalid_path
                 - invalid_config
                 - outside_roots
                 - not_found
                 - not_ready
+                - ready_timeout
                 - launch_failed
                 - session_live
                 - worktree_error
@@ -81,7 +83,7 @@ components:
 
     Session:
       type: object
-      required: [id, name, folder, spawnMode, branch, worktreePath, permissionMode, state, pairingUrl, startedAt, exitedAt, exitCode, lastOutputAt, lastLine]
+      required: [id, name, folder, spawnMode, branch, worktreePath, permissionMode, state, pairingUrl, callbackUrl, startedAt, exitedAt, exitCode, lastOutputAt, lastLine]
       properties:
         id: { type: string, description: 8-char launch id }
         name: { type: string }
@@ -95,6 +97,7 @@ components:
           enum: [starting, ready, exited, error]
           description: error means the process died before a pairing URL appeared.
         pairingUrl: { type: [string, "null"] }
+        callbackUrl: { type: [string, "null"], description: "Per-launch webhook: session.ready and session.exit are POSTed here." }
         startedAt: { type: string, format: date-time }
         exitedAt: { type: [string, "null"], format: date-time }
         exitCode: { type: [integer, "null"] }
@@ -114,6 +117,32 @@ components:
             Required in worktree mode (base for the private gc/<id> branch).
             In same-dir mode, switches the checkout first; refused if dirty.
         permissionMode: { type: string, default: default }
+        callbackUrl: { type: string, description: "http(s) URL — this launch's session.ready and session.exit events are POSTed to it." }
+        timeoutMs: { type: integer, default: 60000, minimum: 1000, maximum: 300000, description: Only meaningful with ?wait=ready. }
+
+    LifecycleEvent:
+      type: object
+      required: [event, at, title, message, data]
+      properties:
+        event: { type: string, description: "session.start | session.ready | session.exit | session.kill" }
+        at: { type: string, format: date-time }
+        title: { type: string, description: Ready-made human summary line. }
+        message: { type: string }
+        data:
+          type: object
+          description: The full session object under a "session" key.
+
+    WebhookConfig:
+      type: object
+      required: [url]
+      properties:
+        url: { type: string, description: http(s) URL that receives matching events as JSON POSTs. }
+        events:
+          type: array
+          items: { type: string }
+          description: >
+            Filter tokens: exact names, prefix wildcards (session.*), "*" or
+            omitted for everything, and the derived token session.failed.
 
     FolderEntry:
       type: object
@@ -168,24 +197,17 @@ components:
         branch: { type: [string, "null"] }
         dirty: { type: boolean }
 
-    NtfyConfig:
-      type: object
-      required: [url, topic, notifyReady, notifyExit]
-      properties:
-        url: { type: string }
-        topic: { type: string, description: Empty disables notifications. }
-        notifyReady: { type: boolean }
-        notifyExit: { type: string, enum: [errors, all, never] }
-
     ConfigView:
       type: object
-      required: [roots, showHidden, ntfy]
+      required: [roots, showHidden, webhooks]
       properties:
         roots:
           type: array
           items: { type: string }
         showHidden: { type: boolean }
-        ntfy: { $ref: "#/components/schemas/NtfyConfig" }
+        webhooks:
+          type: array
+          items: { $ref: "#/components/schemas/WebhookConfig" }
 
 paths:
   /roots:
@@ -267,7 +289,9 @@ paths:
                   type: array
                   items: { type: string }
                 showHidden: { type: boolean }
-                ntfy: { $ref: "#/components/schemas/NtfyConfig" }
+                webhooks:
+                  type: array
+                  items: { $ref: "#/components/schemas/WebhookConfig" }
       responses:
         "200":
           description: Applied and persisted.
@@ -338,7 +362,13 @@ paths:
       description: >
         Spawns claude remote-control in the folder (or a fresh worktree).
         Returns immediately with state "starting"; poll GET /sessions/{id}
-        until state is "ready" and pairingUrl is set.
+        until state is "ready" and pairingUrl is set — or pass ?wait=ready
+        to block until then and get the pairing URL in one round-trip.
+      parameters:
+        - name: wait
+          in: query
+          schema: { type: string, enum: [ready] }
+          description: Block until the session pairs, dies, or timeoutMs passes.
       requestBody:
         required: true
         content:
@@ -353,7 +383,12 @@ paths:
         "400": { $ref: "#/components/responses/BadRequest" }
         "401": { $ref: "#/components/responses/Unauthorized" }
         "409":
-          description: "launch_failed: duplicate live name, unknown branch, dirty checkout, or worktree failure."
+          description: "launch_failed: duplicate live name, unknown branch, dirty checkout, worktree failure — or, with ?wait=ready, the process died before pairing."
+          content:
+            application/json:
+              schema: { $ref: "#/components/schemas/Error" }
+        "504":
+          description: "ready_timeout: ?wait=ready deadline passed; the session is still starting — poll GET /sessions/{id}."
           content:
             application/json:
               schema: { $ref: "#/components/schemas/Error" }
@@ -440,6 +475,22 @@ paths:
           content:
             application/json:
               schema: { $ref: "#/components/schemas/Error" }
+
+  /events:
+    get:
+      summary: Lifecycle event stream (SSE)
+      description: >
+        Server-sent events: one message per lifecycle event (LifecycleEvent as
+        JSON in the data field, event name in the event field), plus a ping
+        every 25 seconds. No replay — re-list sessions after reconnecting.
+        EventSource clients authenticate with ?token=.
+      responses:
+        "200":
+          description: text/event-stream held open.
+          content:
+            text/event-stream:
+              schema: { type: string }
+        "401": { $ref: "#/components/responses/Unauthorized" }
 
   /journal/recent:
     get:

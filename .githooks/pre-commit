@@ -1,0 +1,39 @@
+#!/bin/sh
+# agent-runner pre-commit — secrets, private files, types, JSON sanity.
+# Wired up automatically by `npm install` (prepare script sets core.hooksPath).
+set -e
+
+fail() { printf '\n\033[31m✗ %s\033[0m\n' "$1" >&2; exit 1; }
+step() { printf '\033[2m› %s\033[0m\n' "$1"; }
+
+STAGED=$(git diff --cached --name-only --diff-filter=ACMR)
+[ -z "$STAGED" ] && exit 0
+
+# 1. Private files must never be committed, even if force-added past .gitignore.
+for banned in config.json data/ .playwright-mcp/; do
+  if echo "$STAGED" | grep -q "^$banned"; then
+    fail "$banned is private to this machine — unstage it (git restore --staged $banned)"
+  fi
+done
+
+# 2. Secret scan over staged changes.
+if command -v gitleaks >/dev/null 2>&1; then
+  step "gitleaks (staged)"
+  gitleaks git --pre-commit --staged --redact --no-banner || fail "gitleaks found a secret in staged changes"
+else
+  fail "gitleaks is not installed (brew install gitleaks)"
+fi
+
+# 3. Staged JSON must parse.
+for f in $(echo "$STAGED" | grep '\.json$' || true); do
+  step "json: $f"
+  node -e "JSON.parse(require('fs').readFileSync('$f','utf8'))" || fail "$f is not valid JSON"
+done
+
+# 4. TypeScript must typecheck when server code changes.
+if echo "$STAGED" | grep -q '^src/.*\.ts$\|^tsconfig.json$'; then
+  step "tsc --noEmit"
+  npx tsc --noEmit || fail "typecheck failed"
+fi
+
+printf '\033[32m✓ pre-commit clean\033[0m\n'

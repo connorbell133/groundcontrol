@@ -1,0 +1,21 @@
+# gitleaks config — extends the default ruleset with agent-runner specifics.
+title = "agent-runner"
+
+[extend]
+useDefault = true
+
+# The runner's own bearer token: a hex string assigned to authToken.
+# config.json is gitignored AND hard-blocked by the pre-commit hook, but if a
+# token value ever gets pasted into code, docs, or an example, catch it here.
+[[rules]]
+id = "agent-runner-auth-token"
+description = "agent-runner authToken value"
+regex = '''(?i)authtoken['"]?\s*[:=]\s*['"][0-9a-f]{16,}['"]'''
+keywords = ["authtoken"]
+
+# Claude pairing URLs identify a live remote-control environment.
+[[rules]]
+id = "claude-pairing-url"
+description = "Claude remote-control pairing URL"
+regex = '''claude\.ai/code\?environment=env_[0-9A-Za-z]+'''
+keywords = ["environment=env_"]

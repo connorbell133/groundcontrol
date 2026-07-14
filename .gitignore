@@ -1,0 +1,9 @@
+node_modules/
+data/
+*.log
+.playwright-mcp/
+.claude/
+config.json
+
+# scratch screenshots at repo root — but never the PWA icons
+/*.png

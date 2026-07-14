@@ -638,6 +638,27 @@ html[data-theme="dark"] .qr-summary { box-shadow: 3px 3px 0 rgba(0, 0, 0, 0.55);
 html[data-theme="dark"] .toast::before { color: #2e7d43; }
 html[data-theme="dark"] .toast.error::before { color: #b23414; }
 
+/* ---------- left-handed mode (manual opt-in; right is the baseline) ----------
+   mirrors the edge-anchored touch targets — status dot, launch ▶, per-row
+   buttons — so they land under the left thumb. equal-width rows (tab bar,
+   full-width CTAs) have no side and stay put. */
+html[data-hand="left"] .topbar { flex-direction: row-reverse; }
+html[data-hand="left"] .status-dot { margin-right: 0; margin-left: -8px; }
+html[data-hand="left"] .status-pop { right: auto; left: 14px; }
+html[data-hand="left"] .launch-bar { flex-direction: row-reverse; padding: 17px 19px 17px 17px; }
+html[data-hand="left"] .launch-bar-right { flex-direction: row-reverse; }
+html[data-hand="left"] .session-actions { flex-direction: row-reverse; }
+html[data-hand="left"] .qr-summary { flex-direction: row-reverse; }
+html[data-hand="left"] .log-tools { order: -1; margin-left: 0; margin-right: auto; }
+html[data-hand="left"] .field-row { flex-direction: row-reverse; }
+html[data-hand="left"] .field-row > div { text-align: right; }
+html[data-hand="left"] .chip-add { flex-direction: row-reverse; }
+html[data-hand="left"] .root-chip { flex-direction: row-reverse; padding: 6px 10px 6px 6px; }
+html[data-hand="left"] .wt-row { flex-direction: row-reverse; }
+html[data-hand="left"] .wt-info { text-align: right; }
+html[data-hand="left"] .select-wrap select { padding: 13px 14px 13px 38px; }
+html[data-hand="left"] .select-caret { right: auto; left: 14px; }
+
 /* ---------- settings ---------- */
 .topbar-right { display: flex; align-items: center; }
 .settings-group {
@@ -668,6 +689,8 @@ html[data-theme="dark"] .toast.error::before { color: #b23414; }
   padding: 13px 14px;
 }
 .auth-card input:focus-visible { outline: 1.5px solid var(--accent); outline-offset: -1px; }
+.auth-card .auth-error { color: var(--danger); margin: 0; }
+.auth-card .auth-error[hidden] { display: none; }
 
 /* ---------- roots chips ---------- */
 .chips-row { display: flex; flex-wrap: wrap; gap: 7px; margin-bottom: 10px; }

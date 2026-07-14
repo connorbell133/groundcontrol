@@ -1,7 +1,12 @@
 /* groundcontrol mobile UI */
 const CLIENT_VERSION = "0.4.0"; // keep in step with package.json — healthz mismatch triggers a reload
 const $ = (id) => document.getElementById(id);
-const authToken = () => localStorage.getItem("token") || "";
+// tokens travel by copy-paste, which loves to smuggle in zero-width and other
+// non-ASCII characters — those make `Bearer <token>` an invalid header value
+// and every fetch throws. Keep printable ASCII (minus space) only, applied on
+// read too so an already-poisoned stored token heals itself.
+const cleanToken = (v) => (v || "").replace(/[^\x21-\x7e]/g, "");
+const authToken = () => cleanToken(localStorage.getItem("token"));
 const tokenQS = () => (authToken() ? `?token=${encodeURIComponent(authToken())}` : "");
 const api = async (path, opts = {}) => {
   const headers = { ...(opts.headers || {}) };
@@ -43,6 +48,11 @@ matchMedia("(prefers-color-scheme: dark)").addEventListener("change", () => {
   if ((prefs.theme || "light") === "system") applyTheme();
 });
 applyTheme();
+
+function applyHand() {
+  document.documentElement.dataset.hand = prefs.hand || "right";
+}
+applyHand();
 
 function launchDefaults() {
   return { spawnMode: prefs.spawnMode || "same-dir", permissionMode: prefs.permissionMode || "default" };
@@ -725,7 +735,7 @@ function wireSetSegment(id, key) {
     };
   });
 }
-for (const pair of ["setTheme:theme", "setSpawn:spawnMode", "setPerm:permissionMode", "setHookEvents:hookEvents", "setHidden:hidden"]) {
+for (const pair of ["setTheme:theme", "setHand:hand", "setSpawn:spawnMode", "setPerm:permissionMode", "setHookEvents:hookEvents", "setHidden:hidden"]) {
   const [id, key] = pair.split(":");
   wireSetSegment(id, key);
 }
@@ -811,9 +821,11 @@ async function renderWorktrees() {
 
 async function openSettings() {
   setVals.theme = prefs.theme || "light";
+  setVals.hand = prefs.hand || "right";
   setVals.spawnMode = prefs.spawnMode || "same-dir";
   setVals.permissionMode = prefs.permissionMode || "default";
   syncSegment("setTheme", setVals.theme);
+  syncSegment("setHand", setVals.hand);
   syncSegment("setSpawn", setVals.spawnMode);
   syncSegment("setPerm", setVals.permissionMode);
   renderWorktrees();
@@ -834,10 +846,12 @@ async function openSettings() {
 
 async function saveSettings() {
   prefs.theme = setVals.theme;
+  prefs.hand = setVals.hand;
   prefs.spawnMode = setVals.spawnMode;
   prefs.permissionMode = setVals.permissionMode;
   localStorage.setItem("prefs", JSON.stringify(prefs));
   applyTheme();
+  applyHand();
   try {
     await api("/api/v1/config", {
       method: "PUT",
@@ -881,9 +895,23 @@ $("rootAddBtn").onclick = (e) => {
 };
 
 /* ---------- auth gate ---------- */
-$("authSubmit").onclick = () => {
-  const v = $("authInput").value.trim();
+$("authSubmit").onclick = async () => {
+  const v = cleanToken($("authInput").value);
   if (!v) return;
+  const err = $("authError");
+  err.hidden = true;
+  // a wrong token used to save + reload straight back to this gate, which
+  // reads as "nothing happened" — probe the API first and say so instead
+  try {
+    const res = await fetch("/api/v1/roots", { headers: { authorization: `Bearer ${v}` } });
+    if (res.status === 401) {
+      err.textContent = "token rejected — check authToken in the config.json the server was started from";
+      err.hidden = false;
+      return;
+    }
+  } catch {
+    /* server unreachable — save anyway; the reload will surface it */
+  }
   localStorage.setItem("token", v);
   location.reload();
 };

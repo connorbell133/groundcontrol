@@ -158,6 +158,14 @@
       </div>
       <span class="field-hint">light is the baseline; dark is the 2am safelight</span>
     </div>
+    <div class="field">
+      <span class="field-label">Handedness</span>
+      <div class="segment" id="setHand">
+        <button data-value="right" class="active">Right</button>
+        <button data-value="left">Left</button>
+      </div>
+      <span class="field-hint">left mirrors the edge controls under the left thumb</span>
+    </div>
 
     <div class="settings-group">Launch defaults</div>
     <p class="settings-note">used when a folder has no remembered options yet</p>
@@ -225,6 +233,7 @@
       <h2 class="sheet-title">Runner token</h2>
       <p class="settings-note">this runner requires its access token — it lives in config.json on the host</p>
       <input type="password" id="authInput" placeholder="paste token" autocomplete="off" />
+      <p class="settings-note auth-error" id="authError" hidden></p>
       <button class="cta" id="authSubmit">Unlock</button>
     </div>
   </div>

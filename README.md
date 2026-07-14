@@ -23,8 +23,9 @@
 ---
 
 <p align="center">
-  <a href="#before--after"><img src="assets/demo-banner.png" alt="90-second demo — the SSH ritual: a minute of typing. ground·control: two taps and a scan." width="920"></a>
+  <a href="assets/demo.mp4"><img src="assets/demo.gif" width="340" alt="Real demo, real time: browse to a repo, launch a worktree session, scan the QR, land in the Claude app"></a>
 </p>
+<p align="center"><sub>One take, real time, recorded on a phone. Ends where it should: in the Claude app, paired. (<a href="assets/demo.mp4">MP4</a>)</sub></p>
 
 You know the moment. You're on the couch, you think of the fix, and the thought dies because starting a [Claude Code](https://claude.com/claude-code) session means: find the laptop, SSH in, `cd` three directories deep, run `claude remote-control`, and squint at a QR code rendered in terminal characters.
 

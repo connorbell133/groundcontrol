@@ -1,0 +1,11 @@
+{
+  "port": 3020,
+  "host": "0.0.0.0",
+  "roots": [
+    "/home/you/repos"
+  ],
+  "showHidden": false,
+  "webhooks": [],
+  "jobs": { "concurrency": 2, "timeoutMs": 900000 },
+  "authToken": ""
+}

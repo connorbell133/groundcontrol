@@ -1,0 +1,60 @@
+#!/bin/sh
+# agent-runner pre-commit — secrets, private files, build sanity, JSON sanity.
+# Wire up with: git config core.hooksPath .githooks
+set -e
+
+fail() { printf '\n\033[31m✗ %s\033[0m\n' "$1" >&2; exit 1; }
+step() { printf '\033[2m› %s\033[0m\n' "$1"; }
+
+STAGED=$(git diff --cached --name-only --diff-filter=ACMR)
+[ -z "$STAGED" ] && exit 0
+
+# 1. Private files must never be committed, even if force-added past .gitignore.
+for banned in config.json data/ .playwright-mcp/; do
+  if echo "$STAGED" | grep -q "^$banned"; then
+    fail "$banned is private to this machine — unstage it (git restore --staged $banned)"
+  fi
+done
+
+# 2. Secret scan over staged changes.
+if command -v gitleaks >/dev/null 2>&1; then
+  step "gitleaks (staged)"
+  gitleaks git --pre-commit --staged --redact --no-banner || fail "gitleaks found a secret in staged changes"
+else
+  fail "gitleaks is not installed (brew install gitleaks)"
+fi
+
+# 3. Staged JSON must parse.
+for f in $(echo "$STAGED" | grep '\.json$' || true); do
+  step "json: $f"
+  if command -v jq >/dev/null 2>&1; then
+    jq empty "$f" || fail "$f is not valid JSON"
+  elif command -v python3 >/dev/null 2>&1; then
+    python3 -m json.tool "$f" >/dev/null || fail "$f is not valid JSON"
+  else
+    step "json: skipped (need jq or python3)"
+    break
+  fi
+done
+
+# 4. Staged YAML must parse (docs/openapi.yaml keeps the API contract).
+for f in $(echo "$STAGED" | grep '\.ya\?ml$' || true); do
+  step "yaml: $f"
+  if command -v yq >/dev/null 2>&1; then
+    yq eval '.' "$f" >/dev/null || fail "$f is not valid YAML"
+  elif command -v python3 >/dev/null 2>&1; then
+    python3 -c "import sys,yaml; yaml.safe_load(open(sys.argv[1]))" "$f" || fail "$f is not valid YAML"
+  else
+    step "yaml: skipped (need yq or python3+pyyaml)"
+    break
+  fi
+done
+
+# 5. Go must build and vet when server code changes.
+if echo "$STAGED" | grep -q '\.go$\|^go\.mod$\|^go\.sum$'; then
+  step "go build + vet"
+  go build ./... || fail "build failed"
+  go vet ./... || fail "vet failed"
+fi
+
+printf '\033[32m✓ pre-commit clean\033[0m\n'

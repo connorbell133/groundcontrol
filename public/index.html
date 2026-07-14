@@ -1,0 +1,234 @@
+<!doctype html>
+<html lang="en">
+<head>
+  <meta charset="utf-8" />
+  <meta name="viewport" content="width=device-width, initial-scale=1, viewport-fit=cover" />
+  <meta name="theme-color" content="#f2eee3" />
+  <meta name="mobile-web-app-capable" content="yes" />
+  <meta name="apple-mobile-web-app-capable" content="yes" />
+  <meta name="apple-mobile-web-app-status-bar-style" content="default" />
+  <title>ground·control</title>
+  <link rel="manifest" href="/manifest.webmanifest" />
+  <link rel="icon" type="image/png" sizes="192x192" href="/icons/icon-192.png" />
+  <link rel="apple-touch-icon" href="/icons/apple-touch-icon.png" />
+  <link rel="preconnect" href="https://fonts.googleapis.com" />
+  <link rel="preconnect" href="https://fonts.gstatic.com" crossorigin />
+  <link href="https://fonts.googleapis.com/css2?family=Instrument+Serif:ital@0;1&family=IBM+Plex+Mono:wght@400;500;600&display=swap" rel="stylesheet" />
+  <link rel="stylesheet" href="/styles.css" />
+</head>
+<body>
+  <div class="bg-grid" aria-hidden="true"></div>
+  <div class="bg-glow" aria-hidden="true"></div>
+  <div class="bg-grain" aria-hidden="true"></div>
+
+  <header class="topbar">
+    <div class="wordmark">ground<span class="wordmark-dot">·</span>control</div>
+    <button class="status-dot" id="health" aria-label="Runner status">
+      <span class="led"></span>
+    </button>
+  </header>
+
+  <div class="status-pop" id="statusPop" hidden>
+    <div class="status-row"><span class="status-key">state</span><span class="readout-state" id="readoutState">boot</span></div>
+    <div class="status-row"><span class="status-key">host</span><span id="readoutHost"></span></div>
+    <div class="status-row"><span class="status-key">sessions</span><span id="readoutSessions">–</span></div>
+    <div class="status-row"><span class="status-key">server</span><span id="readoutVersion">–</span></div>
+    <div class="status-row" id="syncRow" hidden><span class="status-key">last sync</span><span class="readout-sync" id="readoutSync"></span></div>
+  </div>
+
+  <main id="view-browse" class="view">
+    <div class="pathbar-wrap">
+      <span class="pathbar-tick" aria-hidden="true">┌</span>
+      <nav class="crumbs" id="crumbs" aria-label="Folder path"></nav>
+    </div>
+    <div class="recents" id="recents" hidden>
+      <span class="recents-kicker">Recent dispatches</span>
+      <div class="recents-row" id="recentsRow"></div>
+    </div>
+    <ul class="folder-list" id="folderList"></ul>
+  </main>
+
+  <main id="view-sessions" class="view" hidden>
+    <div class="sessions-empty" id="sessionsEmpty">
+      <div class="idle-frame">
+        <span class="idle-ring"></span>
+        <span class="idle-core"></span>
+      </div>
+      <p class="idle-title">No active units</p>
+      <p class="idle-sub">Open <strong>Browse</strong>, pick a folder,<br />and launch an agent to pair it here.</p>
+    </div>
+    <ul class="session-list" id="sessionList"></ul>
+  </main>
+
+  <button class="launch-bar" id="launchBar">
+    <span class="launch-bar-main">
+      <span class="launch-bar-verb">Launch in</span>
+      <span class="launch-bar-folder" id="launchBarFolder">—</span>
+    </span>
+    <span class="launch-bar-right">
+      <span class="launch-bar-branch" id="launchBarBranch"></span>
+      <span class="launch-bar-exec">▶</span>
+    </span>
+  </button>
+
+  <nav class="tabbar" aria-label="Sections">
+    <button class="tab active" data-tab="browse">
+      <svg viewBox="0 0 24 24" width="20" height="20" fill="none" stroke="currentColor" stroke-width="1.7"><path d="M3 7.5A1.5 1.5 0 0 1 4.5 6h4l2 2.2h7A1.5 1.5 0 0 1 19 9.7V17a1.5 1.5 0 0 1-1.5 1.5h-13A1.5 1.5 0 0 1 3 17V7.5Z" stroke-linejoin="round"/></svg>
+      <span>Browse</span>
+    </button>
+    <button class="tab" data-tab="sessions">
+      <svg viewBox="0 0 24 24" width="20" height="20" fill="none" stroke="currentColor" stroke-width="1.7"><circle cx="11" cy="11" r="7.5"/><circle cx="11" cy="11" r="2.6" fill="currentColor" stroke="none"/></svg>
+      <span>Sessions</span>
+      <span class="tab-badge" id="sessionCount" hidden>0</span>
+    </button>
+    <button class="tab" data-tab="settings" id="gearBtn">
+      <svg viewBox="0 0 24 24" width="20" height="20" fill="none" stroke="currentColor" stroke-width="1.7" stroke-linecap="round"><path d="M4 7h9.3M18.7 7H20M4 12h3.3M12.7 12H20M4 17h8.3M17.7 17H20"/><circle cx="16" cy="7" r="2.4"/><circle cx="10" cy="12" r="2.4"/><circle cx="15" cy="17" r="2.4"/></svg>
+      <span>Settings</span>
+    </button>
+  </nav>
+
+  <div class="scrim" id="scrim" hidden></div>
+  <section class="sheet" id="sheet" hidden aria-label="Launch options">
+    <div class="sheet-grab"></div>
+    <div class="sheet-head">
+      <span class="sheet-kicker">Launch console</span>
+      <h2 class="sheet-title" id="sheetFolder">folder</h2>
+      <p class="sheet-path" id="sheetPath"></p>
+    </div>
+
+    <label class="field">
+      <span class="field-label">What's this run for?</span>
+      <input type="text" id="optName" placeholder="fix checkout race" autocomplete="off" autocapitalize="off" spellcheck="false" />
+      <span class="field-hint">left blank → auto-named from folder</span>
+    </label>
+
+    <div class="field" id="spawnField">
+      <span class="field-label">Workspace</span>
+      <div class="segment" id="optSpawn">
+        <button data-value="same-dir" class="active">In folder</button>
+        <button data-value="worktree">Worktree</button>
+      </div>
+    </div>
+
+    <div class="field" id="branchField" hidden>
+      <span class="field-label" id="branchLabel">Branch</span>
+      <div class="select-wrap">
+        <select id="optBranch" aria-label="Branch for the session"></select>
+        <span class="select-caret" aria-hidden="true">⌄</span>
+      </div>
+      <span class="field-hint" id="branchHint">worktree is created from this branch</span>
+    </div>
+
+    <div class="field">
+      <span class="field-label">Permissions</span>
+      <div class="segment segment-4" id="optPerm">
+        <button data-value="default" class="active">Ask</button>
+        <button data-value="acceptEdits">Edits</button>
+        <button data-value="plan">Plan</button>
+        <button data-value="bypassPermissions" class="is-danger">YOLO</button>
+      </div>
+    </div>
+
+    <div class="field field-row">
+      <div>
+        <span class="field-label">Docker isolation</span>
+        <span class="field-hint">host process · container in v1</span>
+      </div>
+      <div class="toggle disabled" aria-disabled="true"><div class="toggle-knob"></div></div>
+    </div>
+
+    <button class="cta" id="launchBtn">
+      <span class="cta-glyph">▶</span> Launch session
+    </button>
+  </section>
+
+  <main class="view view-settings" id="view-settings" hidden aria-label="Settings">
+    <div class="sheet-head">
+      <span class="sheet-kicker">Settings</span>
+      <h2 class="sheet-title">Preferences</h2>
+    </div>
+
+    <div class="settings-group">Appearance</div>
+    <div class="field">
+      <span class="field-label">Theme</span>
+      <div class="segment" id="setTheme">
+        <button data-value="light" class="active">Light</button>
+        <button data-value="dark">Dark</button>
+        <button data-value="system">System</button>
+      </div>
+      <span class="field-hint">light is the baseline; dark is the 2am safelight</span>
+    </div>
+
+    <div class="settings-group">Launch defaults</div>
+    <p class="settings-note">used when a folder has no remembered options yet</p>
+    <div class="field">
+      <span class="field-label">Workspace</span>
+      <div class="segment" id="setSpawn">
+        <button data-value="same-dir" class="active">In folder</button>
+        <button data-value="worktree">Worktree</button>
+      </div>
+    </div>
+    <div class="field">
+      <span class="field-label">Permissions</span>
+      <div class="segment segment-4" id="setPerm">
+        <button data-value="default" class="active">Ask</button>
+        <button data-value="acceptEdits">Edits</button>
+        <button data-value="plan">Plan</button>
+        <button data-value="bypassPermissions" class="is-danger">YOLO</button>
+      </div>
+    </div>
+
+    <div class="settings-group">Notifications · webhook</div>
+    <label class="field">
+      <span class="field-label">URL</span>
+      <input type="text" id="setHookUrl" placeholder="empty = disabled" autocomplete="off" autocapitalize="off" spellcheck="false" />
+      <span class="field-hint">POSTs {event, title, message, data} — n8n catches it raw; ntfy via ?template=yes&amp;title={{.title}}&amp;message={{.message}}</span>
+    </label>
+    <div class="field">
+      <span class="field-label">Notify on</span>
+      <div class="segment" id="setHookEvents">
+        <button data-value="failures" class="active">Failures</button>
+        <button data-value="ready">Ready + fail</button>
+        <button data-value="all">Everything</button>
+      </div>
+      <span class="field-hint">more subscribers and finer filters via config.json or the API</span>
+    </div>
+
+    <div class="settings-group">Browsing</div>
+    <div class="field">
+      <span class="field-label">Hidden folders</span>
+      <div class="segment" id="setHidden">
+        <button data-value="off" class="active">Hide</button>
+        <button data-value="on">Show</button>
+      </div>
+    </div>
+    <div class="field">
+      <span class="field-label">Roots</span>
+      <div class="chips-row" id="rootsChips"></div>
+      <div class="chip-add">
+        <input type="text" id="rootAdd" placeholder="/absolute/path" autocomplete="off" autocapitalize="off" spellcheck="false" />
+        <button class="log-tool" id="rootAddBtn">add</button>
+      </div>
+      <span class="field-hint">tap × to remove — validated on save</span>
+    </div>
+
+    <div class="settings-group">Kept worktrees</div>
+    <p class="settings-note">worktrees the cleanup refused to delete (dirty or orphaned) — they hold their branch until cleaned</p>
+    <div id="worktreeList"></div>
+
+    <button class="cta" id="settingsSave">Save settings</button>
+  </main>
+
+  <div class="auth-gate" id="authGate" hidden>
+    <div class="auth-card">
+      <div class="sheet-kicker">Access</div>
+      <h2 class="sheet-title">Runner token</h2>
+      <p class="settings-note">this runner requires its access token — it lives in config.json on the host</p>
+      <input type="password" id="authInput" placeholder="paste token" autocomplete="off" />
+      <button class="cta" id="authSubmit">Unlock</button>
+    </div>
+  </div>
+
+  <script src="/app.js"></script>
+</body>
+</html>

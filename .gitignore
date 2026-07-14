@@ -1,0 +1,17 @@
+node_modules/
+data/
+*.log
+.playwright-mcp/
+.claude/
+config.json
+
+# scratch screenshots at repo root — but never the PWA icons
+/*.png
+
+# local planning docs — never public
+docs/brainstorms/
+docs/ideation/
+docs/plans/
+
+# built binary
+/groundcontrol

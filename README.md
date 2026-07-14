@@ -81,6 +81,14 @@ You need [Go 1.24+](https://go.dev), git, and the [Claude Code CLI](https://clau
 
 > **0.4.0+ is a Go rewrite.** Same config format, same API, same frontend, same journal — only the runtime changed. It builds to one static binary with the web frontend embedded: no Node, no npm, no native prebuilds, no postinstall hacks. The one casualty: Windows is no longer supported (the Go PTY layer has no ConPTY support).
 
+The one-command way — [`install.sh`](install.sh) installs the binary, writes `~/.groundcontrol/config.json` with a generated auth token, and offers to start the tower on the spot:
+
+```bash
+curl -fsSL https://raw.githubusercontent.com/connorbell133/groundcontrol/main/install.sh | bash
+```
+
+Or by hand:
+
 ```bash
 go install github.com/connorbell133/groundcontrol@latest
 ```

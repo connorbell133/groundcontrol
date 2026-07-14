@@ -55,7 +55,7 @@ After: open the app, tap the folder, tap **Launch**, scan.
 ## What it does
 
 - **Browses your actual filesystem** from configured roots — no repo allowlist to maintain. Git repos get a branch chip; subfolders of a repo inherit its git context, so launching from `src/` still offers the repo's branches.
-- **Worktree launches off any branch.** Pick *In folder* or *Worktree*; worktrees are created under `~/.groundcontrol/worktrees/`, and dirty ones are never force-deleted — they're kept, listed in Settings, and cleaned only when you say so.
+- **A branch picker on every git launch.** *In folder* switches the checkout to the branch you pick (refused if you have uncommitted changes — your mess is safe). *Worktree* cuts a private `gc/<session>` branch from any base — local or remote — under `~/.groundcontrol/worktrees/`, so launching off the branch you're standing on just works. Session branches are deleted on cleanup only when fully merged; dirty worktrees are never force-deleted — kept, listed in Settings, cleaned when you say so.
 - **Permission modes per launch:** Ask, accept-Edits, Plan, or YOLO (`--dangerously-skip-permissions`). YOLO in a folder with no git history takes a deliberate second tap — no undo exists there, so the button makes you mean it.
 - **Live session cards** with pairing QR, one-tap open-in-Claude-app, runtime log tail, uptime and last-output age, and a kill switch that updates instantly.
 - **Recent dispatches:** your last launches as one-tap relaunch chips, with staleness detection — if the branch is gone, the chip says so and degrades gracefully.

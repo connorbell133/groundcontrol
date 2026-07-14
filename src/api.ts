@@ -1,4 +1,4 @@
-import { Hono, type Context } from "hono";
+import { Hono, type Context, type MiddlewareHandler } from "hono";
 import { streamSSE } from "hono/streaming";
 import type { ContentfulStatusCode } from "hono/utils/http-status";
 import { existsSync, statSync } from "node:fs";
@@ -27,12 +27,34 @@ export interface Config {
   webhooks?: WebhookConfig[];
   jobs?: JobsConfig;
   authToken?: string;
+  tokens?: TokenConfig[];
 }
+
+// Scoped tokens for automations: read (browse/inspect), launch (spawn/kill
+// sessions and jobs), admin (config writes, worktree force-removal). The
+// legacy authToken keeps full scope — an n8n token gets read,launch and can
+// never widen roots.
+export interface TokenConfig {
+  name: string;
+  token: string;
+  scopes: string[];
+}
+
+export type Scope = "read" | "launch" | "admin";
+const ALL_SCOPES: Scope[] = ["read", "launch", "admin"];
+
+interface Actor {
+  name: string;
+  scopes: Set<Scope>;
+}
+
+type ApiEnv = { Variables: { actor: Actor } };
 
 // Stable machine-readable codes — clients key off these, never off message text.
 // Documented in docs/api.md; adding a code is fine, renaming one is a breaking change.
 export type ApiErrorCode =
   | "unauthorized"
+  | "insufficient_scope"
   | "invalid_json"
   | "missing_param"
   | "invalid_param"
@@ -48,7 +70,7 @@ export type ApiErrorCode =
   | "worktree_error"
   | "not_implemented";
 
-function err(c: Context, status: ContentfulStatusCode, code: ApiErrorCode, message: string) {
+function err(c: Context<ApiEnv>, status: ContentfulStatusCode, code: ApiErrorCode, message: string) {
   return c.json({ error: { code, message } }, status);
 }
 
@@ -68,22 +90,39 @@ async function waitForReady(id: string, timeoutMs: number): Promise<"ready" | "d
 }
 
 // One sub-app, mounted at /api/v1 (canonical) and /api (deprecated alias for one release).
-export function createApi(config: Config, persistConfig: () => void): Hono {
-  const api = new Hono();
+export function createApi(config: Config, persistConfig: () => void): Hono<ApiEnv> {
+  const api = new Hono<ApiEnv>();
 
-  // Every route requires the bearer token when one is configured.
+  // Every route requires a token when any is configured; the resolved actor
+  // (name + scopes) travels on the context and into the journal.
   // ?token= is accepted too because <img> tags (the QR) and EventSource can't send headers.
   api.use("*", async (c, next) => {
-    if (!config.authToken) return next();
+    if (!config.authToken && !config.tokens?.length) {
+      c.set("actor", { name: "anonymous", scopes: new Set(ALL_SCOPES) });
+      return next();
+    }
     const header = c.req.header("authorization");
     const token = header?.startsWith("Bearer ") ? header.slice(7) : c.req.query("token");
-    if (token !== config.authToken) return err(c, 401, "unauthorized", "missing or invalid bearer token");
+    if (token && config.authToken && token === config.authToken) {
+      c.set("actor", { name: "owner", scopes: new Set(ALL_SCOPES) });
+      return next();
+    }
+    const entry = token ? config.tokens?.find((t) => t.token === token) : undefined;
+    if (!entry) return err(c, 401, "unauthorized", "missing or invalid bearer token");
+    c.set("actor", { name: entry.name, scopes: new Set(entry.scopes.filter((x): x is Scope => (ALL_SCOPES as string[]).includes(x))) });
     return next();
   });
 
-  api.get("/roots", (c) => c.json({ roots: listRoots() }));
+  // known token, missing scope → 403 (vs 401 for no/unknown token)
+  const need = (scope: Scope): MiddlewareHandler<ApiEnv> => async (c, next) => {
+    const actor = c.get("actor");
+    if (!actor.scopes.has(scope)) return err(c, 403, "insufficient_scope", `token "${actor.name}" lacks the ${scope} scope`);
+    return next();
+  };
 
-  api.get("/browse", (c) => {
+  api.get("/roots", need("read"), (c) => c.json({ roots: listRoots() }));
+
+  api.get("/browse", need("read"), (c) => {
     const path = c.req.query("path");
     if (!path) return err(c, 400, "missing_param", "path required");
     try {
@@ -93,7 +132,7 @@ export function createApi(config: Config, persistConfig: () => void): Hono {
     }
   });
 
-  api.get("/branches", (c) => {
+  api.get("/branches", need("read"), (c) => {
     const path = c.req.query("path");
     if (!path) return err(c, 400, "missing_param", "path required");
     try {
@@ -103,7 +142,7 @@ export function createApi(config: Config, persistConfig: () => void): Hono {
     }
   });
 
-  api.get("/config", (c) =>
+  api.get("/config", need("read"), (c) =>
     c.json({
       roots: config.roots,
       showHidden: config.showHidden,
@@ -111,7 +150,7 @@ export function createApi(config: Config, persistConfig: () => void): Hono {
     })
   );
 
-  api.put("/config", async (c) => {
+  api.put("/config", need("admin"), async (c) => {
     const body = await c.req.json().catch(() => null);
     if (!body) return err(c, 400, "invalid_json", "request body must be valid JSON");
 
@@ -142,9 +181,9 @@ export function createApi(config: Config, persistConfig: () => void): Hono {
     return c.json({ ok: true });
   });
 
-  api.get("/worktrees", (c) => c.json({ worktrees: listKeptWorktrees() }));
+  api.get("/worktrees", need("read"), (c) => c.json({ worktrees: listKeptWorktrees() }));
 
-  api.delete("/worktrees", (c) => {
+  api.delete("/worktrees", need("admin"), (c) => {
     const path = c.req.query("path");
     if (!path) return err(c, 400, "missing_param", "path required");
     try {
@@ -155,16 +194,16 @@ export function createApi(config: Config, persistConfig: () => void): Hono {
     }
   });
 
-  api.get("/sessions", (c) => c.json({ sessions: listSessions(), lost: listLostSessions() }));
+  api.get("/sessions", need("read"), (c) => c.json({ sessions: listSessions(), lost: listLostSessions() }));
 
-  api.get("/journal/recent", (c) => {
+  api.get("/journal/recent", need("read"), (c) => {
     const limit = Math.min(20, Math.max(1, Number(c.req.query("limit")) || 5));
     return c.json({ recent: recentLaunches(limit) });
   });
 
   // Live lifecycle stream (SSE): session.start/ready/exit/kill as they happen.
   // No replay — reconnecting clients should re-list first; the journal is the history.
-  api.get("/events", (c) =>
+  api.get("/events", need("read"), (c) =>
     streamSSE(c, async (stream) => {
       let live = true;
       const unsub = onEvent((e) => {
@@ -182,7 +221,7 @@ export function createApi(config: Config, persistConfig: () => void): Hono {
     })
   );
 
-  api.post("/sessions", async (c) => {
+  api.post("/sessions", need("launch"), async (c) => {
     const body = await c.req.json().catch(() => null);
     if (!body) return err(c, 400, "invalid_json", "request body must be valid JSON");
     if (!body.folder) return err(c, 400, "missing_param", "folder required");
@@ -199,6 +238,7 @@ export function createApi(config: Config, persistConfig: () => void): Hono {
         branch: body.branch,
         permissionMode: body.permissionMode,
         callbackUrl: body.callbackUrl,
+        actor: c.get("actor").name,
       });
     } catch (e) {
       return err(c, 409, "launch_failed", (e as Error).message);
@@ -223,7 +263,7 @@ export function createApi(config: Config, persistConfig: () => void): Hono {
 
   /* ---------- headless jobs: claude -p, no phone in the loop ---------- */
 
-  api.post("/jobs", async (c) => {
+  api.post("/jobs", need("launch"), async (c) => {
     const body = await c.req.json().catch(() => null);
     if (!body) return err(c, 400, "invalid_json", "request body must be valid JSON");
     if (!body.folder) return err(c, 400, "missing_param", "folder required");
@@ -243,6 +283,7 @@ export function createApi(config: Config, persistConfig: () => void): Hono {
         permissionMode: body.permissionMode,
         timeoutMs: body.timeoutMs,
         callbackUrl: body.callbackUrl,
+        actor: c.get("actor").name,
       });
       return c.json(job, 202);
     } catch (e) {
@@ -250,24 +291,24 @@ export function createApi(config: Config, persistConfig: () => void): Hono {
     }
   });
 
-  api.get("/jobs", (c) => c.json({ jobs: listJobs() }));
+  api.get("/jobs", need("read"), (c) => c.json({ jobs: listJobs() }));
 
-  api.get("/jobs/:id", (c) => {
+  api.get("/jobs/:id", need("read"), (c) => {
     const job = getJob(c.req.param("id"));
     return job ? c.json(job) : err(c, 404, "not_found", "no such job");
   });
 
-  api.get("/jobs/:id/log", (c) => {
+  api.get("/jobs/:id/log", need("read"), (c) => {
     const log = getJobLog(c.req.param("id"));
     return log === null ? err(c, 404, "not_found", "no such job") : c.text(log);
   });
 
-  api.delete("/jobs/:id", (c) => {
-    const job = cancelJob(c.req.param("id"));
+  api.delete("/jobs/:id", need("launch"), (c) => {
+    const job = cancelJob(c.req.param("id"), c.get("actor").name);
     return job ? c.json(job) : err(c, 404, "not_found", "no such job");
   });
 
-  api.delete("/jobs/:id/record", (c) => {
+  api.delete("/jobs/:id/record", need("launch"), (c) => {
     try {
       return removeJob(c.req.param("id")) ? c.json({ ok: true }) : err(c, 404, "not_found", "no such job");
     } catch (e) {
@@ -275,12 +316,12 @@ export function createApi(config: Config, persistConfig: () => void): Hono {
     }
   });
 
-  api.get("/sessions/:id", (c) => {
+  api.get("/sessions/:id", need("read"), (c) => {
     const session = getSession(c.req.param("id"));
     return session ? c.json(session) : err(c, 404, "not_found", "no such session");
   });
 
-  api.get("/sessions/:id/qr", async (c) => {
+  api.get("/sessions/:id/qr", need("read"), async (c) => {
     const session = getSession(c.req.param("id"));
     if (!session) return err(c, 404, "not_found", "no such session");
     if (!session.pairingUrl) return err(c, 409, "not_ready", "no pairing url yet");
@@ -292,17 +333,17 @@ export function createApi(config: Config, persistConfig: () => void): Hono {
     return c.body(svg, 200, { "content-type": "image/svg+xml", "cache-control": "no-store" });
   });
 
-  api.get("/sessions/:id/log", (c) => {
+  api.get("/sessions/:id/log", need("read"), (c) => {
     const log = getSessionLog(c.req.param("id"));
     return log === null ? err(c, 404, "not_found", "no such session") : c.text(log);
   });
 
-  api.delete("/sessions/:id", (c) => {
-    const session = killSession(c.req.param("id"));
+  api.delete("/sessions/:id", need("launch"), (c) => {
+    const session = killSession(c.req.param("id"), c.get("actor").name);
     return session ? c.json(session) : err(c, 404, "not_found", "no such session");
   });
 
-  api.delete("/sessions/:id/record", (c) => {
+  api.delete("/sessions/:id/record", need("launch"), (c) => {
     try {
       return removeSession(c.req.param("id")) ? c.json({ ok: true }) : err(c, 404, "not_found", "no such session");
     } catch (e) {

@@ -1,5 +1,5 @@
 /* groundcontrol service worker — network-first shell cache */
-const CACHE = "groundcontrol-v4";
+const CACHE = "groundcontrol-v5";
 const SHELL = ["/", "/styles.css", "/app.js", "/manifest.webmanifest", "/icons/icon-192.png", "/icons/icon-512.png"];
 
 self.addEventListener("install", (e) => {

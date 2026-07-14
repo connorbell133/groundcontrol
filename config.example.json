@@ -5,11 +5,7 @@
     "/home/you/repos"
   ],
   "showHidden": false,
-  "ntfy": {
-    "url": "https://ntfy.sh",
-    "topic": "",
-    "notifyReady": true,
-    "notifyExit": "errors"
-  },
+  "webhooks": [],
+  "jobs": { "concurrency": 2, "timeoutMs": 900000 },
   "authToken": ""
 }

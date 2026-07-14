@@ -1,0 +1,663 @@
+openapi: 3.1.0
+info:
+  title: groundcontrol API
+  version: 0.4.0
+  description: |
+    Launch and supervise Claude Code sessions from HTTP. Every action in the
+    PWA is a route here; see docs/api.md for the human guide and cookbook.
+    The unversioned /api/* paths are a deprecated alias of /api/v1 kept for
+    one release.
+servers:
+  - url: /api/v1
+
+security:
+  - bearer: []
+
+components:
+  securitySchemes:
+    bearer:
+      type: http
+      scheme: bearer
+      description: >
+        The authToken from config.json. Also accepted as a ?token= query
+        parameter (for <img> tags that cannot send headers); prefer the header.
+
+  parameters:
+    sessionId:
+      name: id
+      in: path
+      required: true
+      schema: { type: string }
+    pathQuery:
+      name: path
+      in: query
+      required: true
+      schema: { type: string }
+      description: Absolute path inside a configured root.
+
+  responses:
+    BadRequest:
+      description: Invalid request (see error.code).
+      content:
+        application/json:
+          schema: { $ref: "#/components/schemas/Error" }
+    Unauthorized:
+      description: Missing or invalid bearer token.
+      content:
+        application/json:
+          schema: { $ref: "#/components/schemas/Error" }
+    NotFound:
+      description: No such session.
+      content:
+        application/json:
+          schema: { $ref: "#/components/schemas/Error" }
+
+  schemas:
+    Error:
+      type: object
+      required: [error]
+      properties:
+        error:
+          type: object
+          required: [code, message]
+          properties:
+            code:
+              type: string
+              description: Stable machine-readable code — key off this, not message.
+              enum:
+                - unauthorized
+                - invalid_json
+                - missing_param
+                - invalid_param
+                - invalid_path
+                - invalid_config
+                - outside_roots
+                - not_found
+                - not_ready
+                - ready_timeout
+                - launch_failed
+                - session_live
+                - job_live
+                - worktree_error
+                - not_implemented
+            message:
+              type: string
+
+    Session:
+      type: object
+      required: [id, name, folder, spawnMode, branch, worktreePath, permissionMode, state, pairingUrl, callbackUrl, startedAt, exitedAt, exitCode, lastOutputAt, lastLine]
+      properties:
+        id: { type: string, description: 8-char launch id }
+        name: { type: string }
+        folder: { type: string }
+        spawnMode: { type: string, enum: [same-dir, worktree] }
+        branch: { type: [string, "null"] }
+        worktreePath: { type: [string, "null"] }
+        permissionMode: { type: string, description: "claude permission mode: default, acceptEdits, plan, bypassPermissions" }
+        state:
+          type: string
+          enum: [starting, ready, exited, error]
+          description: error means the process died before a pairing URL appeared.
+        pairingUrl: { type: [string, "null"] }
+        callbackUrl: { type: [string, "null"], description: "Per-launch webhook: session.ready and session.exit are POSTed here." }
+        startedAt: { type: string, format: date-time }
+        exitedAt: { type: [string, "null"], format: date-time }
+        exitCode: { type: [integer, "null"] }
+        lastOutputAt: { type: [string, "null"], format: date-time }
+        lastLine: { type: [string, "null"], description: "Last meaningful log line, ≤120 chars." }
+
+    CreateSession:
+      type: object
+      required: [folder]
+      properties:
+        folder: { type: string, description: Absolute path inside a configured root. }
+        name: { type: string, description: Must not collide with a live session; omitted → auto-generated. }
+        spawnMode: { type: string, enum: [same-dir, worktree], default: same-dir }
+        branch:
+          type: string
+          description: >
+            Required in worktree mode (base for the private gc/<id> branch).
+            In same-dir mode, switches the checkout first; refused if dirty.
+        permissionMode: { type: string, default: default }
+        callbackUrl: { type: string, description: "http(s) URL — this launch's session.ready and session.exit events are POSTed to it." }
+        timeoutMs: { type: integer, default: 60000, minimum: 1000, maximum: 300000, description: Only meaningful with ?wait=ready. }
+
+    LifecycleEvent:
+      type: object
+      required: [event, at, title, message, data]
+      properties:
+        event: { type: string, description: "session.start | session.ready | session.exit | session.kill | job.start | job.exit" }
+        at: { type: string, format: date-time }
+        title: { type: string, description: Ready-made human summary line. }
+        message: { type: string }
+        data:
+          type: object
+          description: The full session object under a "session" key, or the job under a "job" key.
+
+    WebhookConfig:
+      type: object
+      required: [url]
+      properties:
+        url: { type: string, description: http(s) URL that receives matching events as JSON POSTs. }
+        events:
+          type: array
+          items: { type: string }
+          description: >
+            Filter tokens: exact names, prefix wildcards (session.*), "*" or
+            omitted for everything, and the derived token session.failed.
+
+    Job:
+      type: object
+      required: [id, folder, prompt, spawnMode, branch, permissionMode, timeoutMs, callbackUrl, state, createdAt, startedAt, finishedAt, exitCode, result, costUsd, durationMs, numTurns, worktreePath]
+      properties:
+        id: { type: string }
+        folder: { type: string }
+        prompt: { type: string }
+        spawnMode: { type: string, enum: [same-dir, worktree] }
+        branch: { type: [string, "null"] }
+        permissionMode: { type: string }
+        timeoutMs: { type: integer }
+        callbackUrl: { type: [string, "null"] }
+        state: { type: string, enum: [queued, running, succeeded, failed, timeout, canceled] }
+        createdAt: { type: string, format: date-time }
+        startedAt: { type: [string, "null"], format: date-time }
+        finishedAt: { type: [string, "null"], format: date-time }
+        exitCode: { type: [integer, "null"] }
+        result: { type: [string, "null"], description: "Claude's final text, or the launch/kill reason." }
+        costUsd: { type: [number, "null"] }
+        durationMs: { type: [integer, "null"] }
+        numTurns: { type: [integer, "null"] }
+        worktreePath: { type: [string, "null"] }
+
+    CreateJob:
+      type: object
+      required: [folder, prompt]
+      properties:
+        folder: { type: string, description: Absolute path inside a configured root. }
+        prompt: { type: string }
+        spawnMode:
+          type: string
+          enum: [same-dir, worktree]
+          description: Defaults to worktree for git folders — autonomous runs get a fresh checkout.
+        branch: { type: string, description: Worktree base; defaults to the repo's current branch. }
+        permissionMode: { type: string, default: acceptEdits, description: Real autonomy usually wants an explicit bypassPermissions. }
+        timeoutMs: { type: integer, description: "Kill deadline; default from the jobs config key (15 min), max 2h." }
+        callbackUrl: { type: string, description: POSTed the job.exit event on completion. }
+
+    FolderEntry:
+      type: object
+      required: [name, path, isGit, branch]
+      properties:
+        name: { type: string }
+        path: { type: string }
+        isGit: { type: boolean }
+        branch: { type: [string, "null"] }
+
+    BrowseResult:
+      type: object
+      required: [path, parent, isGit, repoRoot, repoName, branch, folders]
+      properties:
+        path: { type: string }
+        parent: { type: [string, "null"], description: null at a configured root. }
+        isGit: { type: boolean, description: "True when inside a repo, not only at its root." }
+        repoRoot: { type: [string, "null"] }
+        repoName: { type: [string, "null"] }
+        branch: { type: [string, "null"] }
+        folders:
+          type: array
+          items: { $ref: "#/components/schemas/FolderEntry" }
+
+    RecentLaunch:
+      type: object
+      required: [folder, name, branch, spawnMode, permissionMode, at, stale]
+      properties:
+        folder: { type: string }
+        name: { type: string }
+        branch: { type: [string, "null"] }
+        spawnMode: { type: string }
+        permissionMode: { type: string }
+        at: { type: string, format: date-time }
+        stale: { type: boolean, description: The launch's branch no longer exists. }
+
+    LostSession:
+      allOf:
+        - $ref: "#/components/schemas/RecentLaunch"
+        - type: object
+          required: [id]
+          properties:
+            id: { type: string }
+
+    KeptWorktree:
+      type: object
+      required: [path, repo, id, branch, dirty]
+      properties:
+        path: { type: string }
+        repo: { type: string }
+        id: { type: string }
+        branch: { type: [string, "null"] }
+        dirty: { type: boolean }
+
+    ConfigView:
+      type: object
+      required: [roots, showHidden, webhooks]
+      properties:
+        roots:
+          type: array
+          items: { type: string }
+        showHidden: { type: boolean }
+        webhooks:
+          type: array
+          items: { $ref: "#/components/schemas/WebhookConfig" }
+
+paths:
+  /roots:
+    get:
+      summary: List configured browse roots
+      responses:
+        "200":
+          description: Roots with git badge and current branch.
+          content:
+            application/json:
+              schema:
+                type: object
+                required: [roots]
+                properties:
+                  roots:
+                    type: array
+                    items: { $ref: "#/components/schemas/FolderEntry" }
+        "401": { $ref: "#/components/responses/Unauthorized" }
+
+  /browse:
+    get:
+      summary: Browse a folder
+      parameters:
+        - $ref: "#/components/parameters/pathQuery"
+      responses:
+        "200":
+          description: Subfolders plus the repo context of the folder itself.
+          content:
+            application/json:
+              schema: { $ref: "#/components/schemas/BrowseResult" }
+        "400": { $ref: "#/components/responses/BadRequest" }
+        "401": { $ref: "#/components/responses/Unauthorized" }
+
+  /branches:
+    get:
+      summary: List branches for the repo containing a path
+      description: Local and remote-tracking refs deduped to plain names, newest commit first.
+      parameters:
+        - $ref: "#/components/parameters/pathQuery"
+      responses:
+        "200":
+          description: Branch names; empty for non-git folders.
+          content:
+            application/json:
+              schema:
+                type: object
+                required: [branches]
+                properties:
+                  branches:
+                    type: array
+                    items: { type: string }
+        "400": { $ref: "#/components/responses/BadRequest" }
+        "401": { $ref: "#/components/responses/Unauthorized" }
+
+  /config:
+    get:
+      summary: Read config
+      responses:
+        "200":
+          description: Current config.
+          content:
+            application/json:
+              schema: { $ref: "#/components/schemas/ConfigView" }
+        "401": { $ref: "#/components/responses/Unauthorized" }
+    put:
+      summary: Update config (partial)
+      description: >
+        Any subset of roots, showHidden, ntfy. Persists to config.json.
+        A token that can reach this route can widen roots — treat it as root
+        on the box.
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              type: object
+              properties:
+                roots:
+                  type: array
+                  items: { type: string }
+                showHidden: { type: boolean }
+                webhooks:
+                  type: array
+                  items: { $ref: "#/components/schemas/WebhookConfig" }
+      responses:
+        "200":
+          description: Applied and persisted.
+          content:
+            application/json:
+              schema:
+                type: object
+                properties:
+                  ok: { type: boolean }
+        "400": { $ref: "#/components/responses/BadRequest" }
+        "401": { $ref: "#/components/responses/Unauthorized" }
+
+  /worktrees:
+    get:
+      summary: List kept worktrees
+      description: Dirty orphans the cleanup sweeps refused to delete.
+      responses:
+        "200":
+          description: Kept worktrees.
+          content:
+            application/json:
+              schema:
+                type: object
+                required: [worktrees]
+                properties:
+                  worktrees:
+                    type: array
+                    items: { $ref: "#/components/schemas/KeptWorktree" }
+        "401": { $ref: "#/components/responses/Unauthorized" }
+    delete:
+      summary: Force-remove a kept worktree
+      description: Merged gc/* session branches are deleted; unmerged ones kept.
+      parameters:
+        - $ref: "#/components/parameters/pathQuery"
+      responses:
+        "200":
+          description: Removed.
+          content:
+            application/json:
+              schema:
+                type: object
+                properties:
+                  ok: { type: boolean }
+        "400": { $ref: "#/components/responses/BadRequest" }
+        "401": { $ref: "#/components/responses/Unauthorized" }
+
+  /sessions:
+    get:
+      summary: List sessions
+      responses:
+        "200":
+          description: Live sessions plus lost headstones from the journal.
+          content:
+            application/json:
+              schema:
+                type: object
+                required: [sessions, lost]
+                properties:
+                  sessions:
+                    type: array
+                    items: { $ref: "#/components/schemas/Session" }
+                  lost:
+                    type: array
+                    items: { $ref: "#/components/schemas/LostSession" }
+        "401": { $ref: "#/components/responses/Unauthorized" }
+    post:
+      summary: Spawn an agent session
+      description: >
+        Spawns claude remote-control in the folder (or a fresh worktree).
+        Returns immediately with state "starting"; poll GET /sessions/{id}
+        until state is "ready" and pairingUrl is set — or pass ?wait=ready
+        to block until then and get the pairing URL in one round-trip.
+      parameters:
+        - name: wait
+          in: query
+          schema: { type: string, enum: [ready] }
+          description: Block until the session pairs, dies, or timeoutMs passes.
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema: { $ref: "#/components/schemas/CreateSession" }
+      responses:
+        "201":
+          description: Session created.
+          content:
+            application/json:
+              schema: { $ref: "#/components/schemas/Session" }
+        "400": { $ref: "#/components/responses/BadRequest" }
+        "401": { $ref: "#/components/responses/Unauthorized" }
+        "409":
+          description: "launch_failed: duplicate live name, unknown branch, dirty checkout, worktree failure — or, with ?wait=ready, the process died before pairing."
+          content:
+            application/json:
+              schema: { $ref: "#/components/schemas/Error" }
+        "504":
+          description: "ready_timeout: ?wait=ready deadline passed; the session is still starting — poll GET /sessions/{id}."
+          content:
+            application/json:
+              schema: { $ref: "#/components/schemas/Error" }
+
+  /sessions/{id}:
+    get:
+      summary: Inspect a session
+      parameters:
+        - $ref: "#/components/parameters/sessionId"
+      responses:
+        "200":
+          description: The session.
+          content:
+            application/json:
+              schema: { $ref: "#/components/schemas/Session" }
+        "401": { $ref: "#/components/responses/Unauthorized" }
+        "404": { $ref: "#/components/responses/NotFound" }
+    delete:
+      summary: Kill a session
+      description: SIGTERM to the PTY; the worktree is cleaned on exit (kept if dirty).
+      parameters:
+        - $ref: "#/components/parameters/sessionId"
+      responses:
+        "200":
+          description: The session as of the kill.
+          content:
+            application/json:
+              schema: { $ref: "#/components/schemas/Session" }
+        "401": { $ref: "#/components/responses/Unauthorized" }
+        "404": { $ref: "#/components/responses/NotFound" }
+
+  /sessions/{id}/qr:
+    get:
+      summary: Pairing QR (SVG)
+      parameters:
+        - $ref: "#/components/parameters/sessionId"
+      responses:
+        "200":
+          description: QR code for the pairing URL.
+          content:
+            image/svg+xml:
+              schema: { type: string }
+        "401": { $ref: "#/components/responses/Unauthorized" }
+        "404": { $ref: "#/components/responses/NotFound" }
+        "409":
+          description: "not_ready: session has no pairing URL yet."
+          content:
+            application/json:
+              schema: { $ref: "#/components/schemas/Error" }
+
+  /sessions/{id}/log:
+    get:
+      summary: Runtime log tail
+      description: Last ~400 output chunks, ANSI-stripped, as plain text.
+      parameters:
+        - $ref: "#/components/parameters/sessionId"
+      responses:
+        "200":
+          description: Log text.
+          content:
+            text/plain:
+              schema: { type: string }
+        "401": { $ref: "#/components/responses/Unauthorized" }
+        "404": { $ref: "#/components/responses/NotFound" }
+
+  /sessions/{id}/record:
+    delete:
+      summary: Dismiss a dead or lost session
+      parameters:
+        - $ref: "#/components/parameters/sessionId"
+      responses:
+        "200":
+          description: Dismissed.
+          content:
+            application/json:
+              schema:
+                type: object
+                properties:
+                  ok: { type: boolean }
+        "401": { $ref: "#/components/responses/Unauthorized" }
+        "404": { $ref: "#/components/responses/NotFound" }
+        "409":
+          description: "session_live: still running — kill it first."
+          content:
+            application/json:
+              schema: { $ref: "#/components/schemas/Error" }
+
+  /events:
+    get:
+      summary: Lifecycle event stream (SSE)
+      description: >
+        Server-sent events: one message per lifecycle event (LifecycleEvent as
+        JSON in the data field, event name in the event field), plus a ping
+        every 25 seconds. No replay — re-list sessions after reconnecting.
+        EventSource clients authenticate with ?token=.
+      responses:
+        "200":
+          description: text/event-stream held open.
+          content:
+            text/event-stream:
+              schema: { type: string }
+        "401": { $ref: "#/components/responses/Unauthorized" }
+
+  /jobs:
+    get:
+      summary: List jobs
+      responses:
+        "200":
+          description: All jobs this runner knows, newest first.
+          content:
+            application/json:
+              schema:
+                type: object
+                required: [jobs]
+                properties:
+                  jobs:
+                    type: array
+                    items: { $ref: "#/components/schemas/Job" }
+        "401": { $ref: "#/components/responses/Unauthorized" }
+    post:
+      summary: Queue a headless job
+      description: >
+        Runs claude -p <prompt> --output-format json to completion — no PTY,
+        no pairing, no human. FIFO queue, bounded concurrency (default 2).
+        An isolation/docker field is rejected with 501 not_implemented.
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema: { $ref: "#/components/schemas/CreateJob" }
+      responses:
+        "202":
+          description: Queued (or already running if a slot was free).
+          content:
+            application/json:
+              schema: { $ref: "#/components/schemas/Job" }
+        "400": { $ref: "#/components/responses/BadRequest" }
+        "401": { $ref: "#/components/responses/Unauthorized" }
+        "409":
+          description: "launch_failed: not a git repo in worktree mode, or detached with no branch given."
+          content:
+            application/json:
+              schema: { $ref: "#/components/schemas/Error" }
+        "501":
+          description: "not_implemented: Docker isolation requested."
+          content:
+            application/json:
+              schema: { $ref: "#/components/schemas/Error" }
+
+  /jobs/{id}:
+    get:
+      summary: Inspect a job
+      parameters:
+        - $ref: "#/components/parameters/sessionId"
+      responses:
+        "200":
+          description: The job with result, cost, duration, turns once finished.
+          content:
+            application/json:
+              schema: { $ref: "#/components/schemas/Job" }
+        "401": { $ref: "#/components/responses/Unauthorized" }
+        "404": { $ref: "#/components/responses/NotFound" }
+    delete:
+      summary: Cancel a job
+      description: Dequeues a queued job, kills a running one's whole process group; a no-op on finished jobs.
+      parameters:
+        - $ref: "#/components/parameters/sessionId"
+      responses:
+        "200":
+          description: The job as of the cancel.
+          content:
+            application/json:
+              schema: { $ref: "#/components/schemas/Job" }
+        "401": { $ref: "#/components/responses/Unauthorized" }
+        "404": { $ref: "#/components/responses/NotFound" }
+
+  /jobs/{id}/log:
+    get:
+      summary: Job log (raw stdout+stderr)
+      parameters:
+        - $ref: "#/components/parameters/sessionId"
+      responses:
+        "200":
+          description: Log text.
+          content:
+            text/plain:
+              schema: { type: string }
+        "401": { $ref: "#/components/responses/Unauthorized" }
+        "404": { $ref: "#/components/responses/NotFound" }
+
+  /jobs/{id}/record:
+    delete:
+      summary: Drop a finished job from the list
+      parameters:
+        - $ref: "#/components/parameters/sessionId"
+      responses:
+        "200":
+          description: Dropped.
+          content:
+            application/json:
+              schema:
+                type: object
+                properties:
+                  ok: { type: boolean }
+        "401": { $ref: "#/components/responses/Unauthorized" }
+        "404": { $ref: "#/components/responses/NotFound" }
+        "409":
+          description: "job_live: still queued or running — cancel it first."
+          content:
+            application/json:
+              schema: { $ref: "#/components/schemas/Error" }
+
+  /journal/recent:
+    get:
+      summary: Recent launch configs
+      parameters:
+        - name: limit
+          in: query
+          schema: { type: integer, minimum: 1, maximum: 20, default: 5 }
+      responses:
+        "200":
+          description: Distinct recent launches, newest first.
+          content:
+            application/json:
+              schema:
+                type: object
+                required: [recent]
+                properties:
+                  recent:
+                    type: array
+                    items: { $ref: "#/components/schemas/RecentLaunch" }
+        "401": { $ref: "#/components/responses/Unauthorized" }

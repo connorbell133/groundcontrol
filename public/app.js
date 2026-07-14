@@ -1,5 +1,5 @@
 /* groundcontrol mobile UI */
-const CLIENT_VERSION = "0.3.0"; // keep in step with package.json — healthz mismatch triggers a reload
+const CLIENT_VERSION = "0.4.0"; // keep in step with package.json — healthz mismatch triggers a reload
 const $ = (id) => document.getElementById(id);
 const authToken = () => localStorage.getItem("token") || "";
 const tokenQS = () => (authToken() ? `?token=${encodeURIComponent(authToken())}` : "");
@@ -12,7 +12,7 @@ const api = async (path, opts = {}) => {
     throw new Error("unauthorized");
   }
   const body = res.headers.get("content-type")?.includes("json") ? await res.json() : await res.text();
-  if (!res.ok) throw new Error(body.error || res.statusText);
+  if (!res.ok) throw new Error(body?.error?.message || res.statusText);
   return body;
 };
 
@@ -74,9 +74,9 @@ function fmtDur(ms) {
 
 /* ---------- browse ---------- */
 async function loadFolder(path) {
-  const data = path ? await api(`/api/browse?path=${encodeURIComponent(path)}`) : null;
+  const data = path ? await api(`/api/v1/browse?path=${encodeURIComponent(path)}`) : null;
   if (!data) {
-    const { roots } = await api("/api/roots");
+    const { roots } = await api("/api/v1/roots");
     state.current = { path: null, parent: null, isGit: false, repoRoot: null, repoName: null, branch: null, folders: roots };
   } else {
     state.current = data;
@@ -146,7 +146,7 @@ function gitGlyph() {
 
 /* ---------- recents ---------- */
 async function loadRecents() {
-  const { recent } = await api("/api/journal/recent?limit=6");
+  const { recent } = await api("/api/v1/journal/recent?limit=6");
   state.recent = recent;
   state.recentLoaded = true;
   const row = $("recentsRow");
@@ -198,7 +198,7 @@ async function loadBranches(folder) {
   const select = $("optBranch");
   select.innerHTML = "";
   try {
-    const { branches } = await api(`/api/branches?path=${encodeURIComponent(folder)}`);
+    const { branches } = await api(`/api/v1/branches?path=${encodeURIComponent(folder)}`);
     state.branchCount = branches.length;
     if (branches.length === 0) {
       // repo with no commits yet: no branches to pick and worktrees are impossible
@@ -300,7 +300,7 @@ async function launch() {
     const branch = state.current.isGit ? $("optBranch").value || undefined : undefined;
     state.opts.branch = branch;
     localStorage.setItem(`opts:${state.path}`, JSON.stringify(state.opts));
-    await api("/api/sessions", {
+    await api("/api/v1/sessions", {
       method: "POST",
       headers: { "content-type": "application/json" },
       body: JSON.stringify({
@@ -349,7 +349,7 @@ function reconcile(id, tries = 6) {
 
 async function refreshSessions() {
   try {
-    const { sessions, lost } = await api("/api/sessions");
+    const { sessions, lost } = await api("/api/v1/sessions");
     state.sessions = sessions.map((s) =>
       killing.has(s.id) && s.state !== "exited" && s.state !== "error"
         ? { ...s, state: "exited", pairingUrl: null }
@@ -386,7 +386,7 @@ function renderShell(card, s) {
     ${s.pairingUrl && s.state === "ready" ? `
       <details class="qr-details" data-qr="${s.id}">
         <summary class="qr-summary">
-          <img class="qr-thumb" alt="Pairing QR code" src="/api/sessions/${s.id}/qr${tokenQS()}" />
+          <img class="qr-thumb" alt="Pairing QR code" src="/api/v1/sessions/${s.id}/qr${tokenQS()}" />
           <span class="qr-summary-label">
             <span class="qr-summary-title">Scan to pair</span>
             <span class="qr-summary-sub">tap to expand</span>
@@ -394,7 +394,7 @@ function renderShell(card, s) {
           <span class="qr-chevron">›</span>
         </summary>
         <div class="qr-wrap">
-          <img class="qr-img" alt="Pairing QR code" src="/api/sessions/${s.id}/qr${tokenQS()}" />
+          <img class="qr-img" alt="Pairing QR code" src="/api/v1/sessions/${s.id}/qr${tokenQS()}" />
           <span class="qr-hint">Claude app · camera</span>
           <span class="bracket bl"></span><span class="bracket br"></span>
         </div>
@@ -540,7 +540,7 @@ async function tailLogs() {
     }
     if (s.state !== "starting" && s.state !== "ready") continue; // frozen but stays open
     try {
-      const text = await api(`/api/sessions/${id}/log`);
+      const text = await api(`/api/v1/sessions/${id}/log`);
       const pre = document.querySelector(`pre[data-log="${id}"]`); // fresh lookup — survives rewrites
       if (pre && openLogs.has(id)) fillLog(pre, text);
     } catch {
@@ -561,7 +561,7 @@ document.addEventListener("toggle", async (e) => {
   const id = pre.dataset.log;
   if (e.target.open) {
     openLogs.add(id);
-    const text = await api(`/api/sessions/${id}/log`).catch(() => "log unavailable");
+    const text = await api(`/api/v1/sessions/${id}/log`).catch(() => "log unavailable");
     fillLog(pre, text);
   } else {
     openLogs.delete(id);
@@ -606,7 +606,7 @@ document.addEventListener("click", async (e) => {
     const cfg = state.sessions.find((x) => x.id === id) || state.lost.find((l) => l.id === id);
     if (!cfg) return;
     try {
-      await api("/api/sessions", {
+      await api("/api/v1/sessions", {
         method: "POST",
         headers: { "content-type": "application/json" },
         body: JSON.stringify({
@@ -626,7 +626,7 @@ document.addEventListener("click", async (e) => {
   if (kill) {
     const id = kill.dataset.kill;
     try {
-      await api(`/api/sessions/${id}`, { method: "DELETE" });
+      await api(`/api/v1/sessions/${id}`, { method: "DELETE" });
       toast("Session killed");
       // optimistic: the PTY takes a beat to exit, so show it right away
       killing.add(id);
@@ -643,7 +643,7 @@ document.addEventListener("click", async (e) => {
   }
   if (remove) {
     try {
-      await api(`/api/sessions/${remove.dataset.remove}/record`, { method: "DELETE" });
+      await api(`/api/v1/sessions/${remove.dataset.remove}/record`, { method: "DELETE" });
       state.lost = state.lost.filter((l) => l.id !== remove.dataset.remove);
       refreshSessions();
     } catch (err) {
@@ -725,9 +725,26 @@ function wireSetSegment(id, key) {
     };
   });
 }
-for (const pair of ["setTheme:theme", "setSpawn:spawnMode", "setPerm:permissionMode", "setNtfyReady:ntfyReady", "setNtfyExit:ntfyExit", "setHidden:hidden"]) {
+for (const pair of ["setTheme:theme", "setSpawn:spawnMode", "setPerm:permissionMode", "setHookEvents:hookEvents", "setHidden:hidden"]) {
   const [id, key] = pair.split(":");
   wireSetSegment(id, key);
+}
+
+// the settings sheet edits the first webhook; extra subscribers set up via
+// config.json or the API are preserved untouched on save
+const HOOK_PRESETS = {
+  failures: ["session.failed", "job.failed"],
+  ready: ["session.ready", "session.failed", "job.failed"],
+  all: ["*"],
+};
+let webhooksDraft = [];
+function hookPresetFor(events) {
+  if (!events || !events.length) return "all";
+  const key = [...events].sort().join(",");
+  for (const [name, set] of Object.entries(HOOK_PRESETS)) {
+    if ([...set].sort().join(",") === key) return name;
+  }
+  return "custom"; // hand-edited filter — shown unhighlighted, preserved on save
 }
 
 let rootsDraft = [];
@@ -754,7 +771,7 @@ function renderRootChips() {
 async function renderWorktrees() {
   const box = $("worktreeList");
   try {
-    const { worktrees } = await api("/api/worktrees");
+    const { worktrees } = await api("/api/v1/worktrees");
     box.innerHTML = "";
     if (!worktrees.length) {
       box.innerHTML = `<div class="wt-empty">none kept — all clean</div>`;
@@ -778,7 +795,7 @@ async function renderWorktrees() {
           return;
         }
         try {
-          await api(`/api/worktrees?path=${encodeURIComponent(wt.path)}`, { method: "DELETE" });
+          await api(`/api/v1/worktrees?path=${encodeURIComponent(wt.path)}`, { method: "DELETE" });
           toast("Worktree cleaned");
           renderWorktrees();
         } catch (err) {
@@ -801,16 +818,14 @@ async function openSettings() {
   syncSegment("setPerm", setVals.permissionMode);
   renderWorktrees();
   try {
-    const cfg = await api("/api/config");
-    setVals.ntfyReady = cfg.ntfy.notifyReady ? "on" : "off";
-    setVals.ntfyExit = cfg.ntfy.notifyExit;
+    const cfg = await api("/api/v1/config");
+    webhooksDraft = Array.isArray(cfg.webhooks) ? [...cfg.webhooks] : [];
+    setVals.hookEvents = hookPresetFor(webhooksDraft[0]?.events);
     setVals.hidden = cfg.showHidden ? "on" : "off";
-    $("setNtfyTopic").value = cfg.ntfy.topic;
-    $("setNtfyUrl").value = cfg.ntfy.url;
+    $("setHookUrl").value = webhooksDraft[0]?.url || "";
     rootsDraft = [...cfg.roots];
     renderRootChips();
-    syncSegment("setNtfyReady", setVals.ntfyReady);
-    syncSegment("setNtfyExit", setVals.ntfyExit);
+    syncSegment("setHookEvents", setVals.hookEvents);
     syncSegment("setHidden", setVals.hidden);
   } catch {
     toast("could not load server config", true);
@@ -824,17 +839,18 @@ async function saveSettings() {
   localStorage.setItem("prefs", JSON.stringify(prefs));
   applyTheme();
   try {
-    await api("/api/config", {
+    await api("/api/v1/config", {
       method: "PUT",
       headers: { "content-type": "application/json" },
       body: JSON.stringify({
         showHidden: setVals.hidden === "on",
-        ntfy: {
-          url: $("setNtfyUrl").value.trim() || "https://ntfy.sh",
-          topic: $("setNtfyTopic").value.trim(),
-          notifyReady: setVals.ntfyReady === "on",
-          notifyExit: setVals.ntfyExit || "errors",
-        },
+        webhooks: (() => {
+          const url = $("setHookUrl").value.trim();
+          const rest = webhooksDraft.slice(1);
+          if (!url) return rest;
+          const events = setVals.hookEvents === "custom" ? webhooksDraft[0]?.events : HOOK_PRESETS[setVals.hookEvents || "failures"];
+          return [{ url, ...(events && !events.includes("*") ? { events } : {}) }, ...rest];
+        })(),
         roots: rootsDraft,
       }),
     });

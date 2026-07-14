@@ -60,7 +60,7 @@ After: open the app, tap the folder, tap **Launch**, scan.
 - **Live session cards** with pairing QR, one-tap open-in-Claude-app, runtime log tail, uptime and last-output age, and a kill switch that updates instantly.
 - **Recent dispatches:** your last launches as one-tap relaunch chips, with staleness detection — if the branch is gone, the chip says so and degrades gracefully.
 - **Survives restarts honestly.** Sessions the tower lost track of show up as *lost* cards from the flight log instead of silently vanishing.
-- **ntfy notifications** when a session pairs or dies, so you can put the phone down while it provisions.
+- **Webhook notifications** when a session pairs or dies, so you can put the phone down while it provisions. One generic JSON POST per lifecycle event — point it at [ntfy](https://ntfy.sh) (via its `?template=yes` params), n8n, or anything else with a URL; nothing is special-cased.
 - **Installable PWA** — add to home screen, standalone window, offline shell, and it self-reloads when the server ships a new version.
 
 ## How it works
@@ -110,11 +110,16 @@ That gives you a stable HTTPS URL on your tailnet — which also unlocks PWA ins
 |---|---|
 | `roots` | absolute paths the folder browser can see (and the only places sessions may launch) |
 | `authToken` | bearer token required on every API call; empty disables auth (don't) |
-| `ntfy` | server, topic, and when to notify (`notifyReady`, `notifyExit: errors\|all\|never`) |
+| `webhooks` | notification subscribers: `[{url, events?}]` — each lifecycle event is POSTed as JSON to every matching URL; filter with exact names, `session.*`, `session.failed`, or `*` |
+| `jobs` | headless-job bounds: `{concurrency, timeoutMs}` (default 2 parallel, 15 min) |
 | `showHidden` | show dotfolders in the browser |
 | `port`, `host` | where the server listens |
 
-Everything user-facing — theme, launch defaults, roots, ntfy, kept-worktree cleanup — is also editable from the ⚙ Settings sheet in the app itself.
+Everything user-facing — theme, launch defaults, roots, the notification webhook, kept-worktree cleanup — is also editable from the ⚙ Settings sheet in the app itself.
+
+## API
+
+Everything the app does is a bearer-token HTTP API at `/api/v1` — the PWA is just the first client. Spawn a session from a script or an n8n workflow with `POST /api/v1/sessions?wait=ready` and get the pairing URL in one round-trip; run a fully headless agent with `POST /api/v1/jobs` (`claude -p` in a fresh worktree, result + cost on your webhook); follow every lifecycle event live over SSE (`GET /api/v1/events`). [docs/api.md](docs/api.md) is the guide with a curl cookbook; [docs/openapi.yaml](docs/openapi.yaml) is the machine contract. Errors are a stable envelope (`{"error":{"code","message"}}`) — key off `code`.
 
 ## Development
 
@@ -127,7 +132,7 @@ npm run typecheck    # tsc --noEmit
 
 - secrets — [gitleaks](https://github.com/gitleaks/gitleaks) over staged changes, extended with rules for this app's own token format and Claude pairing URLs (`brew install gitleaks`)
 - the private files — `config.json` and `data/` are blocked even if force-added past `.gitignore`
-- broken JSON or TypeScript that doesn't typecheck
+- broken JSON or YAML, and TypeScript that doesn't typecheck
 
 Design notes, for the curious: the UI is a "paper dispatch" theme — Instrument Serif and IBM Plex Mono on warm paper, vermillion for actions, stamp green for anything git. Light is the baseline; dark mode is the 2am safelight, opt-in from Settings.
 

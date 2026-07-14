@@ -178,30 +178,20 @@
       </div>
     </div>
 
-    <div class="settings-group">Notifications · ntfy</div>
+    <div class="settings-group">Notifications · webhook</div>
     <label class="field">
-      <span class="field-label">Topic</span>
-      <input type="text" id="setNtfyTopic" placeholder="empty = disabled" autocomplete="off" autocapitalize="off" spellcheck="false" />
-      <span class="field-hint">subscribe to the same topic in the ntfy app</span>
-    </label>
-    <label class="field">
-      <span class="field-label">Server</span>
-      <input type="text" id="setNtfyUrl" placeholder="https://ntfy.sh" autocomplete="off" autocapitalize="off" spellcheck="false" />
+      <span class="field-label">URL</span>
+      <input type="text" id="setHookUrl" placeholder="empty = disabled" autocomplete="off" autocapitalize="off" spellcheck="false" />
+      <span class="field-hint">POSTs {event, title, message, data} — n8n catches it raw; ntfy via ?template=yes&amp;title={{.title}}&amp;message={{.message}}</span>
     </label>
     <div class="field">
-      <span class="field-label">Notify when ready</span>
-      <div class="segment" id="setNtfyReady">
-        <button data-value="on" class="active">On</button>
-        <button data-value="off">Off</button>
+      <span class="field-label">Notify on</span>
+      <div class="segment" id="setHookEvents">
+        <button data-value="failures" class="active">Failures</button>
+        <button data-value="ready">Ready + fail</button>
+        <button data-value="all">Everything</button>
       </div>
-    </div>
-    <div class="field">
-      <span class="field-label">Notify on exit</span>
-      <div class="segment" id="setNtfyExit">
-        <button data-value="errors" class="active">Errors</button>
-        <button data-value="all">All</button>
-        <button data-value="never">Never</button>
-      </div>
+      <span class="field-hint">more subscribers and finer filters via config.json or the API</span>
     </div>
 
     <div class="settings-group">Browsing</div>

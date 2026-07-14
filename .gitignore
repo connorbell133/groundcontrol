@@ -12,3 +12,6 @@ config.json
 docs/brainstorms/
 docs/ideation/
 docs/plans/
+
+# built binary
+/groundcontrol

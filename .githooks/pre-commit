@@ -1,6 +1,6 @@
 #!/bin/sh
-# agent-runner pre-commit — secrets, private files, types, JSON sanity.
-# Wired up automatically by `npm install` (prepare script sets core.hooksPath).
+# agent-runner pre-commit — secrets, private files, build sanity, JSON sanity.
+# Wire up with: git config core.hooksPath .githooks
 set -e
 
 fail() { printf '\n\033[31m✗ %s\033[0m\n' "$1" >&2; exit 1; }
@@ -27,19 +27,34 @@ fi
 # 3. Staged JSON must parse.
 for f in $(echo "$STAGED" | grep '\.json$' || true); do
   step "json: $f"
-  node -e "JSON.parse(require('fs').readFileSync('$f','utf8'))" || fail "$f is not valid JSON"
+  if command -v jq >/dev/null 2>&1; then
+    jq empty "$f" || fail "$f is not valid JSON"
+  elif command -v python3 >/dev/null 2>&1; then
+    python3 -m json.tool "$f" >/dev/null || fail "$f is not valid JSON"
+  else
+    step "json: skipped (need jq or python3)"
+    break
+  fi
 done
 
 # 4. Staged YAML must parse (docs/openapi.yaml keeps the API contract).
 for f in $(echo "$STAGED" | grep '\.ya\?ml$' || true); do
   step "yaml: $f"
-  npx --yes js-yaml "$f" >/dev/null || fail "$f is not valid YAML"
+  if command -v yq >/dev/null 2>&1; then
+    yq eval '.' "$f" >/dev/null || fail "$f is not valid YAML"
+  elif command -v python3 >/dev/null 2>&1; then
+    python3 -c "import sys,yaml; yaml.safe_load(open(sys.argv[1]))" "$f" || fail "$f is not valid YAML"
+  else
+    step "yaml: skipped (need yq or python3+pyyaml)"
+    break
+  fi
 done
 
-# 5. TypeScript must typecheck when server code changes.
-if echo "$STAGED" | grep -q '^src/.*\.ts$\|^tsconfig.json$'; then
-  step "tsc --noEmit"
-  npx tsc --noEmit || fail "typecheck failed"
+# 5. Go must build and vet when server code changes.
+if echo "$STAGED" | grep -q '\.go$\|^go\.mod$\|^go\.sum$'; then
+  step "go build + vet"
+  go build ./... || fail "build failed"
+  go vet ./... || fail "vet failed"
 fi
 
 printf '\033[32m✓ pre-commit clean\033[0m\n'

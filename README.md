@@ -10,9 +10,9 @@
 
 <p align="center">
   <img src="https://img.shields.io/badge/license-MIT-1c1a14?style=flat-square" alt="MIT license">
-  <img src="https://img.shields.io/badge/node-%E2%89%A520-1c1a14?style=flat-square" alt="Node 20+">
+  <img src="https://img.shields.io/badge/go-%E2%89%A51.24-1c1a14?style=flat-square" alt="Go 1.24+">
   <img src="https://img.shields.io/badge/PWA-installable-d8451f?style=flat-square" alt="Installable PWA">
-  <img src="https://img.shields.io/badge/dependencies-4-1c1a14?style=flat-square" alt="4 runtime dependencies">
+  <img src="https://img.shields.io/badge/dependencies-2-1c1a14?style=flat-square" alt="2 runtime dependencies">
   <img src="https://img.shields.io/badge/frontend-vanilla%20JS%2C%20zero%20build-1c1a14?style=flat-square" alt="Vanilla JS, zero build">
 </p>
 
@@ -66,33 +66,40 @@ After: open the app, tap the folder, tap **Launch**, scan.
 ## How it works
 
 ```
-phone (PWA, vanilla JS) ──HTTPS via tailscale serve──▶ Hono server (Node)
+phone (PWA, vanilla JS) ──HTTPS via tailscale serve──▶ Go server (one static binary)
                                                           │
-                                            node-pty ─▶ claude remote-control
+                                          creack/pty ─▶ claude remote-control
                                                           │
                                      scrape pairing URL ─▶ QR ─▶ Claude app
 ```
 
-One Node process. The server spawns `claude remote-control` in a PTY, scrapes the pairing URL out of the output, and renders it as a QR. Session history lives in an append-only JSON journal that doubles as the recents list, the lost-session detector, and the audit trail. No database, no build step, no framework — the server is three TypeScript files (~900 lines), the frontend three static files plus a 32-line service worker.
+One static Go binary. The server spawns `claude remote-control` in a PTY, scrapes the pairing URL out of the output, and renders it as a QR. Session history lives in an append-only JSON journal that doubles as the recents list, the lost-session detector, and the audit trail. No database, no runtime dependencies, no framework — the server is one flat Go package leaning on the stdlib (plus a PTY and a QR library), the frontend three static files plus a 32-line service worker, embedded straight into the binary with `go:embed`.
 
 ## Install
 
-You need [Node 20+](https://nodejs.org), git, and the [Claude Code CLI](https://claude.com/claude-code) logged in on the host machine (`claude` must work in a terminal there — Remote Control needs full login credentials, not an API key).
+You need [Go 1.24+](https://go.dev), git, and the [Claude Code CLI](https://claude.com/claude-code) logged in on the host machine (`claude` must work in a terminal there — Remote Control needs full login credentials, not an API key). Linux and macOS only.
+
+> **0.4.0+ is a Go rewrite.** Same config format, same API, same frontend, same journal — only the runtime changed. It builds to one static binary with the web frontend embedded: no Node, no npm, no native prebuilds, no postinstall hacks. The one casualty: Windows is no longer supported (the Go PTY layer has no ConPTY support).
+
+```bash
+go install github.com/connorbell133/groundcontrol@latest
+```
+
+or build from a clone:
 
 ```bash
 git clone https://github.com/connorbell133/groundcontrol.git
 cd groundcontrol
-npm install
-cp config.example.json config.json
+go build -o groundcontrol .
 ```
 
-Edit `config.json`: set `roots` to the folders you want browsable, and give `authToken` a value (`openssl rand -hex 16` makes a good one). Then:
+Copy [`config.example.json`](config.example.json) to `config.json` in the directory you'll run from, then edit it: set `roots` to the folders you want browsable, and give `authToken` a value (`openssl rand -hex 16` makes a good one). Then:
 
 ```bash
-npm start
+./groundcontrol
 ```
 
-Open `http://localhost:3020`, paste your token when asked, launch something.
+The tower reads `config.json` from the current directory and writes its flight log to `data/journal.json` alongside it. Open `http://localhost:3020`, paste your token when asked, launch something.
 
 ### Reaching it from your phone
 
@@ -124,15 +131,17 @@ Everything the app does is a bearer-token HTTP API at `/api/v1` — the PWA is j
 ## Development
 
 ```bash
-npm run dev          # tsx watch mode
-npm run typecheck    # tsc --noEmit
+go run .             # build and run from source
+go vet ./...         # static checks
 ```
 
-`npm install` wires up the repo's pre-commit hook (`.githooks/pre-commit`), which refuses to commit:
+`public/` is embedded into the binary with `go:embed`, so frontend edits need a rebuild — stop and re-run `go run .` to see them.
+
+Wire up the repo's pre-commit hook with `git config core.hooksPath .githooks`; it refuses to commit:
 
 - secrets — [gitleaks](https://github.com/gitleaks/gitleaks) over staged changes, extended with rules for this app's own token format and Claude pairing URLs (`brew install gitleaks`)
 - the private files — `config.json` and `data/` are blocked even if force-added past `.gitignore`
-- broken JSON or YAML, and TypeScript that doesn't typecheck
+- broken JSON or YAML
 
 Design notes, for the curious: the UI is a "paper dispatch" theme — Instrument Serif and IBM Plex Mono on warm paper, vermillion for actions, stamp green for anything git. Light is the baseline; dark mode is the 2am safelight, opt-in from Settings.
 

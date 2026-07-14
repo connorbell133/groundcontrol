@@ -22,6 +22,27 @@ authorization: Bearer <authToken>
 and `EventSource` (the SSE stream) can't send headers. Prefer the header
 everywhere else — query strings leak into logs and proxies more readily.
 
+### Scoped tokens
+
+`authToken` has full access. Automations should get their own entries under
+`tokens` in `config.json` instead — each carries only the scopes it needs:
+
+```json
+"tokens": [
+  { "name": "n8n", "token": "<openssl rand -hex 16>", "scopes": ["read", "launch"] }
+]
+```
+
+| scope | grants |
+|---|---|
+| `read` | browse folders and branches; list/inspect sessions, jobs, worktrees, config; the QR; the SSE stream |
+| `launch` | spawn and kill sessions and jobs; dismiss finished records |
+| `admin` | `PUT /config`, force-removing kept worktrees |
+
+A known token missing the needed scope gets `403 insufficient_scope`; a
+missing or unknown token gets `401 unauthorized`. The token's `name` travels
+into the journal as `actor`, so the flight log shows who launched what.
+
 `GET /healthz` is unauthenticated by design (uptime probes):
 
 ```json
@@ -43,6 +64,7 @@ change; renaming one is breaking.
 | code | status | meaning |
 |---|---|---|
 | `unauthorized` | 401 | missing or wrong bearer token |
+| `insufficient_scope` | 403 | token is valid but lacks the scope the route needs |
 | `invalid_json` | 400 | request body didn't parse |
 | `missing_param` | 400 | a required query/body field is absent |
 | `invalid_param` | 400 | a field is present but malformed (e.g. non-http `callbackUrl`) |
@@ -239,8 +261,9 @@ about their own launch.
 | `GET /config` | roots, showHidden, webhooks |
 | `PUT /config` | partial update of the same; persists to `config.json` |
 
-A token that can reach `PUT /config` can widen `roots` — treat the token as
-root on the box. Scoped tokens are planned (same plan doc).
+A token that can reach `PUT /config` can widen `roots` — treat `authToken`
+and any `admin`-scoped token as root on the box. Give automations
+`read`/`launch` tokens instead; they can never widen what's reachable.
 
 ## Cookbook
 

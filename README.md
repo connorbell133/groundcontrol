@@ -116,7 +116,8 @@ That gives you a stable HTTPS URL on your tailnet — which also unlocks PWA ins
 | key | what it does |
 |---|---|
 | `roots` | absolute paths the folder browser can see (and the only places sessions may launch) |
-| `authToken` | bearer token required on every API call; empty disables auth (don't) |
+| `authToken` | bearer token with full access, required on every API call; empty disables auth (don't) |
+| `tokens` | scoped tokens for automations: `[{name, token, scopes}]` with scopes from `read`/`launch`/`admin` — an n8n token gets `read,launch` and can never widen `roots` ([docs](docs/api.md#scoped-tokens)) |
 | `webhooks` | notification subscribers: `[{url, events?}]` — each lifecycle event is POSTed as JSON to every matching URL; filter with exact names, `session.*`, `session.failed`, or `*` |
 | `jobs` | headless-job bounds: `{concurrency, timeoutMs}` (default 2 parallel, 15 min) |
 | `showHidden` | show dotfolders in the browser |

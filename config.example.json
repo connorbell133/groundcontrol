@@ -7,5 +7,6 @@
   "showHidden": false,
   "webhooks": [],
   "jobs": { "concurrency": 2, "timeoutMs": 900000 },
-  "authToken": ""
+  "authToken": "",
+  "tokens": []
 }

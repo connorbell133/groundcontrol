@@ -1528,3 +1528,29 @@ func TestSessionsExtrasOverHTTP(t *testing.T) {
 	}
 	t.Fatal("folder-mate extra never appeared on GET /sessions")
 }
+
+// TestSameDirSecondLaunch409OverHTTP asserts the one-live-environment-per-folder
+// guard on the wire: a second same-dir launch into a live folder returns 409
+// folder_in_use (distinct from launch_failed) so clients can flip to worktree.
+func TestSameDirSecondLaunch409OverHTTP(t *testing.T) {
+	testutil.FakeClaude(t)
+	root := testutil.InitRepo(t)
+	env := newTestEnv(t, config.Config{Roots: []string{root}})
+
+	first := createSession(t, env, fmt.Sprintf(`{"folder":%q,"name":"first"}`, root))
+	_ = first
+
+	rec := doReq(t, env.handler, "POST", "/sessions", fmt.Sprintf(`{"folder":%q,"name":"second"}`, root), nil)
+	if rec.Code != 409 {
+		t.Fatalf("second same-dir launch = %d, want 409: %s", rec.Code, rec.Body.String())
+	}
+	if code := errCode(t, rec); code != "folder_in_use" {
+		t.Errorf("error code = %q, want folder_in_use", code)
+	}
+
+	// worktree mode into the same repo is still allowed alongside the live same-dir env
+	wt := createSession(t, env, fmt.Sprintf(`{"folder":%q,"name":"wt","spawnMode":"worktree","branch":"main"}`, root))
+	if wt.WorktreePath == nil || *wt.WorktreePath == "" {
+		t.Errorf("worktree launch should succeed beside a live same-dir env: %+v", wt)
+	}
+}

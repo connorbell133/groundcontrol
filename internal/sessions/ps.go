@@ -33,8 +33,16 @@ func execPSParents(timeout time.Duration) (map[int]int, error) {
 		}
 		return nil, err
 	}
+	return parsePSOutput(out.String()), nil
+}
+
+// parsePSOutput turns `ps -axo pid=,ppid=` output into a pid→ppid map. Torn
+// lines (wrong field count, non-integer fields) are skipped, never an error —
+// a degraded snapshot is better than a failed join. Split out from the exec so
+// the parse is testable without a real ps.
+func parsePSOutput(out string) map[int]int {
 	ps := map[int]int{}
-	for _, line := range strings.Split(out.String(), "\n") {
+	for _, line := range strings.Split(out, "\n") {
 		fields := strings.Fields(line)
 		if len(fields) != 2 {
 			continue
@@ -46,7 +54,7 @@ func execPSParents(timeout time.Duration) (map[int]int, error) {
 		}
 		ps[pid] = ppid
 	}
-	return ps, nil
+	return ps
 }
 
 // reachesAncestor reports whether walking pid's ppid chain hits ancestor.

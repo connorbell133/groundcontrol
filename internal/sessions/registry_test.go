@@ -1109,3 +1109,88 @@ func TestApplyRegistryTickActivityHoldsOnPsLessAmbiguity(t *testing.T) {
 		t.Errorf("ps-confirmed absence must clear now, got %v", *got.Activity)
 	}
 }
+
+func TestRegistrySnapshotTiers(t *testing.T) {
+	t.Parallel()
+	// helper: insert a live session and stamp its StartedAt
+	setup := func(m *Manager, id string, startedAgo time.Duration, uuid string) {
+		s := insertLive(t, m, id, "/w/"+id, StateReady)
+		m.mu.Lock()
+		s.StartedAt = time.Now().Add(-startedAgo).Format(time.RFC3339)
+		if uuid != "" {
+			u := uuid
+			s.ClaudeSessionID = &u
+		}
+		m.mu.Unlock()
+	}
+
+	t.Run("pre-capture within chase window is fast", func(t *testing.T) {
+		t.Parallel()
+		m := testManager(t, nil)
+		setup(m, "a", 10*time.Second, "") // no uuid, young
+		m.mu.Lock()
+		m.observedAt = time.Now().Add(-time.Hour) // not observed recently
+		m.mu.Unlock()
+		_, fast, ok := m.registrySnapshot(time.Now())
+		if !ok || !fast {
+			t.Errorf("young pre-capture session must force fast tier: ok=%v fast=%v", ok, fast)
+		}
+	})
+
+	t.Run("pre-capture past chase window is slow", func(t *testing.T) {
+		t.Parallel()
+		m := testManager(t, nil)
+		setup(m, "a", registryUUIDChaseWindow+time.Minute, "") // no uuid, old
+		m.mu.Lock()
+		m.observedAt = time.Now().Add(-time.Hour)
+		m.mu.Unlock()
+		_, fast, ok := m.registrySnapshot(time.Now())
+		if !ok || fast {
+			t.Errorf("stale pre-capture session must not force fast tier: ok=%v fast=%v", ok, fast)
+		}
+	})
+
+	t.Run("captured uuid is slow", func(t *testing.T) {
+		t.Parallel()
+		m := testManager(t, nil)
+		setup(m, "a", 10*time.Second, "77777777-7777-4777-8777-777777777777")
+		m.mu.Lock()
+		m.observedAt = time.Now().Add(-time.Hour)
+		m.mu.Unlock()
+		_, fast, ok := m.registrySnapshot(time.Now())
+		if !ok || fast {
+			t.Errorf("captured session should not force fast via chase: ok=%v fast=%v", ok, fast)
+		}
+	})
+
+	t.Run("recent observation forces fast", func(t *testing.T) {
+		t.Parallel()
+		m := testManager(t, nil)
+		setup(m, "a", registryUUIDChaseWindow+time.Minute, "77777777-7777-4777-8777-777777777777")
+		m.mu.Lock()
+		m.observedAt = time.Now() // just watched
+		m.mu.Unlock()
+		_, fast, ok := m.registrySnapshot(time.Now())
+		if !ok || !fast {
+			t.Errorf("a recent GET /sessions must force fast tier: ok=%v fast=%v", ok, fast)
+		}
+	})
+
+	t.Run("zero live sessions parks the loop", func(t *testing.T) {
+		t.Parallel()
+		m := testManager(t, nil)
+		m.mu.Lock()
+		m.regRunning = true
+		m.mu.Unlock()
+		_, _, ok := m.registrySnapshot(time.Now())
+		if ok {
+			t.Error("no live sessions must return ok=false")
+		}
+		m.mu.Lock()
+		running := m.regRunning
+		m.mu.Unlock()
+		if running {
+			t.Error("registrySnapshot must clear regRunning when it parks")
+		}
+	})
+}

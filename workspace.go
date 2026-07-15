@@ -10,7 +10,9 @@ import (
 	"os"
 	"os/exec"
 	"path/filepath"
+	"regexp"
 	"strings"
+	"syscall"
 	"time"
 )
 
@@ -94,6 +96,29 @@ func gitRun(dir string, timeout time.Duration, args ...string) error {
 
 /* ---------- worktrees: one branch, one worktree, cleaned up honestly ---------- */
 
+// runnerLockFile stays referenced for the process lifetime — a finalizer
+// closing it would release the flock.
+var runnerLockFile *os.File
+
+// acquireRunnerLock takes a non-blocking exclusive flock scoped to the shared
+// worktree base. Held until exit (the kernel releases it with the process), it
+// marks this instance as the one allowed to treat on-disk worktrees as orphans.
+func (a *app) acquireRunnerLock() bool {
+	if err := os.MkdirAll(filepath.Dir(a.wtBase), 0o755); err != nil {
+		return false
+	}
+	f, err := os.OpenFile(filepath.Join(filepath.Dir(a.wtBase), "runner.lock"), os.O_CREATE|os.O_RDWR, 0o644)
+	if err != nil {
+		return false
+	}
+	if err := syscall.Flock(int(f.Fd()), syscall.LOCK_EX|syscall.LOCK_NB); err != nil {
+		f.Close()
+		return false
+	}
+	runnerLockFile = f
+	return true
+}
+
 type worktreeInfo struct {
 	wtPath, wtBranch, baseCommit string
 }
@@ -122,7 +147,21 @@ func branchExists(folder, branch string) bool {
 	return resolveBranch(folder, branch) != ""
 }
 
-func (a *app) addWorktree(folder, branch, id string) (worktreeInfo, error) {
+// slugify reduces a human label (session name, job prompt) to a branch-safe
+// fragment: lowercase, runs of non-alphanumerics collapse to single dashes,
+// capped so the id stays readable at the end of the branch name.
+var slugRE = regexp.MustCompile(`[^a-z0-9]+`)
+
+func slugify(label string) string {
+	s := slugRE.ReplaceAllString(strings.ToLower(label), "-")
+	s = strings.Trim(s, "-")
+	if len(s) > 32 {
+		s = strings.Trim(s[:32], "-")
+	}
+	return s
+}
+
+func (a *app) addWorktree(folder, branch, id, label string) (worktreeInfo, error) {
 	wtPath := filepath.Join(a.wtBase, filepath.Base(folder), id)
 	if err := os.MkdirAll(filepath.Join(a.wtBase, filepath.Base(folder)), 0o755); err != nil {
 		return worktreeInfo{}, err
@@ -131,7 +170,12 @@ func (a *app) addWorktree(folder, branch, id string) (worktreeInfo, error) {
 	if base == "" {
 		return worktreeInfo{}, fmt.Errorf("branch %s not found locally or on a remote", branch)
 	}
+	// gc/<what-this-run-is-for>-<id>: the label answers "what is this branch"
+	// at a glance in `git branch`, the id keeps it collision-free
 	wtBranch := "gc/" + id
+	if slug := slugify(label); slug != "" {
+		wtBranch = "gc/" + slug + "-" + id
+	}
 	// each run works on its own branch cut from the base: the base may be checked
 	// out in the main folder (git refuses a second checkout) or exist only on a remote
 	if _, stderrLine, err := gitExec(folder, 15*time.Second, "worktree", "add", "-b", wtBranch, wtPath, base); err != nil {

@@ -143,6 +143,23 @@ components:
           type: object
           description: The full session object under a "session" key, or the job under a "job" key.
 
+    Transcript:
+      type: object
+      properties:
+        sessionId:
+          type: string
+          description: Claude Code's conversation id (not the runner's session id).
+        updatedAt: { type: string, format: date-time }
+        messages:
+          type: array
+          description: Last 200 messages; each message's text is capped at 4000 characters.
+          items:
+            type: object
+            properties:
+              role: { type: string, enum: [user, assistant] }
+              text: { type: string, description: "Message text; tool calls appear as \"→ ToolName\" lines." }
+              at: { type: string, format: date-time }
+
     WebhookConfig:
       type: object
       required: [url]
@@ -514,6 +531,32 @@ paths:
           content:
             text/plain:
               schema: { type: string }
+        "401": { $ref: "#/components/responses/Unauthorized" }
+        "403": { $ref: "#/components/responses/Forbidden" }
+        "404": { $ref: "#/components/responses/NotFound" }
+
+  /sessions/{id}/transcript:
+    get:
+      summary: Conversation transcripts
+      description: >
+        The actual conversations of this launch — user prompts and assistant
+        replies (tool calls compressed to their names), parsed from the JSONL
+        transcripts Claude Code writes for the session's working directory.
+        Sessions added from the phone inside the same launch share that
+        directory, so all of their conversations appear here.
+      parameters:
+        - $ref: "#/components/parameters/sessionId"
+      responses:
+        "200":
+          description: Transcripts, oldest first (empty until the first prompt).
+          content:
+            application/json:
+              schema:
+                type: object
+                properties:
+                  transcripts:
+                    type: array
+                    items: { $ref: "#/components/schemas/Transcript" }
         "401": { $ref: "#/components/responses/Unauthorized" }
         "403": { $ref: "#/components/responses/Forbidden" }
         "404": { $ref: "#/components/responses/NotFound" }

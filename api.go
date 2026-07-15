@@ -709,6 +709,19 @@ func (a *app) createAPI() http.Handler {
 		writeText(w, 200, *log)
 	}))
 
+	// The actual conversations (user prompts + assistant replies), read from the
+	// JSONL transcripts Claude Code writes for the session's launch directory.
+	mux.HandleFunc("GET /sessions/{id}/transcript", need(scopeRead, func(w http.ResponseWriter, r *http.Request) {
+		transcripts, found := a.getSessionTranscripts(r.PathValue("id"))
+		if !found {
+			apiErr(w, 404, "not_found", "no such session")
+			return
+		}
+		writeJSON(w, 200, struct {
+			Transcripts []Transcript `json:"transcripts"`
+		}{nonNil(transcripts)})
+	}))
+
 	mux.HandleFunc("DELETE /sessions/{id}", need(scopeLaunch, func(w http.ResponseWriter, r *http.Request) {
 		session := a.killSession(r.PathValue("id"), actorOf(r).name)
 		if session == nil {

@@ -351,6 +351,18 @@ body {
   border-color: color-mix(in srgb, var(--stamp) 35%, transparent);
   background: var(--stamp-soft);
 }
+/* the row's only link — chip face, link behavior */
+.meta-chip.pr {
+  text-decoration: none; color: var(--accent);
+  border-color: color-mix(in srgb, var(--accent) 35%, transparent);
+  background: color-mix(in srgb, var(--accent) 10%, transparent);
+}
+
+/* extra claude sessions sharing the launch folder (ready cards) */
+.session-extras { margin-top: 12px; font-family: var(--mono); font-size: 11.5px; color: var(--muted); }
+.extras-label { font-size: 10px; letter-spacing: 0.04em; color: var(--faint); margin-bottom: 3px; }
+.extra-row { padding: 2px 0; overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
+.extra-more { padding: 2px 0; color: var(--faint); }
 
 /* staged launch sequence (starting cards) — three checkpoints, sweep on the active one */
 .launch-seq {

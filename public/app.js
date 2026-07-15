@@ -605,9 +605,22 @@ function patchSweptDebrief(branch) {
   });
 }
 
+// live claude sessions sharing the launch folder — capped rows, no disclosure;
+// a status other than busy/idle is unknown and renders nothing, per the
+// unknown-means-absent rule the primary activity chip follows
+function extrasHTML(extras) {
+  if (!extras?.length) return "";
+  const rows = extras
+    .slice(0, 3)
+    .map((x) => `<div class="extra-row">${esc(x.name)}${x.status === "busy" || x.status === "idle" ? ` (${x.status})` : ""}</div>`)
+    .join("");
+  const more = extras.length > 3 ? `<div class="extra-more">and ${extras.length - 3} more in this folder</div>` : "";
+  return `<div class="session-extras"><div class="extras-label">also running in this folder:</div>${rows}${more}</div>`;
+}
+
 // CONTRACT: card.innerHTML is rewritten ONLY here, keyed on the card "face"
-// (state/pairingUrl/exitCode/debrief — all step changes, never time-varying).
-// Everything time-varying updates via data-* lookups in updateDynamic().
+// (state/pairingUrl/exitCode/debrief/extras/prLink — all step changes, never
+// time-varying). Everything time-varying updates via data-* lookups in updateDynamic().
 function renderShell(card, s) {
   const logWasOpen = openLogs.has(s.id);
   const convoWasOpen = openConvos.has(s.id);
@@ -627,7 +640,9 @@ function renderShell(card, s) {
       <span class="meta-chip">${s.permissionMode}</span>
       <span class="meta-chip age" data-age></span>
       <span class="meta-chip activity" data-activity hidden></span>
+      ${s.prLink && (s.state === "ready" || s.state === "starting") ? `<a class="meta-chip pr" href="${esc(s.prLink.url)}" target="_blank" rel="noopener">PR #${esc(s.prLink.number)}</a>` : ""}
     </div>
+    ${s.state === "ready" ? extrasHTML(s.extraSessions) : ""}
     ${s.pairingUrl && s.state === "ready" ? `
       <a class="card-cta" href="${esc(s.pairingUrl)}" target="_blank" rel="noopener">enter cockpit <span class="cta-glyph">→</span></a>
       <details class="qr-details" data-qr="${s.id}">
@@ -762,7 +777,14 @@ function updateDynamic(card, s) {
 
   const activity = card.querySelector("[data-activity]");
   if (activity) {
-    if (s.state === "ready" && s.lastOutputAt) {
+    // registry signal owns the slot when present; the lastOutputAt heuristic
+    // is the fallback, not a second surface. Live states only — an optimistic
+    // kill flips state before the payload clears activity
+    if ((s.state === "ready" || s.state === "starting") && (s.activity === "busy" || s.activity === "idle")) {
+      activity.hidden = false;
+      activity.textContent = s.activity;
+      activity.classList.toggle("hot", s.activity === "busy");
+    } else if (s.state === "ready" && s.lastOutputAt) {
       const diff = now - Date.parse(s.lastOutputAt);
       activity.hidden = false;
       activity.textContent = diff < 60000 ? `output ${Math.floor(diff / 1000)}s ago` : `quiet ${fmtDur(diff)}`;
@@ -818,9 +840,13 @@ function renderSessions() {
     }
     // exitCode/debrief join the key: a kill flips the card to exited
     // optimistically, before the server payload carries either — without
-    // them the later real exit would never rewrite in the debrief face
-    const face = `${s.state}|${s.pairingUrl}|${s.exitCode ?? ""}|${s.debrief?.branchState ?? ""}`;
+    // them the later real exit would never rewrite in the debrief face.
+    // extras and prLink are step changes too — they rewrite exactly when
+    // they change, never on a tick
+    const extras = (s.extraSessions || []).map((x) => `${x.name}:${x.status ?? ""}`).join(",");
+    const face = `${s.state}|${s.pairingUrl}|${s.exitCode ?? ""}|${s.debrief?.branchState ?? ""}|${extras}|${s.prLink?.url ?? ""}`;
     if (card.dataset.face !== face) {
+      if (!card._new) card.style.animation = "none"; // in-place rewrite — no entrance replay
       card.dataset.face = face;
       card.dataset.state = s.state;
       card.dataset.url = String(s.pairingUrl);

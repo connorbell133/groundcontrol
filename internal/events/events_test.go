@@ -1,4 +1,4 @@
-package main
+package events
 
 import (
 	"encoding/json"
@@ -6,7 +6,14 @@ import (
 	"net/http/httptest"
 	"testing"
 	"time"
+
+	"github.com/connorbell133/groundcontrol/internal/journal"
 )
+
+func testBus(t *testing.T) *Bus {
+	t.Helper()
+	return NewBus(journal.New(t.TempDir()))
+}
 
 func TestMatches(t *testing.T) {
 	t.Parallel()
@@ -41,13 +48,13 @@ func TestMatches(t *testing.T) {
 
 func TestEmitListeners(t *testing.T) {
 	t.Parallel()
-	a := testApp(t, Config{})
+	b := testBus(t)
 
 	var got []LifecycleEvent
-	a.onEvent(func(LifecycleEvent) { panic("bad subscriber") })
-	unsub := a.onEvent(func(e LifecycleEvent) { got = append(got, e) })
+	b.OnEvent(func(LifecycleEvent) { panic("bad subscriber") })
+	unsub := b.OnEvent(func(e LifecycleEvent) { got = append(got, e) })
 
-	a.emit("session.exit", map[string]any{"k": "v"}, emitOpts{message: "msg"})
+	b.Emit("session.exit", map[string]any{"k": "v"}, EmitOpts{Message: "msg"})
 	if len(got) != 1 {
 		t.Fatalf("expected 1 event past the panicking subscriber, got %d", len(got))
 	}
@@ -63,7 +70,7 @@ func TestEmitListeners(t *testing.T) {
 	}
 
 	unsub()
-	a.emit("session.exit", nil, emitOpts{})
+	b.Emit("session.exit", nil, EmitOpts{})
 	if len(got) != 1 {
 		t.Errorf("unsubscribed listener still received events: %d", len(got))
 	}
@@ -83,17 +90,17 @@ func TestWebhookFiltering(t *testing.T) {
 	}))
 	defer srv.Close()
 
-	a := testApp(t, Config{})
+	b := testBus(t)
 	failedOnly := []string{"session.failed"}
 	jobsOnly := []string{"job.*"}
-	a.configureWebhooks([]WebhookConfig{
+	b.ConfigureWebhooks([]WebhookConfig{
 		{URL: srv.URL + "/all"}, // no filter: everything
 		{URL: srv.URL + "/failed", Events: &failedOnly},
 		{URL: srv.URL + "/jobs", Events: &jobsOnly},
 	})
 
 	// a failed exit carries the derived session.failed token
-	a.emit("session.exit", map[string]any{}, emitOpts{title: "t", alsoMatch: []string{"session.failed"}})
+	b.Emit("session.exit", map[string]any{}, EmitOpts{Title: "t", AlsoMatch: []string{"session.failed"}})
 
 	seen := map[string]bool{}
 	for i := 0; i < 2; i++ {

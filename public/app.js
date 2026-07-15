@@ -105,10 +105,16 @@ function crumbParts(path) {
     acc += "/" + seg;
     parts.push({ label: seg, path: acc });
   }
-  return parts.slice(-4); // keep the tail readable on phones
+  if (parts.length <= 4) return parts;
+  // keep the tail readable on phones, but never drop the way back to roots:
+  // pin the root crumb and collapse hidden ancestors into a tappable ellipsis
+  const hiddenParent = parts[parts.length - 4];
+  return [parts[0], { label: "…", path: hiddenParent.path }, ...parts.slice(-3)];
 }
 
 function renderBrowse() {
+  $("upBtn").disabled = !state.path; // stays visible at roots, just inert
+
   const crumbs = $("crumbs");
   crumbs.innerHTML = "";
   for (const part of crumbParts(state.path)) {
@@ -1001,6 +1007,8 @@ $("authInput").addEventListener("keydown", (e) => {
 });
 
 document.querySelectorAll(".tab[data-tab]").forEach((t) => (t.onclick = () => switchTab(t.dataset.tab)));
+// at a configured root the API reports no parent — up goes to the roots list
+$("upBtn").onclick = () => loadFolder(state.current?.parent ?? null).catch((e) => toast(e.message, true));
 $("launchBar").onclick = () => openSheet();
 $("scrim").onclick = closeSheet;
 $("launchBtn").onclick = launch;

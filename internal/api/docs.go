@@ -1,12 +1,10 @@
-package main
+package api
 
 import (
-	"embed"
 	"net/http"
-)
 
-//go:embed docs/openapi.yaml
-var openAPISpec embed.FS
+	groundcontrol "github.com/connorbell133/groundcontrol"
+)
 
 // scalarDocsHTML renders the Scalar API reference (https://scalar.com) via
 // its CDN script — no Go client library exists for it, and none is needed:
@@ -26,8 +24,8 @@ const scalarDocsHTML = `<!doctype html>
 </html>
 `
 
-func serveOpenAPISpec(w http.ResponseWriter, r *http.Request) {
-	b, err := openAPISpec.ReadFile("docs/openapi.yaml")
+func ServeOpenAPISpec(w http.ResponseWriter, r *http.Request) {
+	b, err := groundcontrol.OpenAPIFS.ReadFile("docs/openapi.yaml")
 	if err != nil {
 		http.Error(w, "spec not found", http.StatusInternalServerError)
 		return
@@ -36,7 +34,7 @@ func serveOpenAPISpec(w http.ResponseWriter, r *http.Request) {
 	w.Write(b)
 }
 
-func serveScalarDocs(w http.ResponseWriter, r *http.Request) {
+func ServeScalarDocs(w http.ResponseWriter, r *http.Request) {
 	w.Header().Set("Content-Type", "text/html; charset=utf-8")
 	w.Write([]byte(scalarDocsHTML))
 }

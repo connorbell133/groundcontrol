@@ -1,33 +1,45 @@
-package main
+// Package journal is the append-only flight log shared by sessions and jobs.
+//
+// Storage is JSONL (one compact object per line) so every event is a single
+// O(1) append. A crash mid-write can only truncate the last line, never the
+// history behind it — Read skips partial lines silently.
+package journal
 
 import (
 	"encoding/json"
 	"os"
 	"path/filepath"
 	"strings"
+	"sync"
+
+	"github.com/connorbell133/groundcontrol/internal/util"
 )
 
-/* ---------- journal: append-only flight log, shared by sessions and jobs ---------- */
+type Journal struct {
+	dataDir  string
+	mu       sync.Mutex
+	migrated bool // guarded by mu; migration runs at most once per process
+}
 
-// Storage is JSONL (one compact object per line) so every event is a single
-// O(1) append. A crash mid-write can only truncate the last line, never the
-// history behind it — readJournal skips partial lines silently.
+func New(dataDir string) *Journal {
+	return &Journal{dataDir: dataDir}
+}
 
-func (a *app) journalPath() string       { return filepath.Join(a.dataDir, "journal.jsonl") }
-func (a *app) legacyJournalPath() string { return filepath.Join(a.dataDir, "journal.json") }
+func (j *Journal) path() string       { return filepath.Join(j.dataDir, "journal.jsonl") }
+func (j *Journal) legacyPath() string { return filepath.Join(j.dataDir, "journal.json") }
 
-// migrateJournalLocked converts a pre-v0.4.x journal.json (one big JSON array)
-// to JSONL, once. Caller must hold journalMu. The legacy file is renamed to
+// migrateLocked converts a pre-v0.4.x journal.json (one big JSON array)
+// to JSONL, once. Caller must hold mu. The legacy file is renamed to
 // journal.json.bak, never deleted — history is the whole point of a journal.
-func (a *app) migrateJournalLocked() {
-	if a.journalMigrated {
+func (j *Journal) migrateLocked() {
+	if j.migrated {
 		return
 	}
-	a.journalMigrated = true
-	if _, err := os.Stat(a.journalPath()); err == nil {
+	j.migrated = true
+	if _, err := os.Stat(j.path()); err == nil {
 		return // already on JSONL
 	}
-	raw, err := os.ReadFile(a.legacyJournalPath())
+	raw, err := os.ReadFile(j.legacyPath())
 	if err != nil {
 		return // fresh install, nothing to migrate
 	}
@@ -47,27 +59,27 @@ func (a *app) migrateJournalLocked() {
 	}
 	// write via temp + rename: if we crashed mid-write of journal.jsonl itself,
 	// its existence would block a retry and silently orphan the legacy history
-	tmp := a.journalPath() + ".tmp"
+	tmp := j.path() + ".tmp"
 	if err := os.WriteFile(tmp, []byte(buf.String()), 0o644); err != nil {
 		return
 	}
-	if err := os.Rename(tmp, a.journalPath()); err != nil {
+	if err := os.Rename(tmp, j.path()); err != nil {
 		return
 	}
-	_ = os.Rename(a.legacyJournalPath(), a.legacyJournalPath()+".bak")
+	_ = os.Rename(j.legacyPath(), j.legacyPath()+".bak")
 }
 
-func (a *app) journal(entry map[string]any) {
-	a.journalMu.Lock()
-	defer a.journalMu.Unlock()
-	_ = os.MkdirAll(a.dataDir, 0o755)
-	a.migrateJournalLocked()
+func (j *Journal) Append(entry map[string]any) {
+	j.mu.Lock()
+	defer j.mu.Unlock()
+	_ = os.MkdirAll(j.dataDir, 0o755)
+	j.migrateLocked()
 	e := make(map[string]any, len(entry)+1)
 	for k, v := range entry {
 		e[k] = v
 	}
-	e["at"] = nowISO()
-	f, err := os.OpenFile(a.journalPath(), os.O_APPEND|os.O_CREATE|os.O_WRONLY, 0o644)
+	e["at"] = util.NowISO()
+	f, err := os.OpenFile(j.path(), os.O_APPEND|os.O_CREATE|os.O_WRONLY, 0o644)
 	if err != nil {
 		return
 	}
@@ -77,11 +89,11 @@ func (a *app) journal(entry map[string]any) {
 	_ = enc.Encode(e) // one compact line; Encode appends the trailing "\n"
 }
 
-func (a *app) readJournal() []map[string]any {
-	a.journalMu.Lock()
-	defer a.journalMu.Unlock()
-	a.migrateJournalLocked()
-	raw, err := os.ReadFile(a.journalPath())
+func (j *Journal) Read() []map[string]any {
+	j.mu.Lock()
+	defer j.mu.Unlock()
+	j.migrateLocked()
+	raw, err := os.ReadFile(j.path())
 	if err != nil {
 		return []map[string]any{}
 	}

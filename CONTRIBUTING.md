@@ -15,16 +15,16 @@ Linux and macOS only. The PTY layer uses unix syscalls, so Windows won't build �
 ```bash
 git clone https://github.com/connorbell133/groundcontrol.git
 cd groundcontrol
-go build -o groundcontrol .
+go build -o groundcontrol ./cmd/groundcontrol
 ```
 
 To run it, copy [`config.example.json`](config.example.json) to `config.json` in the directory you'll run from, point `roots` at some folders, set an `authToken` (`openssl rand -hex 16`), then:
 
 ```bash
-go run .
+go run ./cmd/groundcontrol
 ```
 
-`public/` is embedded with `go:embed`, so frontend edits need a rebuild — stop and re-run `go run .` to see them.
+`public/` is embedded with `go:embed`, so frontend edits need a rebuild — stop and re-run `go run ./cmd/groundcontrol` to see them.
 
 ## Before you push
 

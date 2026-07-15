@@ -1,16 +1,25 @@
-package main
+package browse
 
 import (
 	"os"
 	"path/filepath"
 	"testing"
+
+	"github.com/connorbell133/groundcontrol/internal/testutil"
 )
+
+func testBrowser(t *testing.T, roots []string, showHidden bool) *Browser {
+	t.Helper()
+	b := New()
+	b.Configure(roots, showHidden)
+	return b
+}
 
 // buildRootFixture creates root, a prefix-trickster sibling root2, an outside
 // dir, a real subdir, and two symlinks: one escaping, one staying inside.
 func buildRootFixture(t *testing.T) (root, root2, outside, sub string) {
 	t.Helper()
-	base := resolvedTempDir(t)
+	base := testutil.ResolvedTempDir(t)
 	root = filepath.Join(base, "root")
 	root2 = filepath.Join(base, "root2")
 	outside = filepath.Join(base, "outside")
@@ -32,7 +41,7 @@ func buildRootFixture(t *testing.T) (root, root2, outside, sub string) {
 func TestWithinRoots(t *testing.T) {
 	t.Parallel()
 	root, root2, outside, sub := buildRootFixture(t)
-	a := testApp(t, Config{Roots: []string{root}})
+	b := testBrowser(t, []string{root}, false)
 
 	cases := []struct {
 		name string
@@ -50,8 +59,8 @@ func TestWithinRoots(t *testing.T) {
 	}
 	for _, tc := range cases {
 		t.Run(tc.name, func(t *testing.T) {
-			if got := a.withinRoots(tc.path); got != tc.want {
-				t.Errorf("withinRoots(%q) = %v, want %v", tc.path, got, tc.want)
+			if got := b.WithinRoots(tc.path); got != tc.want {
+				t.Errorf("WithinRoots(%q) = %v, want %v", tc.path, got, tc.want)
 			}
 		})
 	}
@@ -68,9 +77,9 @@ func TestBrowse(t *testing.T) {
 	if err := os.WriteFile(filepath.Join(root, "file.txt"), []byte("x"), 0o644); err != nil {
 		t.Fatal(err)
 	}
-	a := testApp(t, Config{Roots: []string{root}})
+	b := testBrowser(t, []string{root}, false)
 
-	res, err := a.browse(root)
+	res, err := b.Browse(root)
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -100,7 +109,7 @@ func TestBrowse(t *testing.T) {
 		}
 	}
 
-	subRes, err := a.browse(sub)
+	subRes, err := b.Browse(sub)
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -108,28 +117,28 @@ func TestBrowse(t *testing.T) {
 		t.Errorf("Parent of subdir = %v, want %q", subRes.Parent, root)
 	}
 
-	if _, err := a.browse(outside); err == nil {
+	if _, err := b.Browse(outside); err == nil {
 		t.Error("browse outside the roots should fail")
 	}
-	if _, err := a.browse(filepath.Join(root, "escape")); err == nil {
+	if _, err := b.Browse(filepath.Join(root, "escape")); err == nil {
 		t.Error("browsing an escaping symlink should fail")
 	}
-	if _, err := a.browse(filepath.Join(root, "file.txt")); err == nil {
+	if _, err := b.Browse(filepath.Join(root, "file.txt")); err == nil {
 		t.Error("browsing a file should fail")
 	}
-	if _, err := a.browse(filepath.Join(root, "does-not-exist")); err == nil {
+	if _, err := b.Browse(filepath.Join(root, "does-not-exist")); err == nil {
 		t.Error("browsing a missing dir should fail")
 	}
 }
 
 func TestBrowseShowHidden(t *testing.T) {
 	t.Parallel()
-	root := resolvedTempDir(t)
+	root := testutil.ResolvedTempDir(t)
 	if err := os.MkdirAll(filepath.Join(root, ".hid"), 0o755); err != nil {
 		t.Fatal(err)
 	}
-	a := testApp(t, Config{Roots: []string{root}, ShowHidden: true})
-	res, err := a.browse(root)
+	b := testBrowser(t, []string{root}, true)
+	res, err := b.Browse(root)
 	if err != nil {
 		t.Fatal(err)
 	}

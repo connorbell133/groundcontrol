@@ -1,10 +1,30 @@
-package main
+package sessions
 
 import (
 	"strings"
 	"testing"
 	"time"
+
+	"github.com/connorbell133/groundcontrol/internal/browse"
+	"github.com/connorbell133/groundcontrol/internal/events"
+	"github.com/connorbell133/groundcontrol/internal/journal"
+	"github.com/connorbell133/groundcontrol/internal/testutil"
+	"github.com/connorbell133/groundcontrol/internal/workspace"
 )
+
+// testManager builds an isolated manager wired the way main() wires it.
+func testManager(t *testing.T, roots []string) *Manager {
+	t.Helper()
+	if roots == nil {
+		roots = []string{testutil.ResolvedTempDir(t)}
+	}
+	jnl := journal.New(t.TempDir())
+	bus := events.NewBus(jnl)
+	ws := workspace.New(t.TempDir(), jnl)
+	browser := browse.New()
+	browser.Configure(roots, false)
+	return NewManager(jnl, bus, ws, browser)
+}
 
 func TestLastMeaningfulLine(t *testing.T) {
 	t.Parallel()
@@ -53,49 +73,49 @@ func TestLastMeaningfulLine(t *testing.T) {
 
 func TestWaitForReadyMissingSession(t *testing.T) {
 	t.Parallel()
-	a := testApp(t, Config{})
-	if got := a.waitForReady("nope", 10*time.Millisecond); got != "dead" {
-		t.Errorf("waitForReady on a missing session = %q, want dead", got)
+	m := testManager(t, nil)
+	if got := m.WaitForReady("nope", 10*time.Millisecond); got != "dead" {
+		t.Errorf("WaitForReady on a missing session = %q, want dead", got)
 	}
 }
 
 func TestListLostSessions(t *testing.T) {
 	t.Parallel()
-	root := resolvedTempDir(t)
-	a := testApp(t, Config{Roots: []string{root}})
+	root := testutil.ResolvedTempDir(t)
+	m := testManager(t, []string{root})
 
-	a.journal(map[string]any{"event": evSessionStart, "id": "lost1", "name": "one", "folder": root})
-	a.journal(map[string]any{"event": evSessionStart, "id": "done1", "name": "two", "folder": root})
-	a.journal(map[string]any{"event": evSessionExit, "id": "done1", "code": 0})
+	m.journal.Append(map[string]any{"event": evSessionStart, "id": "lost1", "name": "one", "folder": root})
+	m.journal.Append(map[string]any{"event": evSessionStart, "id": "done1", "name": "two", "folder": root})
+	m.journal.Append(map[string]any{"event": evSessionExit, "id": "done1", "code": 0})
 
-	lost := a.listLostSessions()
+	lost := m.ListLost()
 	if len(lost) != 1 || lost[0].ID != "lost1" {
 		t.Fatalf("expected one lost session lost1, got %+v", lost)
 	}
-	if lost[0].SpawnMode != string(spawnSameDir) || lost[0].PermissionMode != "default" {
+	if lost[0].SpawnMode != string(workspace.SpawnSameDir) || lost[0].PermissionMode != "default" {
 		t.Errorf("expected defaulted spawnMode/permissionMode, got %+v", lost[0])
 	}
 
 	// headstone dismissal splices the cache
-	removed, err := a.removeSession("lost1")
+	removed, err := m.Remove("lost1")
 	if err != nil || !removed {
-		t.Fatalf("removeSession(lost1) = %v, %v", removed, err)
+		t.Fatalf("Remove(lost1) = %v, %v", removed, err)
 	}
-	if again := a.listLostSessions(); len(again) != 0 {
+	if again := m.ListLost(); len(again) != 0 {
 		t.Errorf("dismissed lost session still listed: %+v", again)
 	}
 }
 
 func TestRecentLaunchesDedupAndOrder(t *testing.T) {
 	t.Parallel()
-	root := resolvedTempDir(t)
-	a := testApp(t, Config{Roots: []string{root}})
+	root := testutil.ResolvedTempDir(t)
+	m := testManager(t, []string{root})
 
-	a.journal(map[string]any{"event": evSessionStart, "id": "a", "name": "n1", "folder": root})
-	a.journal(map[string]any{"event": evSessionStart, "id": "b", "name": "n2", "folder": root, "spawnMode": "worktree"})
-	a.journal(map[string]any{"event": evSessionStart, "id": "c", "name": "n3", "folder": root}) // dup of first key
+	m.journal.Append(map[string]any{"event": evSessionStart, "id": "a", "name": "n1", "folder": root})
+	m.journal.Append(map[string]any{"event": evSessionStart, "id": "b", "name": "n2", "folder": root, "spawnMode": "worktree"})
+	m.journal.Append(map[string]any{"event": evSessionStart, "id": "c", "name": "n3", "folder": root}) // dup of first key
 
-	out := a.recentLaunches(10)
+	out := m.RecentLaunches(10)
 	if len(out) != 2 {
 		t.Fatalf("expected 2 deduped launches, got %+v", out)
 	}

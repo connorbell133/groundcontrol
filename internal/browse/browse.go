@@ -1,4 +1,6 @@
-package main
+// Package browse is the folder browser: configured roots, containment checks,
+// directory listings with git context, and the branch picker's branch list.
+package browse
 
 import (
 	"errors"
@@ -8,7 +10,10 @@ import (
 	"regexp"
 	"sort"
 	"strings"
+	"sync"
 	"time"
+
+	"github.com/connorbell133/groundcontrol/internal/gitx"
 )
 
 type FolderEntry struct {
@@ -28,10 +33,20 @@ type BrowseResult struct {
 	Folders  []FolderEntry `json:"folders"`
 }
 
-func (a *app) configureBrowser(roots []string, showHidden bool) {
+type Browser struct {
+	mu         sync.RWMutex
+	roots      []string
+	showHidden bool
+}
+
+func New() *Browser {
+	return &Browser{}
+}
+
+func (b *Browser) Configure(roots []string, showHidden bool) {
 	abs := make([]string, 0, len(roots))
 	for _, r := range roots {
-		// roots are stored symlink-resolved so withinRoots compares like with like:
+		// roots are stored symlink-resolved so WithinRoots compares like with like:
 		// e.g. /tmp on macOS is a symlink to /private/tmp, and resolved candidates
 		// land on the /private form. Fall back to Abs when the root doesn't exist yet.
 		resolved, err := filepath.EvalSymlinks(r)
@@ -50,13 +65,13 @@ func (a *app) configureBrowser(roots []string, showHidden bool) {
 		}
 		abs = append(abs, resolved)
 	}
-	a.browserMu.Lock()
-	a.browserCfg.roots = abs
-	a.browserCfg.showHidden = showHidden
-	a.browserMu.Unlock()
+	b.mu.Lock()
+	b.roots = abs
+	b.showHidden = showHidden
+	b.mu.Unlock()
 }
 
-func (a *app) withinRoots(path string) bool {
+func (b *Browser) WithinRoots(path string) bool {
 	// containment is decided on the symlink-RESOLVED path — a lexical prefix check
 	// alone lets a symlink inside a root (e.g. root/link -> /etc) escape, since its
 	// Abs path sits "inside" the root while its target can be anywhere on disk.
@@ -70,9 +85,9 @@ func (a *app) withinRoots(path string) bool {
 			return false
 		}
 	}
-	a.browserMu.RLock()
-	defer a.browserMu.RUnlock()
-	for _, root := range a.browserCfg.roots {
+	b.mu.RLock()
+	defer b.mu.RUnlock()
+	for _, root := range b.roots {
 		if resolved == root || strings.HasPrefix(resolved, root+"/") {
 			return true
 		}
@@ -80,62 +95,35 @@ func (a *app) withinRoots(path string) bool {
 	return false
 }
 
-// gitRoot returns the toplevel of the repo containing path, or "" when not a repo.
-func gitRoot(path string) string {
-	out, err := gitOut(path, 2*time.Second, "rev-parse", "--show-toplevel")
-	if err != nil {
-		return ""
-	}
-	return out
-}
-
-// gitBranch: "(detached)" when git succeeds but reports no current branch,
-// nil when git fails (not a repo, timeout, ...).
-func gitBranch(path string) *string {
-	out, err := gitOut(path, 2*time.Second, "branch", "--show-current")
-	if err != nil {
-		return nil
-	}
-	if out == "" {
-		out = "(detached)"
-	}
-	return &out
-}
-
-func isGitFolder(path string) bool {
-	_, err := os.Stat(filepath.Join(path, ".git"))
-	return err == nil
-}
-
-func (a *app) listRoots() []FolderEntry {
-	a.browserMu.RLock()
-	roots := append([]string(nil), a.browserCfg.roots...)
-	a.browserMu.RUnlock()
+func (b *Browser) ListRoots() []FolderEntry {
+	b.mu.RLock()
+	roots := append([]string(nil), b.roots...)
+	b.mu.RUnlock()
 	entries := []FolderEntry{}
 	for _, root := range roots {
-		git := isGitFolder(root)
+		git := gitx.IsGitFolder(root)
 		var branch *string
 		if git {
-			branch = gitBranch(root)
+			branch = gitx.Branch(root)
 		}
 		entries = append(entries, FolderEntry{Name: root, Path: root, IsGit: git, Branch: branch})
 	}
 	return entries
 }
 
-func (a *app) browse(path string) (BrowseResult, error) {
+func (b *Browser) Browse(path string) (BrowseResult, error) {
 	resolved, err := filepath.Abs(path)
 	if err != nil {
 		return BrowseResult{}, err
 	}
 	// resolve symlinks so the atRoot comparison (and returned paths) line up with
-	// the symlink-resolved roots stored by configureBrowser — e.g. browsing /tmp
+	// the symlink-resolved roots stored by Configure — e.g. browsing /tmp
 	// must count as being at the /private/tmp root on macOS. A failure means the
 	// path doesn't exist; keep the Abs form and let os.Stat report the error.
 	if r, err := filepath.EvalSymlinks(resolved); err == nil {
 		resolved = r
 	}
-	if !a.withinRoots(resolved) {
+	if !b.WithinRoots(resolved) {
 		return BrowseResult{}, errors.New("path outside configured roots")
 	}
 	st, err := os.Stat(resolved)
@@ -146,15 +134,15 @@ func (a *app) browse(path string) (BrowseResult, error) {
 		return BrowseResult{}, errors.New("not a directory")
 	}
 
-	a.browserMu.RLock()
-	showHidden := a.browserCfg.showHidden
+	b.mu.RLock()
+	showHidden := b.showHidden
 	atRoot := false
-	for _, root := range a.browserCfg.roots {
+	for _, root := range b.roots {
 		if root == resolved {
 			atRoot = true
 		}
 	}
-	a.browserMu.RUnlock()
+	b.mu.RUnlock()
 
 	dirEntries, err := os.ReadDir(resolved)
 	if err != nil {
@@ -181,16 +169,16 @@ func (a *app) browse(path string) (BrowseResult, error) {
 		if !fi.IsDir() {
 			continue
 		}
-		// symlinks must still resolve inside the roots — withinRoots resolves the
+		// symlinks must still resolve inside the roots — WithinRoots resolves the
 		// link target, so root/link -> /etc is filtered even though `full` is
 		// lexically inside the root
-		if isSymlink && !a.withinRoots(full) {
+		if isSymlink && !b.WithinRoots(full) {
 			continue
 		}
-		git := isGitFolder(full)
+		git := gitx.IsGitFolder(full)
 		var branch *string
 		if git {
-			branch = gitBranch(full)
+			branch = gitx.Branch(full)
 		}
 		folders = append(folders, FolderEntry{Name: entry.Name(), Path: full, IsGit: git, Branch: branch})
 	}
@@ -208,7 +196,7 @@ func (a *app) browse(path string) (BrowseResult, error) {
 	})
 
 	// repo context comes from the nearest parent with .git, not just this folder
-	repoRoot := gitRoot(resolved)
+	repoRoot := gitx.Root(resolved)
 	var parent, repoRootPtr, repoName, branch *string
 	if !atRoot {
 		d := filepath.Dir(resolved)
@@ -219,7 +207,7 @@ func (a *app) browse(path string) (BrowseResult, error) {
 		parts := strings.Split(repoRoot, "/")
 		name := parts[len(parts)-1]
 		repoName = &name
-		branch = gitBranch(resolved)
+		branch = gitx.Branch(resolved)
 	}
 	return BrowseResult{
 		Path:     resolved,
@@ -234,12 +222,12 @@ func (a *app) browse(path string) (BrowseResult, error) {
 
 var remoteRefRe = regexp.MustCompile(`^refs/remotes/[^/]+/`)
 
-// branchList is the TS `branches()` — renamed to avoid clashing with git terms.
-func (a *app) branchList(path string) ([]string, error) {
-	if !a.withinRoots(path) {
+// BranchList is the TS `branches()` — renamed to avoid clashing with git terms.
+func (b *Browser) BranchList(path string) ([]string, error) {
+	if !b.WithinRoots(path) {
 		return nil, errors.New("path outside configured roots")
 	}
-	out, err := gitOut(path, 3*time.Second, "for-each-ref", "--format=%(refname)", "--sort=-committerdate", "refs/heads/", "refs/remotes/")
+	out, err := gitx.Out(path, 3*time.Second, "for-each-ref", "--format=%(refname)", "--sort=-committerdate", "refs/heads/", "refs/remotes/")
 	if err != nil {
 		return []string{}, nil
 	}

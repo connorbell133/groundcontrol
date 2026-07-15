@@ -58,10 +58,10 @@ bindir="$(go env GOBIN)"
 script_dir="$(cd "$(dirname "${BASH_SOURCE[0]:-.}")" 2>/dev/null && pwd)"
 if [ -f "${script_dir}/go.mod" ] && head -1 "${script_dir}/go.mod" | grep -q "$MODULE"; then
   say "Building from local clone (${script_dir})…"
-  (cd "$script_dir" && go build -o "${bindir}/groundcontrol" .)
+  (cd "$script_dir" && go build -o "${bindir}/groundcontrol" ./cmd/groundcontrol)
 else
   say "Installing ${MODULE}@latest…"
-  go install "${MODULE}@latest"
+  go install "${MODULE}/cmd/groundcontrol@latest"
 fi
 note "installed ${bindir}/groundcontrol"
 

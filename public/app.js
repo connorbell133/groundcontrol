@@ -591,7 +591,7 @@ async function doLaunch() {
     });
     closeSheet();
     switchTab("sessions");
-    toast("Session starting");
+    toast("Environment starting");
   } catch (e) {
     toast(e.message, true);
   } finally {
@@ -675,8 +675,8 @@ function deriveTail(transcripts) {
 
 // the card face's one-word answer to "does anything need me?"
 function verbFor(s, now = Date.now()) {
-  if (s.state === "starting") return "igniting";
-  if (s.state === "error") return "scrubbed";
+  if (s.state === "starting") return "starting";
+  if (s.state === "error") return "failed";
   if (s.state === "exited") return s.exitCode === 0 ? "landed" : "failed";
   const outAge = s.lastOutputAt ? now - Date.parse(s.lastOutputAt) : Infinity;
   if (outAge < QUIET_MS) return "working";
@@ -687,7 +687,7 @@ function verbFor(s, now = Date.now()) {
 // 4 ended (exited/error/landed/lost); recency breaks ties within a group
 function attentionRank(verb) {
   if (verb === "your move") return 0;
-  if (verb === "igniting") return 1;
+  if (verb === "starting") return 1;
   if (verb === "working") return 2;
   if (verb === "quiet") return 3;
   return 4;
@@ -852,15 +852,15 @@ function renderShell(card, s) {
       </div>` : s.state === "starting" ? `
       <div class="launch-seq">
         <div class="seq-stage done"><span class="seq-mark">✓</span><span class="seq-label">request accepted</span></div>
-        <div class="seq-stage active"><span class="seq-mark"><span class="provision-dot"></span></span><span class="seq-label">agent igniting</span><span class="seq-elapsed" data-provision></span></div>
-        <div class="seq-stage pending"><span class="seq-mark">·</span><span class="seq-label">telemetry acquired</span></div>
+        <div class="seq-stage active"><span class="seq-mark"><span class="provision-dot"></span></span><span class="seq-label">environment starting</span><span class="seq-elapsed" data-provision></span></div>
+        <div class="seq-stage pending"><span class="seq-mark">·</span><span class="seq-label">pairing link ready</span></div>
       </div>
       <div class="session-actions">
         <button class="btn danger" data-kill="${s.id}">Kill</button>
       </div>` : s.state === "error" ? `
       <div class="launch-seq failed">
         <div class="seq-stage done"><span class="seq-mark">✓</span><span class="seq-label">request accepted</span></div>
-        <div class="seq-stage failed"><span class="seq-mark">✕</span><span class="seq-label">ignition failed — launch scrubbed</span></div>
+        <div class="seq-stage failed"><span class="seq-mark">✕</span><span class="seq-label">environment failed to start</span></div>
       </div>
       ${debriefHTML(s.debrief)}
       <div class="session-actions">
@@ -1306,7 +1306,7 @@ document.addEventListener("click", async (e) => {
           // name omitted deliberately: reusing it risks a duplicate-name conflict
         }),
       });
-      toast("Session starting");
+      toast("Environment starting");
       refreshSessions();
     } catch (err) {
       toast(err.message, true);

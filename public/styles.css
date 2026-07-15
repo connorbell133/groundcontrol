@@ -149,6 +149,16 @@ body {
 /* ---------- path bar ---------- */
 .pathbar-wrap { display: flex; align-items: center; gap: 8px; padding: 20px 22px 12px; }
 .pathbar-tick { color: var(--accent); font-size: 15px; opacity: 0.75; }
+.pathbar-up {
+  display: grid; place-items: center;
+  width: 30px; height: 30px; flex: none;
+  background: none; border: 0; color: var(--muted);
+  border-radius: 8px;
+  transition: transform 0.13s var(--ease), background 0.13s var(--ease), opacity 0.13s var(--ease);
+}
+.pathbar-up:active:not(:disabled) { transform: scale(0.9); background: var(--surface); }
+.pathbar-up:disabled { opacity: 0.3; }
+.pathbar-up:focus-visible { outline: 1.5px solid var(--accent); outline-offset: 2px; }
 .crumbs {
   display: flex; align-items: center; gap: 7px;
   font-family: var(--mono); font-size: 12.5px;

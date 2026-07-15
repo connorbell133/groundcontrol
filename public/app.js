@@ -113,6 +113,8 @@ function crumbParts(path) {
 }
 
 function renderBrowse() {
+  $("upBtn").disabled = !state.path; // stays visible at roots, just inert
+
   const crumbs = $("crumbs");
   crumbs.innerHTML = "";
   for (const part of crumbParts(state.path)) {
@@ -1005,6 +1007,8 @@ $("authInput").addEventListener("keydown", (e) => {
 });
 
 document.querySelectorAll(".tab[data-tab]").forEach((t) => (t.onclick = () => switchTab(t.dataset.tab)));
+// at a configured root the API reports no parent — up goes to the roots list
+$("upBtn").onclick = () => loadFolder(state.current?.parent ?? null).catch((e) => toast(e.message, true));
 $("launchBar").onclick = () => openSheet();
 $("scrim").onclick = closeSheet;
 $("launchBtn").onclick = launch;

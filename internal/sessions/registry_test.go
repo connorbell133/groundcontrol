@@ -482,6 +482,25 @@ func TestAgeRegistryStateGrace(t *testing.T) {
 	}
 }
 
+func TestExtraRowNameFallback(t *testing.T) {
+	t.Parallel()
+	// nameless rows are real (IDE/SDK sessions, fresh pre-created ones) and
+	// must never reach the card as a blank line
+	cases := []struct {
+		in   claudex.Agent
+		want string
+	}{
+		{claudex.Agent{Name: "gc-auto-1", SessionID: "aaaabbbb-cccc", PID: 7}, "gc-auto-1"},
+		{claudex.Agent{SessionID: "947c45fb-ad3d-453d", PID: 7}, "947c45fb"},
+		{claudex.Agent{PID: 61863}, "pid 61863"},
+	}
+	for _, c := range cases {
+		if got := extraRowOf(c.in).name; got != c.want {
+			t.Errorf("extraRowOf(%+v).name = %q, want %q", c.in, got, c.want)
+		}
+	}
+}
+
 func TestExtrasRefreshAndAging(t *testing.T) {
 	t.Parallel()
 	m := testManager(t, nil)

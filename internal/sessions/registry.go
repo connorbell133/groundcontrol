@@ -14,11 +14,9 @@ import (
 	"context"
 	"log"
 	"math/rand"
-	"os/exec"
 	"path/filepath"
 	"sort"
 	"strconv"
-	"strings"
 	"time"
 
 	"github.com/connorbell133/groundcontrol/internal/claudex"
@@ -47,9 +45,6 @@ const (
 	// `claude agents --json` first shipped in this CLI release
 	registryVersionFloor = "2.1.145"
 	// bound on the pid→ppid walk; the observed topology is launcher → forked
-	// server → one child per session (depth 2), so 10 is generous while still
-	// making a corrupt ps snapshot (cycles) finite
-	maxAncestryDepth = 10
 )
 
 // Exec seams, swappable in tests so registry scenarios need no real CLI or
@@ -59,34 +54,12 @@ var (
 	registryProbeVersion = func() (string, error) { return claudex.Version(claudex.DefaultTimeout) }
 )
 
-// psParentMap builds the pid→ppid map for one tick with a single ps exec.
-// It lives here rather than claudex because claudex owns claude state queries
-// only — ps is a general process query. nil means "unavailable" and switches
-// the join to the last-resort cwd fallback.
+// psParentMap yields the pid→ppid map for one tick (shared exec in ps.go).
+// nil means "unavailable" and switches the join to the last-resort cwd
+// fallback; a package var so tests inject synthetic process trees.
 var psParentMap = func() map[int]int {
-	ctx, cancel := context.WithTimeout(context.Background(), 3*time.Second)
-	defer cancel()
-	cmd := exec.CommandContext(ctx, "ps", "-axo", "pid=,ppid=")
-	// a killed ps must not wedge Wait on an inherited pipe (gitx/claudex rule)
-	cmd.WaitDelay = time.Second
-	out, err := cmd.Output()
-	if err != nil {
-		return nil
-	}
-	ps := map[int]int{}
-	for _, line := range strings.Split(string(out), "\n") {
-		f := strings.Fields(line)
-		if len(f) != 2 {
-			continue
-		}
-		pid, err1 := strconv.Atoi(f[0])
-		ppid, err2 := strconv.Atoi(f[1])
-		if err1 != nil || err2 != nil {
-			continue
-		}
-		ps[pid] = ppid
-	}
-	if len(ps) == 0 {
+	ps, err := execPSParents(3 * time.Second)
+	if err != nil || len(ps) == 0 {
 		return nil
 	}
 	return ps
@@ -322,26 +295,6 @@ func normalizeActivity(status string) string {
 	return ""
 }
 
-// reachesAncestor walks pid→ppid a bounded number of hops. The bound doubles
-// as the cycle guard: a torn ps snapshot can loop, and ten hops comfortably
-// covers the observed launcher → server → session depth of two.
-func reachesAncestor(ps map[int]int, pid, ancestor int) bool {
-	if pid <= 0 || ancestor <= 0 {
-		return false
-	}
-	for i := 0; i <= maxAncestryDepth; i++ {
-		if pid == ancestor {
-			return true
-		}
-		next, ok := ps[pid]
-		if !ok || next == pid || next <= 0 {
-			return false
-		}
-		pid = next
-	}
-	return false
-}
-
 // extraRow is one tick's sighting of a non-primary registry row.
 type extraRow struct {
 	key    string // stable identity for wall-clock aging
@@ -468,7 +421,17 @@ func extraRowOf(a claudex.Agent) extraRow {
 	if key == "" {
 		key = strconv.Itoa(a.PID)
 	}
-	return extraRow{key: key, name: a.Name, status: normalizeActivity(a.Status)}
+	// live registry rows can lack a name entirely (observed: IDE/SDK sessions
+	// and fresh pre-created ones) — fall back to a real identifier so the card
+	// never renders a blank row
+	name := a.Name
+	if name == "" && len(a.SessionID) >= 8 {
+		name = a.SessionID[:8]
+	}
+	if name == "" {
+		name = "pid " + strconv.Itoa(a.PID)
+	}
+	return extraRow{key: key, name: name, status: normalizeActivity(a.Status)}
 }
 
 type claudeIDCapture struct {

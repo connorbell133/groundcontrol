@@ -212,12 +212,13 @@ async function loadRecents() {
 async function relaunchFromRecent(cfg) {
   try {
     await loadFolder(cfg.folder);
+    const prompt = cfg.initialPrompt ?? undefined;
     if (cfg.stale) {
       // the branch this config used no longer exists — degrade honestly
       toast(`branch ${cfg.branch} no longer exists — defaulting to in-folder`, true);
-      openSheet({ spawnMode: "same-dir", permissionMode: cfg.permissionMode });
+      openSheet({ spawnMode: "same-dir", permissionMode: cfg.permissionMode, prompt });
     } else {
-      openSheet({ spawnMode: cfg.spawnMode, permissionMode: cfg.permissionMode, branch: cfg.branch ?? undefined });
+      openSheet({ spawnMode: cfg.spawnMode, permissionMode: cfg.permissionMode, branch: cfg.branch ?? undefined, prompt });
     }
   } catch (e) {
     toast(e.message, true);

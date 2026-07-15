@@ -123,6 +123,7 @@ change; renaming one is breaking.
   "spawnMode": "worktree",
   "branch": "main",
   "permissionMode": "acceptEdits",
+  "capacity": 8,
   "callbackUrl": "http://n8n.local:5678/webhook/gc",
   "timeoutMs": 60000
 }
@@ -137,8 +138,17 @@ change; renaming one is breaking.
   prompt), so `git branch` answers "what was this run for" at a glance.
 - `branch` — in `same-dir` mode this switches the checkout first; git refuses
   if that would clobber local changes.
-- `permissionMode` — passed to `claude`: `default`, `acceptEdits`, `plan`, or
-  `bypassPermissions`.
+- `permissionMode` — passed to `claude`: `default`, `acceptEdits`, `plan`,
+  `auto`, `dontAsk`, or `bypassPermissions`; anything else is a 400
+  `invalid_param`. Note that `dontAsk` and `bypassPermissions` skip Claude
+  Code's confirmation prompts entirely — a launch-scoped token grants that
+  power, so hand those tokens out accordingly.
+- `capacity` — how many sessions claude.ai can create in this environment
+  (`--capacity`). Normalized, never rejected: absent or < 1 falls back to 32
+  (the CLI default), values above 256 clamp to 256. The flag is passed to
+  `claude` only when the normalized value differs from the default, so
+  launches keep working on CLIs that predate it. The session object always
+  carries the resolved `capacity`.
 - `callbackUrl` — this launch's own webhook: every lifecycle event except
   `session.start` (`session.ready`, `session.kill`, `session.exit`) is POSTed
   to it (same payload shape as [events](#events--notifications)).

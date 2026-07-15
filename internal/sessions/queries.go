@@ -18,8 +18,12 @@ type RecentLaunch struct {
 	Branch         *string `json:"branch"`
 	SpawnMode      string  `json:"spawnMode"`
 	PermissionMode string  `json:"permissionMode"`
-	At             string  `json:"at"`
-	Stale          bool    `json:"stale"` // launch config whose branch no longer exists
+	// capacity is journaled only when the launch overrode the CLI default,
+	// so absent (and pre-capacity) entries read back as the default
+	Capacity   int    `json:"capacity"`
+	PresetName string `json:"presetName,omitempty"`
+	At         string `json:"at"`
+	Stale      bool   `json:"stale"` // launch config whose branch no longer exists
 }
 
 type LostSession struct {
@@ -85,6 +89,8 @@ func (m *Manager) RecentLaunches(limit int) []RecentLaunch {
 			Branch:         util.StrPtr(branch),
 			SpawnMode:      mode,
 			PermissionMode: permissionMode,
+			Capacity:       normalizeCapacity(jInt(e, "capacity")),
+			PresetName:     jStr(e, "presetName"),
 			At:             jStr(e, "at"),
 			Stale:          branch != "" && !gitx.BranchExists(folder, branch),
 		})
@@ -159,6 +165,8 @@ func (m *Manager) ListLost() []LostSession {
 				Branch:         util.StrPtr(branch),
 				SpawnMode:      mode,
 				PermissionMode: permissionMode,
+				Capacity:       normalizeCapacity(jInt(e, "capacity")),
+				PresetName:     jStr(e, "presetName"),
 				At:             at,
 				Stale:          branch != "" && !gitx.BranchExists(folder, branch),
 			},

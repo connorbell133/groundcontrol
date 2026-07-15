@@ -118,7 +118,8 @@ func (m *Manager) ListLost() []LostSession {
 	claudeIDs := map[string]string{}
 	for _, e := range entries {
 		ev := jStr(e, "event")
-		if (ev == evSessionExit || ev == evSessionKill) && jStr(e, "id") != "" {
+		if (ev == evSessionExit || ev == evSessionKill || ev == evSessionDismissed) && jStr(e, "id") != "" {
+			// dismissed lost headstones must not re-derive on a cache rebuild
 			terminated[jStr(e, "id")] = true
 		}
 		if ev == evSessionClaudeID && jStr(e, "id") != "" {
@@ -310,9 +311,17 @@ func (m *Manager) ListLanded() []LandedSession {
 
 	entries := m.journal.Read()
 	exits := map[string]map[string]any{}
+	dismissed := map[string]bool{}
 	for _, e := range entries {
-		if jStr(e, "event") == evSessionExit && jStr(e, "id") != "" {
-			exits[jStr(e, "id")] = e
+		switch jStr(e, "event") {
+		case evSessionExit:
+			if jStr(e, "id") != "" {
+				exits[jStr(e, "id")] = e
+			}
+		case evSessionDismissed:
+			if jStr(e, "id") != "" {
+				dismissed[jStr(e, "id")] = true
+			}
 		}
 	}
 	cutoff := time.Now().Add(-lostWindow)
@@ -327,7 +336,7 @@ func (m *Manager) ListLanded() []LandedSession {
 		}
 		seen[id] = true
 		exit, ok := exits[id]
-		if !ok || liveIDs[id] {
+		if !ok || liveIDs[id] || dismissed[id] {
 			continue
 		}
 		exitedAt := jStr(exit, "at")

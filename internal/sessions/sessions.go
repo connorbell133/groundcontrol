@@ -864,19 +864,41 @@ func (m *Manager) Remove(id string) (bool, error) {
 		m.mu.Unlock()
 		// lost-session headstones dismiss through the same endpoint
 		m.lostMu.Lock()
-		defer m.lostMu.Unlock()
+		removed := false
 		for i, l := range m.lostCache {
 			if l.ID == id {
 				m.lostCache = append(m.lostCache[:i], m.lostCache[i+1:]...)
-				return true, nil
+				removed = true
+				break
 			}
 		}
-		return false, nil
+		m.lostMu.Unlock()
+		if removed {
+			// journal so the headstone stays dismissed across a runner restart,
+			// when the lost-session cache is rebuilt from the journal
+			m.journalDismissal(id)
+		}
+		return removed, nil
 	}
-	defer m.mu.Unlock()
 	if s.State != StateExited && s.State != StateError {
+		m.mu.Unlock()
 		return false, errors.New("session is still live; kill it first")
 	}
 	delete(m.sessions, id)
+	m.mu.Unlock()
+	// journal the dismissal (outside the lock — it does disk IO): ListLanded
+	// rebuilds ended sessions from the journal, so without this marker the card
+	// resurrects on the next poll
+	m.journalDismissal(id)
 	return true, nil
+}
+
+// journalDismissal records a session.dismissed marker so the journal-derived
+// landed and lost views permanently exclude the id. A flat named event read
+// with the tolerant jStr idiom — no generic fact envelope (deliberately
+// rejected in prior work); it may scroll off the 2000-entry read window while
+// its exit entry survives, the same tolerance the landed/lost views already
+// carry.
+func (m *Manager) journalDismissal(id string) {
+	m.journal.Append(map[string]any{"event": evSessionDismissed, "id": id})
 }

@@ -136,6 +136,7 @@ fi
 note "to start the tower:    cd ${APP_HOME} && groundcontrol"
 note "then open:             http://localhost:3020"
 note "phone access (nice):   tailscale serve --bg 3020"
+note "  (one option among several — plain LAN, another VPN, your own reverse proxy: see README#reaching-it-from-your-phone)"
 echo
 
 # Only offer to launch when a human is attached (curl | bash keeps stdin busy,

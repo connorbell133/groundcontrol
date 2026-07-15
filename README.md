@@ -78,14 +78,16 @@ After: open the app, tap the folder, tap **Launch**, scan.
 ## How it works
 
 ```
-phone (PWA, vanilla JS) ──HTTPS via tailscale serve──▶ Go server (one static binary)
-                                                          │
-                                          creack/pty ─▶ claude remote-control
-                                                          │
-                                     scrape pairing URL ─▶ QR ─▶ Claude app
+phone (PWA, vanilla JS) ──HTTPS via [your choice: Tailscale, Caddy, LAN...]──▶ Go server (one static binary)
+                                                                                 │
+                                                                 creack/pty ─▶ claude remote-control
+                                                                                 │
+                                                            scrape pairing URL ─▶ QR ─▶ Claude app
 ```
 
 One static Go binary. The server spawns `claude remote-control` in a PTY, scrapes the pairing URL out of the output, and renders it as a QR. Session history lives in an append-only JSON journal that doubles as the recents list, the lost-session detector, and the audit trail. No database, no build tooling, no framework — the server is one flat Go package leaning on the stdlib plus two small libraries ([creack/pty](https://github.com/creack/pty), [skip2/go-qrcode](https://github.com/skip2/go-qrcode)), the frontend three static files plus a 32-line service worker, embedded straight into the binary with `go:embed`.
+
+The server itself doesn't know or care how it's reached — it just binds a host/port. Tailscale is the one we recommend and document below, but it's a suggestion, not a dependency: anything that gets HTTPS to `:3020` works (see [Reaching it from your phone](#reaching-it-from-your-phone)).
 
 ## Install
 
@@ -123,13 +125,51 @@ The tower reads `config.json` from the current directory and writes its flight l
 
 ### Reaching it from your phone
 
-The tower binds to your LAN, but the pleasant way is [Tailscale](https://tailscale.com):
+The tower just binds `host:port` — how you get HTTPS to it is up to you. A few ways people run it, roughly easiest first:
 
-```bash
-tailscale serve --bg 3020
-```
+- **Tailscale** (what we use, what the docs above assume):
 
-That gives you a stable HTTPS URL on your tailnet — which also unlocks PWA installation (Add to Home Screen from Safari/Chrome) and keeps the whole thing off the public internet. The token is defense-in-depth on top of the tailnet perimeter, not a substitute for one. **Do not port-forward this to the open internet** — it launches shells on your machine; that's the entire point of it.
+  ```bash
+  tailscale serve --bg 3020
+  ```
+
+  Gives you a stable HTTPS URL on your tailnet, no cert management, keeps the whole thing off the public internet. This is the path PWA installation (Add to Home Screen) is tested against, since Safari/Chrome require HTTPS for that.
+
+- **Plain LAN, no HTTPS.** Set `host` to `0.0.0.0` in `config.json` and hit `http://<machine-lan-ip>:3020` from your phone on the same Wi-Fi. Zero setup, but no PWA installability (browsers require HTTPS for that) and no access away from home.
+- **Another mesh/VPN** (Wireguard, Nebula, ZeroTier, plain SSH tunnel/port-forward to a device you control) — same idea as Tailscale: get a private network path to the box, then hit it over that. You'd still want a reverse proxy in front for HTTPS/PWA support.
+- **Your own reverse proxy** (Caddy, nginx, Cloudflare Tunnel) in front of `localhost:3020` if you already run one — gives HTTPS and a real domain, but now you're managing exposure yourself.
+
+Whatever you pick, the `authToken` is defense-in-depth on top of that perimeter, not a substitute for one. **Do not port-forward this to the open internet** — it launches shells on your machine; that's the entire point of it.
+
+### Keeping it running
+
+`./groundcontrol` in a terminal dies with the terminal — fine for a first look, not for a tower you want to reach from the couch tomorrow. Pick one:
+
+- **tmux/screen**, the zero-config option: `tmux new -s groundcontrol -d 'cd ~/.groundcontrol && groundcontrol'`, reattach any time with `tmux attach -t groundcontrol`.
+- **systemd user service** (Linux) — survives logout, restarts on crash:
+
+  ```ini
+  # ~/.config/systemd/user/groundcontrol.service
+  [Unit]
+  Description=groundcontrol
+
+  [Service]
+  WorkingDirectory=%h/.groundcontrol
+  ExecStart=%h/go/bin/groundcontrol
+  Restart=on-failure
+
+  [Install]
+  WantedBy=default.target
+  ```
+
+  ```bash
+  systemctl --user enable --now groundcontrol
+  loginctl enable-linger "$USER"   # keeps it running after you log out
+  ```
+
+- **launchd** (macOS) — same idea, a `~/Library/LaunchAgents/com.groundcontrol.plist` with `ProgramArguments` pointing at the binary and `WorkingDirectory` set to `~/.groundcontrol`, loaded with `launchctl load -w ~/Library/LaunchAgents/com.groundcontrol.plist`.
+
+Adjust the binary path to wherever `go env GOPATH`/bin (or your build output) actually put it.
 
 ## Configuration
 
@@ -141,7 +181,7 @@ That gives you a stable HTTPS URL on your tailnet — which also unlocks PWA ins
 | `webhooks` | notification subscribers: `[{url, events?}]` — each lifecycle event is POSTed as JSON to every matching URL; filter with exact names, `session.*`, `session.failed`, or `*` |
 | `jobs` | headless-job bounds: `{concurrency, timeoutMs}` (default 2 parallel, 15 min) |
 | `showHidden` | show dotfolders in the browser |
-| `port`, `host` | where the server listens |
+| `port`, `host` | where the server listens. `host` defaults to `127.0.0.1` (loopback only) if omitted — the example config and `install.sh`'s generated config both set it to `0.0.0.0` so LAN/Tailscale/proxy access works out of the box; narrow it back to `127.0.0.1` if you're only ever reaching it through something on `localhost` (an SSH tunnel, a reverse proxy on the same box) |
 
 Everything user-facing — theme, launch defaults, roots, the notification webhook, kept-worktree cleanup — is also editable from the ⚙ Settings sheet in the app itself.
 

@@ -1016,9 +1016,84 @@ wireSegment("optSpawn", "spawnMode", syncBranchField);
 wireSegment("optPerm", "permissionMode");
 $("optBranch").onchange = () => (state.opts.branch = $("optBranch").value);
 
+/* ---------- URL-parameter launch (manifest shortcuts, share target, scripts) ---------- */
+// Grammar: ?path=/abs/dir[&prompt=...][&name=...] | ?prompt=... | ?mission=1 | ?relaunch=last
+// Share target (GET) arrives as title/text/url and maps onto prompt when no explicit
+// param is present. Params only prefill UI — launching always takes a human tap.
+const PARAM_TEXT_MAX = 4096;
+
+// Land on Browse at roots and hand `text` to the mission input. The input ships in a
+// sibling unit, so it may not exist yet — degrade to a toast instead of dropping silently.
+async function missionEntry(text) {
+  switchTab("browse");
+  if (state.path !== null) await loadFolder(null);
+  const input = document.getElementById("missionInput");
+  if (!input) {
+    if (text) toast("no destination — pick a folder");
+    return;
+  }
+  if (text) input.value = text;
+  input.focus();
+}
+
+async function consumeLaunchParams() {
+  const qs = new URLSearchParams(location.search);
+  const trunc = (v) => (v ? String(v).slice(0, PARAM_TEXT_MAX) : undefined);
+  const path = qs.get("path");
+  let prompt = trunc(qs.get("prompt"));
+  const name = trunc(qs.get("name"));
+  const mission = qs.get("mission") === "1";
+  const relaunch = qs.get("relaunch") === "last";
+  if (!path && !prompt && !name && !mission && !relaunch) {
+    prompt = trunc(qs.get("text") || qs.get("url") || qs.get("title")); // share-target mapping
+    if (!prompt) return; // nothing we understand — leave the URL alone
+  }
+  try {
+    history.replaceState(null, "", "/"); // consumed — reload/relaunch never replays
+  } catch {
+    /* cosmetic — some webviews refuse; params simply stay visible */
+  }
+
+  if (path) {
+    // client-side root check is UX only — the server's WithinRoots is the real gate
+    const { roots } = await api("/api/v1/roots");
+    const inRoots = typeof path === "string" && path.startsWith("/") && roots.some((r) => path === r.path || path.startsWith(r.path + "/"));
+    if (inRoots) {
+      await loadFolder(path);
+      const saved = JSON.parse(localStorage.getItem(`opts:${path}`) || "null");
+      openSheet({ ...(saved || launchDefaults()), prompt, name });
+      return;
+    }
+    toast("path is outside the configured roots", true);
+    if (!prompt) return; // fall through: a share with a bad path still keeps its text
+  }
+  if (relaunch) {
+    const { recent } = await api("/api/v1/journal/recent?limit=1");
+    const last = recent?.[0];
+    if (!last) {
+      toast("no previous launch");
+      await missionEntry();
+      return;
+    }
+    await relaunchFromRecent(last); // handles the stale-branch degrade + toast itself
+    return;
+  }
+  if (prompt) {
+    await missionEntry(prompt);
+    return;
+  }
+  if (mission) await missionEntry();
+}
+
 $("readoutHost").textContent = location.hostname.split(".")[0]; // first label only — full FQDN swamps a phone header
 if ("serviceWorker" in navigator) navigator.serviceWorker.register("/sw.js").catch(() => {});
-loadFolder(null).catch((e) => toast(e.message, true));
+loadFolder(null)
+  .then(() => {
+    // first authorized load succeeded — safe to consume launch params. A 401 boot
+    // shows the auth gate instead, and unlocking reloads with the query intact.
+    if ($("authGate").hidden) consumeLaunchParams().catch((e) => toast(e.message, true));
+  })
+  .catch((e) => toast(e.message, true));
 health();
 setInterval(health, 10000);
 setInterval(() => {

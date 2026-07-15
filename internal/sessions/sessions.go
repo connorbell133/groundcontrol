@@ -56,6 +56,7 @@ type Session struct {
 	Branch         *string             `json:"branch"`
 	WorktreePath   *string             `json:"worktreePath"`
 	PermissionMode string              `json:"permissionMode"`
+	InitialPrompt  *string             `json:"initialPrompt,omitempty"`
 	State          State               `json:"state"`
 	PairingURL     *string             `json:"pairingUrl"`
 	CallbackURL    *string             `json:"callbackUrl"`
@@ -262,7 +263,7 @@ func (m *Manager) WaitForReady(id string, timeout time.Duration) string {
 }
 
 type CreateOpts struct {
-	Folder, Name, SpawnMode, Branch, PermissionMode, CallbackURL, Actor string
+	Folder, Name, SpawnMode, Branch, PermissionMode, InitialPrompt, CallbackURL, Actor string
 }
 
 func (m *Manager) Create(opts CreateOpts) (Session, error) {
@@ -380,6 +381,7 @@ func (m *Manager) Create(opts CreateOpts) (Session, error) {
 			Branch:         util.StrPtr(branch),
 			WorktreePath:   util.StrPtr(worktreePath),
 			PermissionMode: permissionMode,
+			InitialPrompt:  util.StrPtr(opts.InitialPrompt),
 			State:          StateStarting,
 			PairingURL:     nil,
 			CallbackURL:    util.StrPtr(opts.CallbackURL),
@@ -412,6 +414,9 @@ func (m *Manager) Create(opts CreateOpts) (Session, error) {
 	}
 	if opts.Actor != "" {
 		entry["actor"] = opts.Actor
+	}
+	if opts.InitialPrompt != "" {
+		entry["initialPrompt"] = opts.InitialPrompt
 	}
 	m.journal.Append(entry)
 	m.announce(evSessionStart, snap, false)

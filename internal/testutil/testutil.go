@@ -58,6 +58,21 @@ func CommitFile(t *testing.T, dir, name, msg, date string) {
 	MustGitEnv(t, dir, env, "commit", "-m", msg)
 }
 
+// FakeClaude puts an executable "claude" stub first on PATH so lifecycle
+// tests can launch real sessions without the CLI: it prints a pairing-URL
+// line (which flips the session to ready) and then blocks until killed —
+// exec'ing a bounded sleep so a missed kill can't leak a process forever.
+// Uses t.Setenv, so callers must not also call t.Parallel.
+func FakeClaude(t *testing.T) {
+	t.Helper()
+	dir := t.TempDir()
+	script := "#!/bin/sh\necho \"https://claude.ai/remote/abc123\"\nexec sleep 300\n"
+	if err := os.WriteFile(filepath.Join(dir, "claude"), []byte(script), 0o755); err != nil {
+		t.Fatalf("write fake claude: %v", err)
+	}
+	t.Setenv("PATH", dir+string(os.PathListSeparator)+os.Getenv("PATH"))
+}
+
 func InitRepo(t *testing.T) string {
 	t.Helper()
 	dir := ResolvedTempDir(t)

@@ -1,6 +1,8 @@
 package sessions
 
 import (
+	"os"
+	"path/filepath"
 	"strings"
 	"testing"
 	"time"
@@ -122,5 +124,51 @@ func TestRecentLaunchesDedupAndOrder(t *testing.T) {
 	// newest first; the duplicate keeps its most recent occurrence
 	if out[0].Name != "n3" || out[1].Name != "n2" {
 		t.Errorf("unexpected order: %+v", out)
+	}
+}
+
+func TestRecentLaunchesInitialPrompt(t *testing.T) {
+	t.Parallel()
+	root := testutil.ResolvedTempDir(t)
+	m := testManager(t, []string{root})
+	// distinct folders so the dedup key keeps both entries
+	withDir := filepath.Join(root, "with")
+	withoutDir := filepath.Join(root, "without")
+	for _, d := range []string{withDir, withoutDir} {
+		if err := os.MkdirAll(d, 0o755); err != nil {
+			t.Fatal(err)
+		}
+	}
+	// markup and quotes must survive the journal round-trip byte-identical
+	prompt := `<script>alert(1)</script> "double" 'single'`
+	m.journal.Append(map[string]any{"event": evSessionStart, "id": "p1", "name": "with", "folder": withDir, "initialPrompt": prompt})
+	m.journal.Append(map[string]any{"event": evSessionStart, "id": "p2", "name": "without", "folder": withoutDir})
+
+	out := m.RecentLaunches(10)
+	if len(out) != 2 {
+		t.Fatalf("expected 2 launches, got %+v", out)
+	}
+	// newest first: the promptless launch, then the prompted one
+	if out[0].InitialPrompt != nil {
+		t.Errorf("promptless launch carries %q, want nil", *out[0].InitialPrompt)
+	}
+	if out[1].InitialPrompt == nil || *out[1].InitialPrompt != prompt {
+		t.Errorf("prompted launch = %+v, want initialPrompt %q", out[1], prompt)
+	}
+}
+
+func TestListLostCarriesInitialPrompt(t *testing.T) {
+	t.Parallel()
+	root := testutil.ResolvedTempDir(t)
+	m := testManager(t, []string{root})
+	prompt := "resume the refactor"
+	m.journal.Append(map[string]any{"event": evSessionStart, "id": "lost1", "name": "one", "folder": root, "initialPrompt": prompt})
+
+	lost := m.ListLost()
+	if len(lost) != 1 {
+		t.Fatalf("expected one lost session, got %+v", lost)
+	}
+	if lost[0].InitialPrompt == nil || *lost[0].InitialPrompt != prompt {
+		t.Errorf("lost session = %+v, want initialPrompt %q", lost[0], prompt)
 	}
 }

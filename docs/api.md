@@ -77,6 +77,7 @@ change; renaming one is breaking.
 | `invalid_param` | 400 | a field is present but malformed (e.g. non-http `callbackUrl`) |
 | `invalid_path` | 400 | path outside roots, or not a directory |
 | `outside_roots` | 400 | launch folder is outside configured roots |
+| `prompt_too_long` | 400 | `initialPrompt` exceeds 4096 bytes |
 | `invalid_config` | 400 | config write rejected (bad roots, bad webhooks block) |
 | `not_found` | 404 | no such session or job |
 | `not_ready` | 409 | session exists but has no pairing URL yet |
@@ -118,6 +119,7 @@ change; renaming one is breaking.
 {
   "folder": "/home/you/repos/checkout-service",
   "name": "fix-race",
+  "initialPrompt": "fix the race in the checkout retry loop",
   "spawnMode": "worktree",
   "branch": "main",
   "permissionMode": "acceptEdits",
@@ -128,6 +130,11 @@ change; renaming one is breaking.
 
 - `folder` (required) — must be inside a configured root.
 - `name` — must not collide with a live session; omit to auto-generate.
+- `initialPrompt` — optional opening prompt, at most 4096 bytes (rejected with
+  `prompt_too_long` above that). Stored and echoed verbatim — clients must
+  escape it for HTML — on the session object, in the `session.start` journal
+  entry, and on `GET /journal/recent` and lost entries. It is **not** typed
+  into the Claude session; it rides along for display and one-tap copy.
 - `spawnMode` — `same-dir` (default) or `worktree`. Worktree mode requires
   `branch`, cuts a private `gc/<name-slug>-<id>` branch off it under
   `~/.groundcontrol/worktrees/`, and cleans up on exit (dirty worktrees are

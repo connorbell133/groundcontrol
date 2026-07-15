@@ -16,6 +16,7 @@ type RecentLaunch struct {
 	Branch         *string `json:"branch"`
 	SpawnMode      string  `json:"spawnMode"`
 	PermissionMode string  `json:"permissionMode"`
+	InitialPrompt  *string `json:"initialPrompt"`
 	At             string  `json:"at"`
 	Stale          bool    `json:"stale"` // launch config whose branch no longer exists
 }
@@ -68,6 +69,7 @@ func (m *Manager) RecentLaunches(limit int) []RecentLaunch {
 			Branch:         util.StrPtr(branch),
 			SpawnMode:      mode,
 			PermissionMode: permissionMode,
+			InitialPrompt:  util.StrPtr(jStr(e, "initialPrompt")),
 			At:             jStr(e, "at"),
 			Stale:          branch != "" && !gitx.BranchExists(folder, branch),
 		})
@@ -137,6 +139,7 @@ func (m *Manager) ListLost() []LostSession {
 				Branch:         util.StrPtr(branch),
 				SpawnMode:      mode,
 				PermissionMode: permissionMode,
+				InitialPrompt:  util.StrPtr(jStr(e, "initialPrompt")),
 				At:             at,
 				Stale:          branch != "" && !gitx.BranchExists(folder, branch),
 			},

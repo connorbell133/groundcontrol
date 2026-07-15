@@ -511,6 +511,8 @@ func (s *Server) Handler() http.Handler {
 	}))
 
 	mux.HandleFunc("GET /sessions", need(scopeRead, func(w http.ResponseWriter, r *http.Request) {
+		// a reader is watching: flip the registry poller to its fast tier
+		s.sessions.MarkObserved()
 		WriteJSON(w, 200, struct {
 			Sessions []sessions.Session       `json:"sessions"`
 			Lost     []sessions.LostSession   `json:"lost"`

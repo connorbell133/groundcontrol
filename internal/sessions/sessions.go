@@ -1,9 +1,12 @@
 // Package sessions owns interactive remote-control sessions: a real PTY per
-// launch, lifecycle events, and the journal-derived views (recent launches,
-// lost sessions) that make a restarted runner honest about what it forgot.
+// launch, lifecycle events, registry-sourced enrichment (Claude conversation
+// ids, busy/idle activity, folder-mate sessions), and the journal-derived
+// views (recent launches, lost sessions) that make a restarted runner honest
+// about what it forgot.
 package sessions
 
 import (
+	"context"
 	"errors"
 	"fmt"
 	"os"
@@ -39,13 +42,16 @@ const (
 )
 
 // session lifecycle event names; evSessionFailed is a derived match token
-// (announce adds it alongside a failed exit), never an emitted event itself
+// (announce adds it alongside a failed exit), never an emitted event itself.
+// evSessionClaudeID is journal-only: the registry poller appends it on first
+// UUID capture but never announces it — enrichment facts don't fan out (R8).
 const (
-	evSessionStart  = "session.start"
-	evSessionReady  = "session.ready"
-	evSessionKill   = "session.kill"
-	evSessionExit   = "session.exit"
-	evSessionFailed = "session.failed"
+	evSessionStart    = "session.start"
+	evSessionReady    = "session.ready"
+	evSessionKill     = "session.kill"
+	evSessionExit     = "session.exit"
+	evSessionFailed   = "session.failed"
+	evSessionClaudeID = "session.claude-id"
 )
 
 type Session struct {
@@ -64,7 +70,23 @@ type Session struct {
 	ExitCode       *int                `json:"exitCode"`
 	LastOutputAt   *string             `json:"lastOutputAt"`
 	LastLine       *string             `json:"lastLine"`
-	Debrief        *Debrief            `json:"debrief,omitempty"`
+	// registry-sourced enrichment: every field degrades to absence and none
+	// of them ever drives a state transition — the PTY stays the sole exit
+	// authority (R6)
+	ClaudeSessionID *string        `json:"claudeSessionId,omitempty"`
+	Activity        *string        `json:"activity,omitempty"`
+	ExtraSessions   []ExtraSession `json:"extraSessions,omitempty"`
+	Debrief         *Debrief       `json:"debrief,omitempty"`
+}
+
+// ExtraSession is one additional live Claude session observed in the launch's
+// directory — a phone-spawned sibling behind the same remote-control server,
+// or an unrelated session (manual, IDE) that happens to run in the folder.
+// "In this folder" is the literal contract. Status carries only "busy"/"idle";
+// any other registry value reads as absent, mirroring the primary activity rule.
+type ExtraSession struct {
+	Name   string `json:"name"`
+	Status string `json:"status,omitempty"`
 }
 
 // Debrief records what a worktree run left behind, captured at exit because
@@ -93,6 +115,10 @@ type liveSession struct {
 	repoRoot   string
 	wtBranch   string
 	baseCommit string
+	// registry enrichment bookkeeping, all guarded by m.mu
+	extrasSeen             map[string]extraRecord // last sighting per extra row, for wall-clock aging
+	activitySeenAt         time.Time              // last successful registry confirm of Activity
+	claudeIDConflictLogged bool                   // a disagreeing later sessionId is logged once, not per tick
 }
 
 // Manager owns the live session table. Lost-session and recent-launch views
@@ -107,6 +133,16 @@ type Manager struct {
 	lostCache    []LostSession
 	lostComputed bool
 
+	// registry poller lifecycle (guarded by mu): regCtx arms the loop,
+	// regRunning guarantees at most one loop goroutine, observedAt feeds the
+	// watched cadence tier
+	regCtx     context.Context
+	regRunning bool
+	observedAt time.Time
+	// regWake cuts a slow poll sleep short when a reader appears; buffered so
+	// MarkObserved never blocks an API request
+	regWake chan struct{}
+
 	journal *journal.Journal
 	bus     *events.Bus
 	ws      *workspace.Manager
@@ -117,6 +153,7 @@ func NewManager(j *journal.Journal, bus *events.Bus, ws *workspace.Manager, brow
 	return &Manager{
 		sessions:     map[string]*liveSession{},
 		pendingNames: map[string]bool{},
+		regWake:      make(chan struct{}, 1),
 		journal:      j,
 		bus:          bus,
 		ws:           ws,
@@ -430,7 +467,18 @@ func (m *Manager) Create(opts CreateOpts) (Session, error) {
 	m.mu.Lock()
 	m.sessions[id] = s
 	snap := s.Session
+	// arm the registry poller on the 0→1 live-session transition: regRunning
+	// flips under the same lock the loop uses when it observes zero live
+	// sessions, so exactly one loop goroutine can exist at a time
+	startPoll := m.regCtx != nil && !m.regRunning
+	if startPoll {
+		m.regRunning = true
+	}
+	regCtx := m.regCtx
 	m.mu.Unlock()
+	if startPoll {
+		go m.registryLoop(regCtx)
+	}
 
 	entry := map[string]any{
 		"event":          evSessionStart,
@@ -515,6 +563,10 @@ func (m *Manager) readLoop(s *liveSession) {
 	}
 	s.ExitedAt = util.StrPtr(util.NowISO())
 	s.ExitCode = util.IntPtr(exitCode)
+	// exit is authoritative for registry enrichment too: a "busy" chip must
+	// die with the session (the poller's state guard keeps a stale snapshot
+	// from resurrecting it), while the extras list freezes as-is
+	s.Activity = nil
 	s.ptmx = nil
 	id := s.ID
 	killed := s.killed
@@ -551,6 +603,12 @@ func (m *Manager) readLoop(s *liveSession) {
 		m.mu.Unlock()
 	}
 	exitEntry := map[string]any{"event": evSessionExit, "id": id, "code": exitCode}
+	if snap.ClaudeSessionID != nil {
+		// flattened like the debrief fields so ListLanded (and a restarted
+		// runner) can read it off the exit entry even after the standalone
+		// session.claude-id event scrolls off the journal's read window
+		exitEntry["claudeSessionId"] = *snap.ClaudeSessionID
+	}
 	if debrief != nil {
 		exitEntry["filesChanged"] = debrief.FilesChanged
 		exitEntry["insertions"] = debrief.Insertions

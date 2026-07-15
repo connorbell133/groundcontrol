@@ -136,6 +136,11 @@ func main() {
 	ctx, stop := signal.NotifyContext(context.Background(), syscall.SIGINT, syscall.SIGTERM)
 	defer stop()
 
+	// the registry poller (claude agents --json enrichment) rides the same
+	// signal context as the server: armed here, it runs only while sessions
+	// are live and dies with the process
+	sessionMgr.StartRegistryLoop(ctx)
+
 	srv := &http.Server{
 		Handler:           mux,
 		ReadHeaderTimeout: 10 * time.Second,

@@ -23,8 +23,12 @@ type RecentLaunch struct {
 }
 
 type LostSession struct {
-	ID           string `json:"id"`
-	RecentLaunch        // embedded — flattens in JSON like the TS interface extension
+	ID string `json:"id"`
+	// captured from the standalone session.claude-id journal entry — lost
+	// sessions never got an exit entry, so that event is the UUID's only
+	// durable home (R2, the crashed-runner resume target)
+	ClaudeSessionID *string `json:"claudeSessionId,omitempty"`
+	RecentLaunch            // embedded — flattens in JSON like the TS interface extension
 }
 
 const lostWindow = 7 * 24 * time.Hour
@@ -105,10 +109,14 @@ func (m *Manager) ListLost() []LostSession {
 	}
 	entries := m.journal.Read()
 	terminated := map[string]bool{}
+	claudeIDs := map[string]string{}
 	for _, e := range entries {
 		ev := jStr(e, "event")
 		if (ev == evSessionExit || ev == evSessionKill) && jStr(e, "id") != "" {
 			terminated[jStr(e, "id")] = true
+		}
+		if ev == evSessionClaudeID && jStr(e, "id") != "" {
+			claudeIDs[jStr(e, "id")] = jStr(e, "claudeSessionId")
 		}
 	}
 	cutoff := time.Now().Add(-lostWindow)
@@ -143,7 +151,8 @@ func (m *Manager) ListLost() []LostSession {
 			permissionMode = "default"
 		}
 		out = append(out, LostSession{
-			ID: id,
+			ID:              id,
+			ClaudeSessionID: util.StrPtr(claudeIDs[id]),
 			RecentLaunch: RecentLaunch{
 				Folder:         folder,
 				Name:           jStr(e, "name"),
@@ -262,16 +271,20 @@ func (m *Manager) SweepOrbitBranch(repo, branch string) error {
 // session.start/session.exit journal pair — the debrief that survives a
 // runner restart.
 type LandedSession struct {
-	ID             string   `json:"id"`
-	Name           string   `json:"name"`
-	Folder         string   `json:"folder"`
-	Branch         *string  `json:"branch"`
-	SpawnMode      string   `json:"spawnMode"`
-	PermissionMode string   `json:"permissionMode"`
-	StartedAt      string   `json:"startedAt"`
-	ExitedAt       string   `json:"exitedAt"`
-	ExitCode       *int     `json:"exitCode"`
-	Debrief        *Debrief `json:"debrief,omitempty"`
+	ID             string  `json:"id"`
+	Name           string  `json:"name"`
+	Folder         string  `json:"folder"`
+	Branch         *string `json:"branch"`
+	SpawnMode      string  `json:"spawnMode"`
+	PermissionMode string  `json:"permissionMode"`
+	StartedAt      string  `json:"startedAt"`
+	ExitedAt       string  `json:"exitedAt"`
+	ExitCode       *int    `json:"exitCode"`
+	// read from the claudeSessionId flattened into the session.exit entry —
+	// the standalone capture event can scroll off the 2000-entry read window
+	// while the exit entry survives
+	ClaudeSessionID *string  `json:"claudeSessionId,omitempty"`
+	Debrief         *Debrief `json:"debrief,omitempty"`
 }
 
 // ListLanded joins session.start entries with their session.exit entries,
@@ -342,16 +355,17 @@ func (m *Manager) ListLanded() []LandedSession {
 			}
 		}
 		out = append(out, LandedSession{
-			ID:             id,
-			Name:           jStr(e, "name"),
-			Folder:         folder,
-			Branch:         util.StrPtr(jStr(e, "branch")),
-			SpawnMode:      mode,
-			PermissionMode: permissionMode,
-			StartedAt:      jStr(e, "at"),
-			ExitedAt:       exitedAt,
-			ExitCode:       exitCode,
-			Debrief:        debrief,
+			ID:              id,
+			Name:            jStr(e, "name"),
+			Folder:          folder,
+			Branch:          util.StrPtr(jStr(e, "branch")),
+			SpawnMode:       mode,
+			PermissionMode:  permissionMode,
+			StartedAt:       jStr(e, "at"),
+			ExitedAt:        exitedAt,
+			ExitCode:        exitCode,
+			ClaudeSessionID: util.StrPtr(jStr(exit, "claudeSessionId")),
+			Debrief:         debrief,
 		})
 	}
 	return out

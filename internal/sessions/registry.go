@@ -1,0 +1,576 @@
+package sessions
+
+/* ---------- registry enrichment: claude agents --json ----------
+One Manager-owned poll loop joins the CLI's live-session registry to launched
+sessions: the Claude conversation UUID (journaled once — the id a future
+resume needs), a busy/idle activity signal, and the other sessions running in
+a launch's directory. Everything here is enrichment: the PTY stays the sole
+exit authority (R6), and every failure degrades to absent fields, never to a
+state transition or an error. The loop is run-to-completion-then-sleep — the
+next wait is armed only after a tick finishes, so overlapping execs are
+impossible by construction. */
+
+import (
+	"context"
+	"log"
+	"math/rand"
+	"os/exec"
+	"path/filepath"
+	"sort"
+	"strconv"
+	"strings"
+	"time"
+
+	"github.com/connorbell133/groundcontrol/internal/claudex"
+)
+
+// Cadence tiers. Package vars, not consts, so tests can shrink them
+// (precedent: transcripts.go's claudeProjectsDir). One registry exec costs
+// ~200ms wall / ~300MB transient RSS (measured 2026-07-15), which is why the
+// loop is gated on live sessions and tiered instead of a flat fast poll.
+var (
+	registryFastInterval = 3 * time.Second
+	registrySlowInterval = 25 * time.Second
+	registryFailureCap   = time.Minute
+	// the floor under the retention window, so a fast cadence doesn't turn
+	// one blip into an instant clear
+	registryGraceFloor = 10 * time.Second
+)
+
+const (
+	// a GET /sessions inside this window means someone is watching — poll fast
+	registryObservedWindow = 10 * time.Second
+	// forced fast tier while a session still lacks its UUID, bounded per
+	// session: chase the first capture hard early, then stop paying for a
+	// UUID that may never appear (old CLI, launch that never paired)
+	registryUUIDChaseWindow = 2 * time.Minute
+	// `claude agents --json` first shipped in this CLI release
+	registryVersionFloor = "2.1.145"
+	// bound on the pid→ppid walk; the observed topology is launcher → forked
+	// server → one child per session (depth 2), so 10 is generous while still
+	// making a corrupt ps snapshot (cycles) finite
+	maxAncestryDepth = 10
+)
+
+// Exec seams, swappable in tests so registry scenarios need no real CLI or
+// process tree (precedent: transcripts.go's claudeProjectsDir var).
+var (
+	registryQuery        = func(timeout time.Duration) ([]claudex.Agent, error) { return claudex.Agents(timeout) }
+	registryProbeVersion = func() (string, error) { return claudex.Version(claudex.DefaultTimeout) }
+)
+
+// psParentMap builds the pid→ppid map for one tick with a single ps exec.
+// It lives here rather than claudex because claudex owns claude state queries
+// only — ps is a general process query. nil means "unavailable" and switches
+// the join to the last-resort cwd fallback.
+var psParentMap = func() map[int]int {
+	ctx, cancel := context.WithTimeout(context.Background(), 3*time.Second)
+	defer cancel()
+	cmd := exec.CommandContext(ctx, "ps", "-axo", "pid=,ppid=")
+	// a killed ps must not wedge Wait on an inherited pipe (gitx/claudex rule)
+	cmd.WaitDelay = time.Second
+	out, err := cmd.Output()
+	if err != nil {
+		return nil
+	}
+	ps := map[int]int{}
+	for _, line := range strings.Split(string(out), "\n") {
+		f := strings.Fields(line)
+		if len(f) != 2 {
+			continue
+		}
+		pid, err1 := strconv.Atoi(f[0])
+		ppid, err2 := strconv.Atoi(f[1])
+		if err1 != nil || err2 != nil {
+			continue
+		}
+		ps[pid] = ppid
+	}
+	if len(ps) == 0 {
+		return nil
+	}
+	return ps
+}
+
+// MarkObserved records that an API reader just listed sessions — the signal
+// that flips the poll cadence to the fast tier and cuts a slow sleep short.
+func (m *Manager) MarkObserved() {
+	m.mu.Lock()
+	m.observedAt = time.Now()
+	m.mu.Unlock()
+	select {
+	case m.regWake <- struct{}{}:
+	default:
+	}
+}
+
+// StartRegistryLoop arms the poller with the process's signal context. The
+// loop itself runs only while at least one session is live: Create starts it
+// on the 0→1 transition and it parks itself again after the last exit — zero
+// registry execs on an idle runner.
+func (m *Manager) StartRegistryLoop(ctx context.Context) {
+	m.mu.Lock()
+	m.regCtx = ctx
+	start := false
+	for _, s := range m.sessions {
+		if s.State == StateStarting || s.State == StateReady {
+			start = true
+			break
+		}
+	}
+	start = start && !m.regRunning
+	if start {
+		m.regRunning = true
+	}
+	m.mu.Unlock()
+	if start {
+		go m.registryLoop(ctx)
+	}
+}
+
+func (m *Manager) stopRegistryLoop() {
+	m.mu.Lock()
+	m.regRunning = false
+	m.mu.Unlock()
+}
+
+func (m *Manager) registryLoop(ctx context.Context) {
+	if v, err := registryProbeVersion(); err == nil && !claudex.AtLeast(v, registryVersionFloor) {
+		// old CLI: agents --json doesn't exist. Degrade to absent enrichment
+		// instead of hammering a subcommand that can't answer; the next 0→1
+		// transition re-probes, so a CLI upgrade needs no runner restart.
+		log.Printf("sessions: claude %s lacks agents --json (needs %s) — registry enrichment off", v, registryVersionFloor)
+		m.stopRegistryLoop()
+		return
+	}
+	interval := registryFastInterval
+	failures := 0
+	for {
+		if ctx.Err() != nil {
+			m.stopRegistryLoop()
+			return
+		}
+		snaps, fast, ok := m.registrySnapshot(time.Now())
+		if !ok {
+			return // last session exited; registrySnapshot already released loop ownership
+		}
+
+		// exec, decode, and the ps snapshot all run outside m.mu — a wedged
+		// CLI must never stall API reads
+		rows, err := registryQuery(claudex.DefaultTimeout)
+		now := time.Now()
+		if err != nil {
+			failures++
+			next := nextRegistryInterval(interval, fast, true)
+			if failures == 1 || next != interval {
+				// rate-limited: the first failure, then once per doubling step
+				log.Printf("sessions: registry poll failed (%v); next attempt in %s", err, next)
+			}
+			interval = next
+			m.ageRegistryState(retentionWindow(interval), now)
+		} else {
+			failures = 0
+			interval = nextRegistryInterval(interval, fast, false)
+			ps := psParentMap()
+			// symlink-normalize both sides of the cwd comparison out here:
+			// EvalSymlinks does filesystem work that must not run under m.mu
+			for i := range snaps {
+				snaps[i].cwd = normalizePath(snaps[i].cwd)
+			}
+			normRows := append([]claudex.Agent(nil), rows...)
+			for i := range normRows {
+				normRows[i].Cwd = normalizePath(normRows[i].Cwd)
+			}
+			joins := joinRegistry(snaps, normRows, ps)
+			captures := m.applyRegistryTick(snaps, joins, retentionWindow(interval), now)
+			for _, c := range captures {
+				// journaled, never announced: the UUID is a durable fact the
+				// UI polls for, not a lifecycle event to fan out (R8)
+				m.journal.Append(map[string]any{"event": evSessionClaudeID, "id": c.id, "claudeSessionId": c.uuid})
+			}
+		}
+
+		if !sleepInterrupt(ctx, m.regWake, jittered(interval), registryFastInterval) {
+			m.stopRegistryLoop()
+			return
+		}
+	}
+}
+
+// regSessionSnap is the slice of a live session one tick joins against.
+type regSessionSnap struct {
+	id        string
+	pid       int // the spawned claude launcher; registry rows are its descendants
+	cwd       string
+	startedAt time.Time
+	uuid      string // captured conversation id, "" until first capture
+}
+
+// registrySnapshot collects what one tick joins against, under one short
+// lock. ok=false means no session is live: loop ownership is released under
+// the same lock, so a concurrent Create sees either a running loop or none —
+// never a stale flag.
+func (m *Manager) registrySnapshot(now time.Time) (snaps []regSessionSnap, fast bool, ok bool) {
+	m.mu.Lock()
+	defer m.mu.Unlock()
+	for _, s := range m.sessions {
+		if s.State != StateStarting && s.State != StateReady {
+			continue
+		}
+		started, _ := time.Parse(time.RFC3339, s.StartedAt)
+		snap := regSessionSnap{id: s.ID, cwd: s.cwd, startedAt: started}
+		if s.cmd != nil && s.cmd.Process != nil {
+			snap.pid = s.cmd.Process.Pid
+		}
+		if s.ClaudeSessionID != nil {
+			snap.uuid = *s.ClaudeSessionID
+		} else if now.Sub(started) < registryUUIDChaseWindow {
+			fast = true
+		}
+		snaps = append(snaps, snap)
+	}
+	if len(snaps) == 0 {
+		m.regRunning = false
+		return nil, false, false
+	}
+	if now.Sub(m.observedAt) <= registryObservedWindow {
+		fast = true
+	}
+	return snaps, fast, true
+}
+
+// nextRegistryInterval implements the tiered cadence: fast while watched or
+// chasing a first UUID capture, slow otherwise; consecutive failures double
+// the previous interval up to a cap so a broken CLI costs one exec a minute,
+// not twenty. Any success resets to the tier the tick computed.
+func nextRegistryInterval(prev time.Duration, fast, failed bool) time.Duration {
+	if failed {
+		next := prev * 2
+		if next > registryFailureCap {
+			next = registryFailureCap
+		}
+		return next
+	}
+	if fast {
+		return registryFastInterval
+	}
+	return registrySlowInterval
+}
+
+// retentionWindow is how long activity and extras survive without a fresh
+// confirm — wall-clock, not tick counts, so the grace rules hold across
+// cadence changes.
+func retentionWindow(interval time.Duration) time.Duration {
+	if w := 2 * interval; w > registryGraceFloor {
+		return w
+	}
+	return registryGraceFloor
+}
+
+// jittered spreads ticks by up to 10% so several runners on one box don't
+// synchronize their execs.
+func jittered(d time.Duration) time.Duration {
+	return d + time.Duration(rand.Int63n(int64(d)/10+1))
+}
+
+// sleepInterrupt waits out one interval, ending early (down to floor) when a
+// reader pokes wake — so the first watched tick after an idle stretch doesn't
+// sit out a slow interval. Returns false when ctx ends the loop.
+func sleepInterrupt(ctx context.Context, wake <-chan struct{}, d, floor time.Duration) bool {
+	timer := time.NewTimer(d)
+	defer timer.Stop()
+	deadline := time.Now().Add(d)
+	for {
+		select {
+		case <-ctx.Done():
+			return false
+		case <-timer.C:
+			return true
+		case <-wake:
+			if remaining := time.Until(deadline); remaining > floor {
+				if !timer.Stop() {
+					select {
+					case <-timer.C:
+					default:
+					}
+				}
+				timer.Reset(floor)
+				deadline = time.Now().Add(floor)
+			}
+		}
+	}
+}
+
+// normalizePath resolves symlinks so registry cwds and session cwds compare
+// equal (macOS /tmp vs /private/tmp); a path that fails to resolve still
+// compares by its cleaned literal form.
+func normalizePath(p string) string {
+	if r, err := filepath.EvalSymlinks(p); err == nil {
+		return r
+	}
+	return filepath.Clean(p)
+}
+
+// normalizeActivity keeps the two observed values and maps anything else to
+// absent: status is observed-not-enumerated, so an unknown value must read as
+// "no signal", never as a new state (R3/R7).
+func normalizeActivity(status string) string {
+	if status == "busy" || status == "idle" {
+		return status
+	}
+	return ""
+}
+
+// reachesAncestor walks pid→ppid a bounded number of hops. The bound doubles
+// as the cycle guard: a torn ps snapshot can loop, and ten hops comfortably
+// covers the observed launcher → server → session depth of two.
+func reachesAncestor(ps map[int]int, pid, ancestor int) bool {
+	if pid <= 0 || ancestor <= 0 {
+		return false
+	}
+	for i := 0; i <= maxAncestryDepth; i++ {
+		if pid == ancestor {
+			return true
+		}
+		next, ok := ps[pid]
+		if !ok || next == pid || next <= 0 {
+			return false
+		}
+		pid = next
+	}
+	return false
+}
+
+// extraRow is one tick's sighting of a non-primary registry row.
+type extraRow struct {
+	key    string // stable identity for wall-clock aging
+	name   string
+	status string
+}
+
+// regJoin is one session's slice of a tick's join result.
+type regJoin struct {
+	rowSeen  bool
+	uuid     string
+	activity string
+	extras   []extraRow
+}
+
+// joinRegistry is the pure per-tick join over (session snapshots, registry
+// rows, pid→ppid map); cwds must be pre-normalized. Row ownership resolves in
+// order of contract strength: a row carrying a session's captured UUID is
+// that session; otherwise a row belongs to the launch whose spawned pid its
+// ancestry walk reaches; with no ps map at all, a cwd+startedAt pair may bind
+// only when it is unambiguous from both sides — a wrong guess here would be
+// journaled forever, so ambiguity means no capture. The primary row is the
+// earliest-started owned row; later owned rows and unowned rows in a
+// session's folder surface as extras ("in this folder"), never as joins.
+func joinRegistry(snaps []regSessionSnap, rows []claudex.Agent, ps map[int]int) map[string]*regJoin {
+	joins := make(map[string]*regJoin, len(snaps))
+	for i := range snaps {
+		joins[snaps[i].id] = &regJoin{}
+	}
+	owner := make([]int, len(rows)) // row index → snap index, -1 unowned
+	for i := range owner {
+		owner[i] = -1
+	}
+	for ri := range rows {
+		if rows[ri].SessionID == "" {
+			continue
+		}
+		for si := range snaps {
+			if snaps[si].uuid != "" && snaps[si].uuid == rows[ri].SessionID {
+				owner[ri] = si
+				break
+			}
+		}
+	}
+	if ps != nil {
+		for ri := range rows {
+			if owner[ri] != -1 {
+				continue
+			}
+			for si := range snaps {
+				if reachesAncestor(ps, rows[ri].PID, snaps[si].pid) {
+					owner[ri] = si
+					break
+				}
+			}
+		}
+	} else {
+		rowCands := make([][]int, len(rows))
+		snapCands := make([][]int, len(snaps))
+		for ri := range rows {
+			if owner[ri] != -1 {
+				continue
+			}
+			for si := range snaps {
+				if rows[ri].Cwd == snaps[si].cwd && rows[ri].StartedAt >= snaps[si].startedAt.UnixMilli() {
+					rowCands[ri] = append(rowCands[ri], si)
+					snapCands[si] = append(snapCands[si], ri)
+				}
+			}
+		}
+		for ri := range rows {
+			if owner[ri] == -1 && len(rowCands[ri]) == 1 && len(snapCands[rowCands[ri][0]]) == 1 {
+				owner[ri] = rowCands[ri][0]
+			}
+		}
+	}
+
+	for si := range snaps {
+		var owned []int
+		for ri := range rows {
+			if owner[ri] == si {
+				owned = append(owned, ri)
+			}
+		}
+		if len(owned) == 0 {
+			continue
+		}
+		sort.Slice(owned, func(a, b int) bool {
+			if rows[owned[a]].StartedAt != rows[owned[b]].StartedAt {
+				return rows[owned[a]].StartedAt < rows[owned[b]].StartedAt
+			}
+			return rows[owned[a]].PID < rows[owned[b]].PID
+		})
+		j := joins[snaps[si].id]
+		primary := rows[owned[0]]
+		j.rowSeen = true
+		j.uuid = primary.SessionID
+		j.activity = normalizeActivity(primary.Status)
+		for _, ri := range owned[1:] {
+			j.extras = append(j.extras, extraRowOf(rows[ri]))
+		}
+	}
+	// unowned rows in a session's folder are visible as extras on every
+	// same-cwd launch — a row owned by launch A never bleeds into B's list
+	for ri := range rows {
+		if owner[ri] != -1 {
+			continue
+		}
+		for si := range snaps {
+			if rows[ri].Cwd == snaps[si].cwd {
+				j := joins[snaps[si].id]
+				j.extras = append(j.extras, extraRowOf(rows[ri]))
+			}
+		}
+	}
+	return joins
+}
+
+func extraRowOf(a claudex.Agent) extraRow {
+	key := a.SessionID
+	if key == "" {
+		key = a.Name
+	}
+	if key == "" {
+		key = strconv.Itoa(a.PID)
+	}
+	return extraRow{key: key, name: a.Name, status: normalizeActivity(a.Status)}
+}
+
+type claudeIDCapture struct {
+	id, uuid string
+}
+
+// extraRecord is the aging state behind one ExtraSession row.
+type extraRecord struct {
+	name, status string
+	seen         time.Time
+}
+
+// applyRegistryTick writes one successful tick's join into the live table
+// under a single lock acquisition. The state guard re-checks each session's
+// state here because the registry snapshot predates this lock: a session that
+// exited in between takes no writes at all — activity must never resurrect on
+// a dead card, and a reaped pid can already belong to a stranger, so even a
+// first UUID capture is dropped.
+func (m *Manager) applyRegistryTick(snaps []regSessionSnap, joins map[string]*regJoin, window time.Duration, now time.Time) []claudeIDCapture {
+	captures := []claudeIDCapture{}
+	m.mu.Lock()
+	defer m.mu.Unlock()
+	for i := range snaps {
+		s, ok := m.sessions[snaps[i].id]
+		if !ok || (s.State != StateStarting && s.State != StateReady) {
+			continue
+		}
+		j := joins[snaps[i].id]
+		if j == nil {
+			continue
+		}
+		if j.rowSeen {
+			if j.activity != "" {
+				a := j.activity
+				s.Activity = &a
+			} else {
+				s.Activity = nil // unknown status value reads as absent, not as an error
+			}
+			s.activitySeenAt = now
+			if j.uuid != "" {
+				switch {
+				case s.ClaudeSessionID == nil:
+					u := j.uuid
+					s.ClaudeSessionID = &u
+					captures = append(captures, claudeIDCapture{id: s.ID, uuid: u})
+				case *s.ClaudeSessionID != j.uuid && !s.claudeIDConflictLogged:
+					// first capture wins — the journal already carries it;
+					// log the disagreement once, not on every tick
+					s.claudeIDConflictLogged = true
+					log.Printf("sessions: registry sessionId %s disagrees with captured %s for session %s — keeping the first capture", j.uuid, *s.ClaudeSessionID, s.ID)
+				}
+			}
+		} else {
+			// the registry answered and this session's row is gone: absence
+			// is authoritative — clear now, no grace (R3's no-stale rule)
+			s.Activity = nil
+		}
+		if s.extrasSeen == nil {
+			s.extrasSeen = map[string]extraRecord{}
+		}
+		for _, e := range j.extras {
+			s.extrasSeen[e.key] = extraRecord{name: e.name, status: e.status, seen: now}
+		}
+		s.refreshExtrasLocked(window, now)
+	}
+	return captures
+}
+
+// ageRegistryState is the failed-tick path: nothing joined, so activity and
+// extras ride out the wall-clock grace window and then clear — degrade to
+// absence, never to a stale answer (R3).
+func (m *Manager) ageRegistryState(window time.Duration, now time.Time) {
+	m.mu.Lock()
+	defer m.mu.Unlock()
+	for _, s := range m.sessions {
+		if s.State != StateStarting && s.State != StateReady {
+			continue
+		}
+		if s.Activity != nil && now.Sub(s.activitySeenAt) > window {
+			s.Activity = nil
+		}
+		s.refreshExtrasLocked(window, now)
+	}
+}
+
+// refreshExtrasLocked rebuilds the wire slice from the sighting map, dropping
+// entries unconfirmed past the window. Always a fresh slice: Session
+// snapshots escape the lock, so a slice already handed out must stay
+// immutable. Caller holds m.mu.
+func (s *liveSession) refreshExtrasLocked(window time.Duration, now time.Time) {
+	for k, rec := range s.extrasSeen {
+		if now.Sub(rec.seen) > window {
+			delete(s.extrasSeen, k)
+		}
+	}
+	if len(s.extrasSeen) == 0 {
+		s.ExtraSessions = nil
+		return
+	}
+	out := make([]ExtraSession, 0, len(s.extrasSeen))
+	for _, rec := range s.extrasSeen {
+		out = append(out, ExtraSession{Name: rec.name, Status: rec.status})
+	}
+	sort.Slice(out, func(a, b int) bool { return out[a].Name < out[b].Name })
+	s.ExtraSessions = out
+}

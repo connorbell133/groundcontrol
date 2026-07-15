@@ -374,7 +374,7 @@ func TestApplyRegistryTickFirstCaptureWins(t *testing.T) {
 	window := time.Minute
 	snaps := []regSessionSnap{{id: "s1"}}
 
-	captures := m.applyRegistryTick(snaps, map[string]*regJoin{"s1": {rowSeen: true, uuid: "conv-1", activity: "busy"}}, window, now)
+	captures, _ := m.applyRegistryTick(snaps, map[string]*regJoin{"s1": {rowSeen: true, uuid: "conv-1", activity: "busy"}}, window, now)
 	if len(captures) != 1 || captures[0].uuid != "conv-1" {
 		t.Fatalf("first tick should capture conv-1, got %+v", captures)
 	}
@@ -387,7 +387,7 @@ func TestApplyRegistryTickFirstCaptureWins(t *testing.T) {
 	}
 
 	// a later disagreeing sessionId never overwrites and never re-captures
-	captures = m.applyRegistryTick(snaps, map[string]*regJoin{"s1": {rowSeen: true, uuid: "conv-2", activity: "idle"}}, window, now.Add(time.Second))
+	captures, _ = m.applyRegistryTick(snaps, map[string]*regJoin{"s1": {rowSeen: true, uuid: "conv-2", activity: "idle"}}, window, now.Add(time.Second))
 	if len(captures) != 0 {
 		t.Errorf("disagreement must not produce a capture: %+v", captures)
 	}
@@ -410,11 +410,14 @@ func TestApplyRegistryTickStateGuard(t *testing.T) {
 	for _, state := range []State{StateExited, StateError} {
 		id := "dead-" + string(state)
 		insertLive(t, m, id, "/w/a", state)
-		captures := m.applyRegistryTick(
+		captures, scans := m.applyRegistryTick(
 			[]regSessionSnap{{id: id}},
 			map[string]*regJoin{id: {rowSeen: true, uuid: "conv-late", activity: "busy", extras: []extraRow{{key: "k", name: "n"}}}},
 			time.Minute, time.Now(),
 		)
+		if len(scans) != 0 {
+			t.Errorf("%s: non-live session produced scan work: %+v", state, scans)
+		}
 		if len(captures) != 0 {
 			t.Errorf("%s: capture on a non-live session (pid-reuse hazard): %+v", state, captures)
 		}

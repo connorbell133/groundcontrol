@@ -76,6 +76,7 @@ type Session struct {
 	ClaudeSessionID *string        `json:"claudeSessionId,omitempty"`
 	Activity        *string        `json:"activity,omitempty"`
 	ExtraSessions   []ExtraSession `json:"extraSessions,omitempty"`
+	PRLink          *PRLink        `json:"prLink,omitempty"`
 	Debrief         *Debrief       `json:"debrief,omitempty"`
 }
 
@@ -119,6 +120,7 @@ type liveSession struct {
 	extrasSeen             map[string]extraRecord // last sighting per extra row, for wall-clock aging
 	activitySeenAt         time.Time              // last successful registry confirm of Activity
 	claudeIDConflictLogged bool                   // a disagreeing later sessionId is logged once, not per tick
+	prStatSize             int64                  // transcript size at the last pr-link scan (stat-gate)
 }
 
 // Manager owns the live session table. Lost-session and recent-launch views

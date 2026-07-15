@@ -182,12 +182,13 @@ func (m *Manager) registryLoop(ctx context.Context) {
 				normRows[i].Cwd = normalizePath(normRows[i].Cwd)
 			}
 			joins := joinRegistry(snaps, normRows, ps)
-			captures := m.applyRegistryTick(snaps, joins, retentionWindow(interval), now)
+			captures, scans := m.applyRegistryTick(snaps, joins, retentionWindow(interval), now)
 			for _, c := range captures {
 				// journaled, never announced: the UUID is a durable fact the
 				// UI polls for, not a lifecycle event to fan out (R8)
 				m.journal.Append(map[string]any{"event": evSessionClaudeID, "id": c.id, "claudeSessionId": c.uuid})
 			}
+			m.applyPRLinks(scans)
 		}
 
 		if !sleepInterrupt(ctx, m.regWake, jittered(interval), registryFastInterval) {
@@ -481,13 +482,15 @@ type extraRecord struct {
 }
 
 // applyRegistryTick writes one successful tick's join into the live table
-// under a single lock acquisition. The state guard re-checks each session's
+// under a single lock acquisition, and collects the transcript-scan inputs
+// for the pr-link metadata pass. The state guard re-checks each session's
 // state here because the registry snapshot predates this lock: a session that
 // exited in between takes no writes at all — activity must never resurrect on
 // a dead card, and a reaped pid can already belong to a stranger, so even a
 // first UUID capture is dropped.
-func (m *Manager) applyRegistryTick(snaps []regSessionSnap, joins map[string]*regJoin, window time.Duration, now time.Time) []claudeIDCapture {
+func (m *Manager) applyRegistryTick(snaps []regSessionSnap, joins map[string]*regJoin, window time.Duration, now time.Time) ([]claudeIDCapture, []prScanInput) {
 	captures := []claudeIDCapture{}
+	scans := []prScanInput{}
 	m.mu.Lock()
 	defer m.mu.Unlock()
 	for i := range snaps {
@@ -532,8 +535,58 @@ func (m *Manager) applyRegistryTick(snaps []regSessionSnap, joins map[string]*re
 			s.extrasSeen[e.key] = extraRecord{name: e.name, status: e.status, seen: now}
 		}
 		s.refreshExtrasLocked(window, now)
+		if s.ClaudeSessionID != nil {
+			// the transcript filename is exactly the captured conversation
+			// UUID inside the launch cwd's munged project dir (transcripts.go)
+			scans = append(scans, prScanInput{
+				id:       s.ID,
+				path:     filepath.Join(claudeProjectsDir, claudeProjectDirName(s.cwd), *s.ClaudeSessionID+".jsonl"),
+				lastSize: s.prStatSize,
+			})
+		}
 	}
-	return captures
+	return captures, scans
+}
+
+// prScanInput is one session's pr-link scan work order for a tick.
+type prScanInput struct {
+	id       string
+	path     string
+	lastSize int64
+}
+
+// applyPRLinks runs the transcript metadata pass for sessions with a captured
+// UUID: the stat/scan I/O happens outside the lock, then one lock acquisition
+// writes under the same state guard as every other registry write. A rescan's
+// answer is authoritative for the file — including nil, so a vanished record
+// (or a vanished transcript) clears the link rather than pinning a stale one.
+func (m *Manager) applyPRLinks(scans []prScanInput) {
+	if len(scans) == 0 {
+		return
+	}
+	type prResult struct {
+		id        string
+		link      *PRLink
+		size      int64
+		rescanned bool
+	}
+	results := make([]prResult, 0, len(scans))
+	for _, in := range scans {
+		link, size, rescanned := prLinkFromTranscript(in.path, in.lastSize)
+		results = append(results, prResult{id: in.id, link: link, size: size, rescanned: rescanned})
+	}
+	m.mu.Lock()
+	defer m.mu.Unlock()
+	for _, r := range results {
+		s, ok := m.sessions[r.id]
+		if !ok || (s.State != StateStarting && s.State != StateReady) {
+			continue
+		}
+		s.prStatSize = r.size
+		if r.rescanned {
+			s.PRLink = r.link
+		}
+	}
 }
 
 // ageRegistryState is the failed-tick path: nothing joined, so activity and

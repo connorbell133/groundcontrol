@@ -475,9 +475,10 @@ func (s *Server) Handler() http.Handler {
 
 	mux.HandleFunc("GET /sessions", need(scopeRead, func(w http.ResponseWriter, r *http.Request) {
 		WriteJSON(w, 200, struct {
-			Sessions []sessions.Session     `json:"sessions"`
-			Lost     []sessions.LostSession `json:"lost"`
-		}{nonNil(s.sessions.List()), nonNil(s.sessions.ListLost())})
+			Sessions []sessions.Session       `json:"sessions"`
+			Lost     []sessions.LostSession   `json:"lost"`
+			Landed   []sessions.LandedSession `json:"landed"`
+		}{nonNil(s.sessions.List()), nonNil(s.sessions.ListLost()), nonNil(s.sessions.ListLanded())})
 	}))
 
 	mux.HandleFunc("GET /journal/recent", need(scopeRead, func(w http.ResponseWriter, r *http.Request) {

@@ -85,3 +85,82 @@ func TestResolveBranch(t *testing.T) {
 		t.Error("BranchExists should see remote-only branches")
 	}
 }
+
+func TestDiffStat(t *testing.T) {
+	t.Parallel()
+	repo := testutil.InitRepo(t)
+	testutil.MustGit(t, repo, "switch", "-c", "work")
+
+	// nothing since branching → all zeros
+	st, err := DiffStat(repo, "main")
+	if err != nil {
+		t.Fatal(err)
+	}
+	if st != (DiffStats{}) {
+		t.Errorf("clean branch DiffStat = %+v, want zeros", st)
+	}
+
+	// one committed two-line file vs the base
+	if err := os.WriteFile(filepath.Join(repo, "feat.txt"), []byte("one\ntwo\n"), 0o644); err != nil {
+		t.Fatal(err)
+	}
+	testutil.MustGit(t, repo, "add", ".")
+	testutil.MustGit(t, repo, "commit", "-m", "feat")
+	st, err = DiffStat(repo, "main")
+	if err != nil {
+		t.Fatal(err)
+	}
+	if st != (DiffStats{FilesChanged: 1, Insertions: 2}) {
+		t.Errorf("committed change DiffStat = %+v, want 1 file / 2 insertions", st)
+	}
+
+	// an untracked file counts as uncommitted but never in the diff stat
+	scratch := filepath.Join(repo, "scratch.txt")
+	if err := os.WriteFile(scratch, []byte("wip\n"), 0o644); err != nil {
+		t.Fatal(err)
+	}
+	st, err = DiffStat(repo, "main")
+	if err != nil {
+		t.Fatal(err)
+	}
+	if st != (DiffStats{FilesChanged: 1, Insertions: 2, Uncommitted: 1}) {
+		t.Errorf("untracked file DiffStat = %+v, want uncommitted 1", st)
+	}
+	if err := os.Remove(scratch); err != nil {
+		t.Fatal(err)
+	}
+
+	// upstream moves on and the branch merges it in: only the branch's own
+	// change counts, because the stat measures from the merge-base
+	testutil.MustGit(t, repo, "switch", "main")
+	testutil.CommitFile(t, repo, "upstream.txt", "upstream work", "")
+	testutil.MustGit(t, repo, "switch", "work")
+	testutil.MustGit(t, repo, "merge", "main")
+	st, err = DiffStat(repo, "main")
+	if err != nil {
+		t.Fatal(err)
+	}
+	if st != (DiffStats{FilesChanged: 1, Insertions: 2}) {
+		t.Errorf("post-merge DiffStat = %+v, want only the branch's own change", st)
+	}
+
+	// an uncommitted tracked edit shows in both the diff stat and the count
+	if err := os.WriteFile(filepath.Join(repo, "readme.txt"), []byte("changed\n"), 0o644); err != nil {
+		t.Fatal(err)
+	}
+	st, err = DiffStat(repo, "main")
+	if err != nil {
+		t.Fatal(err)
+	}
+	if st != (DiffStats{FilesChanged: 2, Insertions: 3, Deletions: 1, Uncommitted: 1}) {
+		t.Errorf("dirty tracked edit DiffStat = %+v", st)
+	}
+
+	// failures surface as errors so callers can degrade to an absent debrief
+	if _, err := DiffStat(testutil.ResolvedTempDir(t), "main"); err == nil {
+		t.Error("DiffStat outside a repo must error")
+	}
+	if _, err := DiffStat(repo, "no-such-base"); err == nil {
+		t.Error("DiffStat with an unknown base must error")
+	}
+}

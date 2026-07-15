@@ -386,6 +386,193 @@ func TestSessionInitialPromptLifecycle(t *testing.T) {
 	createSession(t, env, string(payload))
 }
 
+// waitForExitEntry polls for the session.exit journal entry: the exit
+// lifecycle (debrief, worktree cleanup, journal write) runs after the state
+// flips to exited, so killAndWait alone doesn't guarantee it has landed.
+func waitForExitEntry(t *testing.T, env *testEnv, id string) map[string]any {
+	t.Helper()
+	deadline := time.Now().Add(10 * time.Second)
+	for time.Now().Before(deadline) {
+		for _, e := range env.journal.Read() {
+			if e["event"] == "session.exit" && e["id"] == id {
+				return e
+			}
+		}
+		time.Sleep(20 * time.Millisecond)
+	}
+	t.Fatalf("no session.exit journal entry for %s", id)
+	return nil
+}
+
+// createWorktreeSession launches a fake-claude worktree session off main and
+// waits for it to pair, returning the session and its worktree path.
+func createWorktreeSession(t *testing.T, env *testEnv, folder, name string) (sessions.Session, string) {
+	t.Helper()
+	created := createSession(t, env, fmt.Sprintf(`{"folder":%q,"name":%q,"spawnMode":"worktree","branch":"main"}`, folder, name))
+	if created.WorktreePath == nil || *created.WorktreePath == "" {
+		t.Fatal("worktree session missing worktreePath")
+	}
+	if outcome := env.sessions.WaitForReady(created.ID, 10*time.Second); outcome != "ready" {
+		t.Fatalf("WaitForReady = %q, want ready", outcome)
+	}
+	return created, *created.WorktreePath
+}
+
+func TestSessionExitDebriefInOrbit(t *testing.T) {
+	testutil.FakeClaude(t)
+	repo := testutil.InitRepo(t)
+	env := newTestEnv(t, config.Config{Roots: []string{repo}})
+
+	created, wt := createWorktreeSession(t, env, repo, "orbit")
+
+	// the run's work: one committed two-line file in the worktree
+	if err := os.WriteFile(filepath.Join(wt, "feat.txt"), []byte("one\ntwo\n"), 0o644); err != nil {
+		t.Fatal(err)
+	}
+	testutil.MustGit(t, wt, "add", ".")
+	testutil.MustGit(t, wt, "commit", "-m", "feat")
+
+	killAndWait(t, env, created.ID)
+	exit := waitForExitEntry(t, env, created.ID)
+	if exit["branchState"] != "in-orbit" {
+		t.Errorf("journal branchState = %v, want in-orbit", exit["branchState"])
+	}
+	if exit["filesChanged"] != float64(1) || exit["insertions"] != float64(2) || exit["deletions"] != float64(0) || exit["uncommitted"] != float64(0) {
+		t.Errorf("journal debrief fields wrong: %v", exit)
+	}
+
+	// the session object carries the same debrief
+	s := env.sessions.Get(created.ID)
+	if s == nil || s.Debrief == nil {
+		t.Fatalf("exited session missing debrief: %+v", s)
+	}
+	if s.Debrief.FilesChanged != 1 || s.Debrief.Insertions != 2 || s.Debrief.BranchState != "in-orbit" {
+		t.Errorf("session debrief = %+v", s.Debrief)
+	}
+	// worktree cleaned, branch kept in orbit
+	if _, err := os.Stat(wt); !os.IsNotExist(err) {
+		t.Errorf("worktree should be removed after a clean exit")
+	}
+	if out := testutil.MustGit(t, repo, "branch", "--list", "gc/*"); out == "" {
+		t.Error("gc/ branch with commits should survive the exit")
+	}
+
+	// while the exited session is still listed, landed must not double-report it
+	rec := doReq(t, env.handler, "GET", "/sessions", "", nil)
+	var list struct {
+		Sessions []sessions.Session       `json:"sessions"`
+		Landed   []sessions.LandedSession `json:"landed"`
+	}
+	if err := json.Unmarshal(rec.Body.Bytes(), &list); err != nil {
+		t.Fatal(err)
+	}
+	if len(list.Landed) != 0 {
+		t.Errorf("landed must exclude sessions the manager still lists: %+v", list.Landed)
+	}
+
+	// dismissing the record surfaces the journal-derived landed entry
+	if rec := doReq(t, env.handler, "DELETE", "/sessions/"+created.ID+"/record", "", nil); rec.Code != 200 {
+		t.Fatalf("dismiss = %d: %s", rec.Code, rec.Body.String())
+	}
+	rec = doReq(t, env.handler, "GET", "/sessions", "", nil)
+	if err := json.Unmarshal(rec.Body.Bytes(), &list); err != nil {
+		t.Fatal(err)
+	}
+	if len(list.Landed) != 1 || list.Landed[0].ID != created.ID {
+		t.Fatalf("landed after dismissal = %+v", list.Landed)
+	}
+	l := list.Landed[0]
+	if l.Debrief == nil || l.Debrief.BranchState != "in-orbit" || l.Debrief.FilesChanged != 1 || l.Debrief.Insertions != 2 {
+		t.Errorf("landed debrief = %+v", l.Debrief)
+	}
+	if l.Name != "orbit" || l.Folder != repo || l.SpawnMode != "worktree" || l.StartedAt == "" || l.ExitedAt == "" {
+		t.Errorf("landed entry = %+v", l)
+	}
+	if l.ExitCode == nil || *l.ExitCode != 1 {
+		t.Errorf("landed exitCode = %v, want 1 (signal-killed)", l.ExitCode)
+	}
+}
+
+func TestSessionExitDebriefMergedOnCleanExit(t *testing.T) {
+	testutil.FakeClaude(t)
+	repo := testutil.InitRepo(t)
+	env := newTestEnv(t, config.Config{Roots: []string{repo}})
+
+	created, wt := createWorktreeSession(t, env, repo, "no-commits")
+	killAndWait(t, env, created.ID)
+	exit := waitForExitEntry(t, env, created.ID)
+	if exit["branchState"] != "merged" {
+		t.Errorf("journal branchState = %v, want merged", exit["branchState"])
+	}
+	if exit["filesChanged"] != float64(0) || exit["uncommitted"] != float64(0) {
+		t.Errorf("no-work exit should report zeros: %v", exit)
+	}
+	if _, err := os.Stat(wt); !os.IsNotExist(err) {
+		t.Errorf("worktree should be removed")
+	}
+	if out := testutil.MustGit(t, repo, "branch", "--list", "gc/*"); out != "" {
+		t.Errorf("commit-less gc/ branch should be deleted, still have %q", out)
+	}
+}
+
+func TestSessionExitDebriefWorktreeKept(t *testing.T) {
+	testutil.FakeClaude(t)
+	repo := testutil.InitRepo(t)
+	env := newTestEnv(t, config.Config{Roots: []string{repo}})
+
+	created, wt := createWorktreeSession(t, env, repo, "dirty")
+	// an untracked file makes the worktree unremovable without --force
+	if err := os.WriteFile(filepath.Join(wt, "wip.txt"), []byte("half-done\n"), 0o644); err != nil {
+		t.Fatal(err)
+	}
+	killAndWait(t, env, created.ID)
+	exit := waitForExitEntry(t, env, created.ID)
+	if exit["branchState"] != "worktree-kept" {
+		t.Errorf("journal branchState = %v, want worktree-kept", exit["branchState"])
+	}
+	if exit["uncommitted"] != float64(1) || exit["filesChanged"] != float64(0) {
+		t.Errorf("dirty exit debrief fields wrong: %v", exit)
+	}
+	if _, err := os.Stat(wt); err != nil {
+		t.Errorf("dirty worktree must be kept on disk: %v", err)
+	}
+	s := env.sessions.Get(created.ID)
+	if s == nil || s.Debrief == nil || s.Debrief.BranchState != "worktree-kept" {
+		t.Errorf("session debrief = %+v", s)
+	}
+}
+
+func TestSessionExitDebriefAbsentOnGitFailure(t *testing.T) {
+	testutil.FakeClaude(t)
+	repo := testutil.InitRepo(t)
+	env := newTestEnv(t, config.Config{Roots: []string{repo}})
+
+	created, wt := createWorktreeSession(t, env, repo, "broken")
+	// nuking the worktree makes every exit-path git call fail
+	if err := os.RemoveAll(wt); err != nil {
+		t.Fatal(err)
+	}
+	killAndWait(t, env, created.ID)
+	exit := waitForExitEntry(t, env, created.ID)
+	if _, ok := exit["branchState"]; ok {
+		t.Errorf("failed git work must not journal debrief fields: %v", exit)
+	}
+	s := env.sessions.Get(created.ID)
+	if s == nil {
+		t.Fatal("session record gone")
+	}
+	if s.Debrief != nil {
+		t.Errorf("debrief should be absent on git failure: %+v", s.Debrief)
+	}
+	if s.State != sessions.StateExited {
+		t.Errorf("teardown must complete despite git failure; state = %s", s.State)
+	}
+	rec := doReq(t, env.handler, "GET", "/sessions/"+created.ID, "", nil)
+	if strings.Contains(rec.Body.String(), "debrief") {
+		t.Errorf("debrief key must be absent when not captured: %s", rec.Body.String())
+	}
+}
+
 func TestSessionWithoutInitialPrompt(t *testing.T) {
 	testutil.FakeClaude(t)
 	root := testutil.ResolvedTempDir(t)
@@ -603,7 +790,7 @@ func TestEmptyListsMarshalAsArrays(t *testing.T) {
 		target string
 		want   []string
 	}{
-		{"/sessions", []string{`"sessions":[]`, `"lost":[]`}},
+		{"/sessions", []string{`"sessions":[]`, `"lost":[]`, `"landed":[]`}},
 		{"/jobs", []string{`"jobs":[]`}},
 		{"/worktrees", []string{`"worktrees":[]`}},
 		{"/config", []string{`"webhooks":[]`}},

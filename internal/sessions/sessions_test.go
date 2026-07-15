@@ -1,6 +1,7 @@
 package sessions
 
 import (
+	"fmt"
 	"os"
 	"path/filepath"
 	"strings"
@@ -154,6 +155,117 @@ func TestRecentLaunchesInitialPrompt(t *testing.T) {
 	}
 	if out[1].InitialPrompt == nil || *out[1].InitialPrompt != prompt {
 		t.Errorf("prompted launch = %+v, want initialPrompt %q", out[1], prompt)
+	}
+}
+
+func TestBranchStateAfterRemove(t *testing.T) {
+	t.Parallel()
+	repo := testutil.InitRepo(t)
+	gonePath := filepath.Join(repo, "no-such-worktree")
+
+	// a surviving worktree directory wins over any ref inspection
+	if got := branchStateAfterRemove(repo, repo, "gc/x"); got != branchWorktreeKept {
+		t.Errorf("existing path = %q, want %q", got, branchWorktreeKept)
+	}
+
+	// branch deleted by cleanup: nothing beyond the base survives
+	if got := branchStateAfterRemove(repo, gonePath, "gc/deleted"); got != branchMerged {
+		t.Errorf("missing branch = %q, want %q", got, branchMerged)
+	}
+
+	// branch with a commit main lacks
+	testutil.MustGit(t, repo, "switch", "-c", "gc/orbit")
+	testutil.CommitFile(t, repo, "orbit.txt", "orbit work", "")
+	testutil.MustGit(t, repo, "switch", "main")
+	if got := branchStateAfterRemove(repo, gonePath, "gc/orbit"); got != branchInOrbit {
+		t.Errorf("unmerged branch = %q, want %q", got, branchInOrbit)
+	}
+
+	// once merged into the default branch it stops being in orbit
+	testutil.MustGit(t, repo, "merge", "gc/orbit")
+	if got := branchStateAfterRemove(repo, gonePath, "gc/orbit"); got != branchMerged {
+		t.Errorf("merged branch = %q, want %q", got, branchMerged)
+	}
+}
+
+func TestListLanded(t *testing.T) {
+	t.Parallel()
+	root := testutil.ResolvedTempDir(t)
+	m := testManager(t, []string{root})
+
+	// worktree session whose exit entry carries a debrief
+	m.journal.Append(map[string]any{"event": evSessionStart, "id": "w1", "name": "wt", "folder": root, "spawnMode": "worktree", "branch": "main", "permissionMode": "acceptEdits", "initialPrompt": "fix it"})
+	m.journal.Append(map[string]any{"event": evSessionExit, "id": "w1", "code": 0, "filesChanged": 2, "insertions": 5, "deletions": 1, "uncommitted": 1, "branchState": "in-orbit"})
+	// same-dir session: no debrief fields on the exit entry
+	m.journal.Append(map[string]any{"event": evSessionStart, "id": "s1", "name": "plain", "folder": root})
+	m.journal.Append(map[string]any{"event": evSessionExit, "id": "s1", "code": 1})
+	// never exited → not landed (it's lost or live, not landed)
+	m.journal.Append(map[string]any{"event": evSessionStart, "id": "r1", "name": "running", "folder": root})
+	// exited but the manager still lists it → excluded, it's already in "sessions"
+	m.journal.Append(map[string]any{"event": evSessionStart, "id": "live1", "name": "listed", "folder": root})
+	m.journal.Append(map[string]any{"event": evSessionExit, "id": "live1", "code": 0})
+	m.mu.Lock()
+	m.sessions["live1"] = &liveSession{Session: Session{ID: "live1", State: StateExited}}
+	m.mu.Unlock()
+	// folder outside the configured roots → excluded
+	m.journal.Append(map[string]any{"event": evSessionStart, "id": "out1", "name": "outside", "folder": "/definitely/not/in/roots"})
+	m.journal.Append(map[string]any{"event": evSessionExit, "id": "out1", "code": 0})
+
+	landed := m.ListLanded()
+	if len(landed) != 2 {
+		t.Fatalf("expected 2 landed sessions, got %+v", landed)
+	}
+	// newest start first
+	if landed[0].ID != "s1" || landed[1].ID != "w1" {
+		t.Fatalf("unexpected order: %+v", landed)
+	}
+	s1 := landed[0]
+	if s1.Debrief != nil {
+		t.Errorf("same-dir session carries a debrief: %+v", s1.Debrief)
+	}
+	if s1.SpawnMode != string(workspace.SpawnSameDir) || s1.PermissionMode != "default" {
+		t.Errorf("defaults not applied: %+v", s1)
+	}
+	if s1.ExitCode == nil || *s1.ExitCode != 1 {
+		t.Errorf("s1 exitCode = %v, want 1", s1.ExitCode)
+	}
+	w1 := landed[1]
+	if w1.Debrief == nil {
+		t.Fatalf("worktree session missing debrief: %+v", w1)
+	}
+	if w1.Debrief.FilesChanged != 2 || w1.Debrief.Insertions != 5 || w1.Debrief.Deletions != 1 || w1.Debrief.Uncommitted != 1 || w1.Debrief.BranchState != "in-orbit" {
+		t.Errorf("w1 debrief = %+v", w1.Debrief)
+	}
+	if w1.InitialPrompt == nil || *w1.InitialPrompt != "fix it" {
+		t.Errorf("w1 initialPrompt = %v", w1.InitialPrompt)
+	}
+	if w1.Branch == nil || *w1.Branch != "main" || w1.SpawnMode != "worktree" || w1.PermissionMode != "acceptEdits" {
+		t.Errorf("w1 launch config = %+v", w1)
+	}
+	if w1.StartedAt == "" || w1.ExitedAt == "" {
+		t.Errorf("w1 timestamps missing: %+v", w1)
+	}
+	if w1.ExitCode == nil || *w1.ExitCode != 0 {
+		t.Errorf("w1 exitCode = %v, want 0", w1.ExitCode)
+	}
+}
+
+func TestListLandedCap(t *testing.T) {
+	t.Parallel()
+	root := testutil.ResolvedTempDir(t)
+	m := testManager(t, []string{root})
+	for i := 0; i < landedCap+5; i++ {
+		id := fmt.Sprintf("id-%02d", i)
+		m.journal.Append(map[string]any{"event": evSessionStart, "id": id, "name": id, "folder": root})
+		m.journal.Append(map[string]any{"event": evSessionExit, "id": id, "code": 0})
+	}
+	landed := m.ListLanded()
+	if len(landed) != landedCap {
+		t.Fatalf("expected cap of %d, got %d", landedCap, len(landed))
+	}
+	// newest first: the last-started session leads, the oldest five fall off
+	if landed[0].ID != fmt.Sprintf("id-%02d", landedCap+4) || landed[landedCap-1].ID != "id-05" {
+		t.Errorf("unexpected window: first %s, last %s", landed[0].ID, landed[landedCap-1].ID)
 	}
 }
 

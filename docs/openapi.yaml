@@ -116,6 +116,53 @@ components:
         exitCode: { type: [integer, "null"] }
         lastOutputAt: { type: [string, "null"], format: date-time }
         lastLine: { type: [string, "null"], description: "Last meaningful log line, ≤120 chars." }
+        debrief: { $ref: "#/components/schemas/Debrief" }
+
+    Debrief:
+      type: object
+      description: >
+        Exit-time record of what a worktree session left behind, captured
+        before the worktree is cleaned up. Absent for same-dir sessions, and
+        (best-effort) whenever git failed at exit time. Diff stats are
+        measured from the merge-base with the launch base, so upstream work
+        merged into the worktree doesn't count as the run's own; uncommitted
+        edits do count.
+      required: [filesChanged, insertions, deletions, uncommitted, branchState]
+      properties:
+        filesChanged: { type: integer }
+        insertions: { type: integer }
+        deletions: { type: integer }
+        uncommitted: { type: integer, description: "Paths with uncommitted changes (git status --porcelain) at exit." }
+        branchState:
+          type: string
+          enum: [merged, in-orbit, worktree-kept]
+          description: >
+            merged — the gc/ branch is gone or its tip is reachable from the
+            default branch; in-orbit — the branch survived with commits the
+            default branch lacks; worktree-kept — the worktree was dirty and
+            kept on disk, branch intact.
+
+    LandedSession:
+      type: object
+      description: >
+        A finished session reconstructed from its session.start/session.exit
+        journal pair — debriefs that survive runner restarts. Sessions still
+        listed under "sessions" (live, or exited but not yet dismissed) are
+        excluded. Newest exits first, capped at 20, 7-day window, scoped to
+        the configured roots.
+      required: [id, name, folder, branch, spawnMode, permissionMode, initialPrompt, startedAt, exitedAt, exitCode]
+      properties:
+        id: { type: string }
+        name: { type: string }
+        folder: { type: string }
+        branch: { type: [string, "null"] }
+        spawnMode: { type: string }
+        permissionMode: { type: string }
+        initialPrompt: { type: [string, "null"], description: The launch's opening prompt, when one was given. }
+        startedAt: { type: string, format: date-time }
+        exitedAt: { type: string, format: date-time }
+        exitCode: { type: [integer, "null"] }
+        debrief: { $ref: "#/components/schemas/Debrief" }
 
     CreateSession:
       type: object
@@ -428,12 +475,12 @@ paths:
       summary: List sessions
       responses:
         "200":
-          description: Live sessions plus lost headstones from the journal.
+          description: Live sessions plus journal-derived lost headstones and landed debriefs.
           content:
             application/json:
               schema:
                 type: object
-                required: [sessions, lost]
+                required: [sessions, lost, landed]
                 properties:
                   sessions:
                     type: array
@@ -441,6 +488,9 @@ paths:
                   lost:
                     type: array
                     items: { $ref: "#/components/schemas/LostSession" }
+                  landed:
+                    type: array
+                    items: { $ref: "#/components/schemas/LandedSession" }
         "401": { $ref: "#/components/responses/Unauthorized" }
         "403": { $ref: "#/components/responses/Forbidden" }
     post:

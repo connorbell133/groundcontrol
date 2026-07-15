@@ -9,6 +9,8 @@ import (
 	"os"
 	"os/exec"
 	"path/filepath"
+	"regexp"
+	"strconv"
 	"strings"
 	"time"
 )
@@ -107,4 +109,58 @@ func ResolveBranch(folder, branch string) string {
 
 func BranchExists(folder, branch string) bool {
 	return ResolveBranch(folder, branch) != ""
+}
+
+// DiffStats summarizes a run's work: committed plus working-tree changes
+// measured from the merge-base with the launch base, and the count of paths
+// with uncommitted changes. JSON tags because sessions embeds it in the
+// debrief it serves and journals.
+type DiffStats struct {
+	FilesChanged int `json:"filesChanged"`
+	Insertions   int `json:"insertions"`
+	Deletions    int `json:"deletions"`
+	Uncommitted  int `json:"uncommitted"`
+}
+
+var (
+	filesChangedRE = regexp.MustCompile(`(\d+) files? changed`)
+	insertionsRE   = regexp.MustCompile(`(\d+) insertions?\(\+\)`)
+	deletionsRE    = regexp.MustCompile(`(\d+) deletions?\(-\)`)
+)
+
+// diffStatTimeout bounds each git call: DiffStat runs on session-exit paths
+// that must never hang teardown.
+const diffStatTimeout = 10 * time.Second
+
+// DiffStat measures dir's work since it diverged from base. It diffs from the
+// merge-base, not base itself: agents pull and merge upstream inside
+// worktrees, and a diff against the launch commit would count all of upstream
+// as the run's own work. The diff is taken against the working tree (not
+// HEAD) so uncommitted edits still count as work. Any git failure returns an
+// error — callers degrade to an absent debrief.
+func DiffStat(dir, base string) (DiffStats, error) {
+	mergeBase, err := Out(dir, diffStatTimeout, "merge-base", base, "HEAD")
+	if err != nil {
+		return DiffStats{}, err
+	}
+	shortstat, err := Out(dir, diffStatTimeout, "diff", "--shortstat", mergeBase)
+	if err != nil {
+		return DiffStats{}, err
+	}
+	num := func(re *regexp.Regexp) int {
+		if m := re.FindStringSubmatch(shortstat); m != nil {
+			n, _ := strconv.Atoi(m[1])
+			return n
+		}
+		return 0 // shortstat omits zero-valued parts (and is empty with no changes)
+	}
+	st := DiffStats{FilesChanged: num(filesChangedRE), Insertions: num(insertionsRE), Deletions: num(deletionsRE)}
+	status, err := Out(dir, diffStatTimeout, "status", "--porcelain")
+	if err != nil {
+		return DiffStats{}, err
+	}
+	if status != "" {
+		st.Uncommitted = len(strings.Split(status, "\n"))
+	}
+	return st, nil
 }

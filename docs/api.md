@@ -102,7 +102,7 @@ change; renaming one is breaking.
 
 | method + path | what |
 |---|---|
-| `GET /sessions` | live sessions plus `lost` headstones from the journal |
+| `GET /sessions` | live sessions plus journal-derived `lost` headstones and `landed` debriefs |
 | `POST /sessions` | spawn `claude remote-control` — see below |
 | `GET /sessions/:id` | one session |
 | `GET /sessions/:id/qr` | pairing QR as SVG (409 `not_ready` until the pairing URL is scraped) |
@@ -158,6 +158,47 @@ if the deadline passed while still provisioning.
 
 Session states: `starting` → `ready` (pairing URL scraped) → `exited`;
 `error` means it died before ever becoming ready.
+
+#### Debriefs
+
+When a worktree session exits, the runner captures a debrief **before** the
+worktree is cleaned up — the diff stat of the run's own work plus the fate of
+its `gc/` branch. The stat is measured from the merge-base with the launch
+base (not the launch commit itself), so upstream work pulled or merged into
+the worktree never counts as the run's own; uncommitted edits do count, and
+`uncommitted` is the number of paths `git status --porcelain` reported at
+exit. It appears as `debrief` on the session object (and in the
+`session.exit` event payload):
+
+```json
+"debrief": {
+  "filesChanged": 3,
+  "insertions": 42,
+  "deletions": 7,
+  "uncommitted": 1,
+  "branchState": "in-orbit"
+}
+```
+
+- `branchState` — `merged` (the `gc/` branch is gone, or its tip is reachable
+  from the default branch), `in-orbit` (the branch survived with commits the
+  default branch lacks), or `worktree-kept` (the worktree was dirty and kept
+  on disk, branch intact).
+- Same-dir sessions have no worktree to debrief: `debrief` is absent.
+- Capture is best-effort: if git fails at exit time the debrief is absent and
+  teardown proceeds regardless — it never blocks a session from exiting.
+
+The same five fields are written flat into the `session.exit` journal entry
+(`filesChanged`, `insertions`, `deletions`, `uncommitted`, `branchState`,
+alongside `id` and `code`), which is what makes debriefs survive restarts:
+`GET /sessions` returns a third list, `landed`, joining `session.start`
+entries with their `session.exit` entries — id, launch config
+(`name`/`folder`/`branch`/`spawnMode`/`permissionMode`/`initialPrompt`),
+`startedAt`/`exitedAt`, `exitCode`, and the `debrief` when one was captured.
+Newest exits first, capped at 20, scoped to a 7-day window and the configured
+roots (folders that vanished are dropped). Sessions the runner still lists
+under `sessions` — live, or exited but not yet dismissed via
+`DELETE /sessions/:id/record` — are excluded from `landed`.
 
 ### Jobs (headless agents)
 

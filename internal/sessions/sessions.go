@@ -65,7 +65,23 @@ type Session struct {
 	ExitCode       *int                `json:"exitCode"`
 	LastOutputAt   *string             `json:"lastOutputAt"`
 	LastLine       *string             `json:"lastLine"`
+	Debrief        *Debrief            `json:"debrief,omitempty"`
 }
+
+// Debrief records what a worktree run left behind, captured at exit because
+// the worktree (and any uncommitted work in it) is gone right after. Absent
+// for same-dir sessions and whenever git failed at exit time.
+type Debrief struct {
+	gitx.DiffStats
+	BranchState string `json:"branchState"`
+}
+
+// branchState values: what actually survived worktree cleanup
+const (
+	branchMerged       = "merged"        // branch gone, or its tip reachable from the default branch
+	branchInOrbit      = "in-orbit"      // branch survived with commits the default branch lacks
+	branchWorktreeKept = "worktree-kept" // dirty worktree kept on disk, branch intact
+)
 
 type liveSession struct {
 	Session
@@ -504,11 +520,70 @@ func (m *Manager) readLoop(s *liveSession) {
 	snap := s.Session
 	m.mu.Unlock()
 
+	var debrief *Debrief
 	if wtPath != "" {
+		// stats must precede Remove — the worktree and its uncommitted work are
+		// about to be deleted. Best-effort throughout: any git failure means an
+		// absent debrief, never a blocked teardown.
+		if st, err := gitx.DiffStat(wtPath, baseCommit); err == nil {
+			debrief = &Debrief{DiffStats: st}
+		}
 		m.ws.Remove(cleanupRoot, wtPath, wtBranch, baseCommit)
+		if debrief != nil {
+			// after Remove: disk and refs are reality, not Remove's intent
+			debrief.BranchState = branchStateAfterRemove(cleanupRoot, wtPath, wtBranch)
+		}
 	}
-	m.journal.Append(map[string]any{"event": evSessionExit, "id": id, "code": exitCode})
+	if debrief != nil {
+		m.mu.Lock()
+		s.Debrief = debrief
+		snap = s.Session
+		m.mu.Unlock()
+	}
+	exitEntry := map[string]any{"event": evSessionExit, "id": id, "code": exitCode}
+	if debrief != nil {
+		exitEntry["filesChanged"] = debrief.FilesChanged
+		exitEntry["insertions"] = debrief.Insertions
+		exitEntry["deletions"] = debrief.Deletions
+		exitEntry["uncommitted"] = debrief.Uncommitted
+		exitEntry["branchState"] = debrief.BranchState
+	}
+	m.journal.Append(exitEntry)
 	m.announce(evSessionExit, snap, killed)
+}
+
+// branchStateAfterRemove inspects what workspace.Remove actually left behind
+// rather than plumbing its decisions back out: the answer stays honest even
+// when Remove's internals change.
+func branchStateAfterRemove(root, wtPath, wtBranch string) string {
+	if util.PathExists(wtPath) {
+		return branchWorktreeKept // removal refused (dirty) — the work is still on disk
+	}
+	tip, err := gitx.Out(root, 5*time.Second, "rev-parse", "--verify", "--quiet", "refs/heads/"+wtBranch)
+	if err != nil || tip == "" {
+		return branchMerged // Remove deleted the no-commit branch: nothing beyond the base survives
+	}
+	if def := defaultRef(root); def != "" {
+		if gitx.Run(root, 5*time.Second, "merge-base", "--is-ancestor", tip, def) == nil {
+			return branchMerged
+		}
+	}
+	return branchInOrbit
+}
+
+// defaultRef finds the branch "merged" is measured against: the remote's
+// declared default when one is set, else conventional local names. "" skips
+// the merged check.
+func defaultRef(root string) string {
+	if out, err := gitx.Out(root, 2*time.Second, "symbolic-ref", "--quiet", "refs/remotes/origin/HEAD"); err == nil && out != "" {
+		return out
+	}
+	for _, name := range []string{"main", "master"} {
+		if gitx.Run(root, 2*time.Second, "rev-parse", "--verify", "--quiet", "refs/heads/"+name) == nil {
+			return "refs/heads/" + name
+		}
+	}
+	return ""
 }
 
 func (m *Manager) Kill(id, actor string) *Session {

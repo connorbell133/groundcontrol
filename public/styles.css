@@ -567,7 +567,6 @@ body {
 .field { margin-bottom: 21px; display: block; }
 .field-label { display: block; font-family: var(--mono); font-size: 10.5px; font-weight: 700; letter-spacing: 0.14em; text-transform: uppercase; color: var(--muted); margin-bottom: 9px; }
 .field-hint { font-family: var(--mono); font-size: 10px; color: var(--faint); letter-spacing: 0.04em; }
-.field-row { display: flex; align-items: center; justify-content: space-between; }
 .field input[type="text"],
 .field textarea {
   width: 100%; font-family: var(--mono); font-size: 15px; color: var(--text);
@@ -605,10 +604,6 @@ body {
 .segment button.is-danger.active { background: var(--danger); color: var(--danger-ink); }
 .segment button:disabled { opacity: 0.35; }
 .segment button:focus-visible { outline: 1.5px solid var(--accent); outline-offset: -2px; }
-
-.toggle { width: 46px; height: 27px; border-radius: 999px; background: var(--surface-2); border: 1px solid var(--line-strong); padding: 2px; flex: none; }
-.toggle-knob { width: 21px; height: 21px; border-radius: 50%; background: var(--faint); }
-.toggle.disabled { opacity: 0.5; }
 
 .cta {
   width: 100%; margin-top: 6px;
@@ -789,8 +784,6 @@ html[data-hand="left"] .qr-summary { flex-direction: row-reverse; }
 html[data-hand="left"] .seq-stage { flex-direction: row-reverse; }
 html[data-hand="left"] .seq-elapsed { margin-left: 0; margin-right: auto; }
 html[data-hand="left"] .log-tools { order: -1; margin-left: 0; margin-right: auto; }
-html[data-hand="left"] .field-row { flex-direction: row-reverse; }
-html[data-hand="left"] .field-row > div { text-align: right; }
 html[data-hand="left"] .chip-add { flex-direction: row-reverse; }
 html[data-hand="left"] .root-chip { flex-direction: row-reverse; padding: 6px 10px 6px 6px; }
 html[data-hand="left"] .wt-row { flex-direction: row-reverse; }

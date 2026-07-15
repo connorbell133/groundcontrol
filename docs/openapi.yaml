@@ -96,7 +96,7 @@ components:
 
     Session:
       type: object
-      required: [id, name, folder, spawnMode, branch, worktreePath, permissionMode, state, pairingUrl, callbackUrl, startedAt, exitedAt, exitCode, lastOutputAt, lastLine]
+      required: [id, name, folder, spawnMode, branch, worktreePath, permissionMode, capacity, state, pairingUrl, callbackUrl, startedAt, exitedAt, exitCode, lastOutputAt, lastLine]
       properties:
         id: { type: string, description: 8-char launch id }
         name: { type: string }
@@ -104,7 +104,13 @@ components:
         spawnMode: { type: string, enum: [same-dir, worktree] }
         branch: { type: [string, "null"] }
         worktreePath: { type: [string, "null"] }
-        permissionMode: { type: string, description: "claude permission mode: default, acceptEdits, plan, bypassPermissions" }
+        permissionMode: { type: string, description: "claude permission mode: default, acceptEdits, plan, auto, dontAsk, bypassPermissions" }
+        capacity:
+          type: integer
+          description: >
+            Resolved --capacity: how many sessions claude.ai can create in
+            this environment. Always present — 32 (the CLI default) when the
+            launch didn't ask.
         state:
           type: string
           enum: [starting, ready, exited, error]
@@ -116,7 +122,77 @@ components:
         exitCode: { type: [integer, "null"] }
         lastOutputAt: { type: [string, "null"], format: date-time }
         lastLine: { type: [string, "null"], description: "Last meaningful log line, ≤120 chars." }
+        settingsSkipReason:
+          type: string
+          description: >
+            Why a requested preset-settings injection didn't happen —
+            "preset no longer exists", "settings file already exists", or
+            "in use by another session". Present only when injection was
+            requested but skipped; absent means injected or never
+            requested (the wire never claims success, only explains
+            absence).
+        claudeSessionId:
+          type: string
+          description: >
+            Claude Code's conversation UUID for the launch's primary session
+            (the id claude --resume wants), captured from the CLI's agents
+            registry. First capture wins; absent until captured. Journaled,
+            so lost and landed objects also carry it after a runner restart.
+        activity:
+          type: string
+          enum: [busy, idle]
+          description: >
+            Registry-sourced live activity. Absent when the registry hasn't
+            confirmed it recently, reports an unknown value, or the session
+            exited — never a stale value. Never journaled, never fanned out.
+        environmentSessions:
+          type: array
+          items: { $ref: "#/components/schemas/ExtraSession" }
+          description: >
+            The environment's own live sessions — registry rows descended
+            from the spawned launcher, primary session first, then by name.
+            The primary row's status reads the same registry row as
+            activity. Rows clear on the first successful poll that no
+            longer lists them; the grace window applies only across failed
+            polls, and rows keep their last confident classification while
+            the process snapshot is unavailable. Absent when none.
+        folderSessions:
+          type: array
+          items: { $ref: "#/components/schemas/ExtraSession" }
+          description: >
+            Live Claude sessions in the launch's directory that do not
+            belong to the environment (manual, IDE), sorted by name — "in
+            this folder" is the literal contract. Rows age out shortly
+            after the registry stops listing them. Absent when none.
+        prLink: { $ref: "#/components/schemas/PRLink" }
         debrief: { $ref: "#/components/schemas/Debrief" }
+
+    ExtraSession:
+      type: object
+      description: >
+        One live Claude session row, as listed under environmentSessions
+        (the environment's own sessions, descendants of the spawned
+        launcher) or folderSessions (unrelated same-folder sessions —
+        manual, IDE).
+      required: [name]
+      properties:
+        name: { type: string, description: Registry-assigned session name. }
+        status:
+          type: string
+          enum: [busy, idle]
+          description: Omitted when the registry reports anything else.
+
+    PRLink:
+      type: object
+      description: >
+        The newest pr-link record from the session's transcript. Best-effort
+        enrichment of an undocumented transcript detail — absence is the
+        contract, and it never appears on landed objects (no journaled
+        source).
+      required: [number, url]
+      properties:
+        number: { type: integer }
+        url: { type: string }
 
     Debrief:
       type: object
@@ -161,6 +237,11 @@ components:
         startedAt: { type: string, format: date-time }
         exitedAt: { type: string, format: date-time }
         exitCode: { type: [integer, "null"] }
+        claudeSessionId:
+          type: string
+          description: >
+            Claude conversation UUID, read from the session.exit journal
+            entry; absent when it was never captured.
         debrief: { $ref: "#/components/schemas/Debrief" }
 
     CreateSession:
@@ -175,7 +256,33 @@ components:
           description: >
             Required in worktree mode (base for the private gc/<id> branch).
             In same-dir mode, switches the checkout first; refused if dirty.
-        permissionMode: { type: string, default: default }
+        permissionMode:
+          type: string
+          enum: [default, acceptEdits, plan, auto, dontAsk, bypassPermissions]
+          default: default
+          description: >
+            Unknown values are a 400 invalid_param. dontAsk and
+            bypassPermissions skip Claude Code's confirmation prompts
+            entirely — a launch-scoped token grants that power.
+        capacity:
+          type: integer
+          default: 32
+          description: >
+            Max sessions claude.ai can create in this environment
+            (--capacity). Normalized, never rejected: absent or < 1 falls
+            back to 32 (the CLI default), values above 256 clamp to 256.
+            Passed to claude only when it differs from the default.
+        presetName:
+          type: string
+          description: >
+            Named preset to resolve: it fills only the options the request
+            left empty (an explicit request field always wins) and supplies
+            the settings JSON injected as <launch
+            cwd>/.claude/settings.local.json for the session's lifetime. A
+            name that no longer resolves is not an error — the launch
+            proceeds without injection and the session carries
+            settingsSkipReason "preset no longer exists". Recorded in the
+            journal so recents and relaunch can re-resolve it.
         callbackUrl: { type: string, description: "http(s) URL — every lifecycle event for this launch except session.start is POSTed to it." }
         timeoutMs: { type: integer, default: 60000, minimum: 1000, maximum: 300000, description: "Only meaningful with ?wait=ready." }
 
@@ -219,6 +326,36 @@ components:
           description: >
             Filter tokens: exact names, prefix wildcards (session.*), "*" or
             omitted for everything, and the derived token session.failed.
+
+    Preset:
+      type: object
+      required: [name]
+      properties:
+        name: { type: string, description: Unique and non-empty within the list. }
+        permissionMode:
+          type: string
+          enum: [default, acceptEdits, plan, auto, dontAsk, bypassPermissions]
+          description: Absent/empty means the launch default.
+        spawnMode:
+          type: string
+          enum: [same-dir, worktree]
+          description: Absent/empty means the launch default.
+        capacity:
+          type: integer
+          minimum: 1
+          maximum: 256
+          description: Absent/0 means unset.
+        settingsJson:
+          type: string
+          description: >
+            Optional settings-file content as a string. At most 64 KB and
+            must parse as a JSON object; a top-level "hooks" key is rejected
+            (hooks run shell commands and are a separately gated feature).
+            An "env" key is allowed. Injected at launch as <launch
+            cwd>/.claude/settings.local.json (marker-scoped: a
+            "_groundcontrol" key brands the file, an existing unmarked file
+            refuses injection, and removal waits for the last same-folder
+            exit).
 
     Job:
       type: object
@@ -285,13 +422,15 @@ components:
 
     RecentLaunch:
       type: object
-      required: [folder, name, branch, spawnMode, permissionMode, at, stale]
+      required: [folder, name, branch, spawnMode, permissionMode, capacity, at, stale]
       properties:
         folder: { type: string }
         name: { type: string }
         branch: { type: [string, "null"] }
         spawnMode: { type: string }
         permissionMode: { type: string }
+        capacity: { type: integer, description: "Defaults to 32 for entries journaled before capacity existed." }
+        presetName: { type: string, description: Absent when the launch didn't come from a preset. }
         at: { type: string, format: date-time }
         stale: { type: boolean, description: The launch's branch no longer exists. }
 
@@ -302,6 +441,12 @@ components:
           required: [id]
           properties:
             id: { type: string }
+            claudeSessionId:
+              type: string
+              description: >
+                Claude conversation UUID from the session.claude-id journal
+                entry — the resume handle for a session a crashed runner
+                forgot. Absent when it was never captured.
 
     KeptWorktree:
       type: object
@@ -335,7 +480,7 @@ components:
 
     ConfigView:
       type: object
-      required: [roots, showHidden, webhooks]
+      required: [roots, showHidden, webhooks, presets]
       properties:
         roots:
           type: array
@@ -344,6 +489,9 @@ components:
         webhooks:
           type: array
           items: { $ref: "#/components/schemas/WebhookConfig" }
+        presets:
+          type: array
+          items: { $ref: "#/components/schemas/Preset" }
 
 paths:
   /roots:
@@ -415,9 +563,11 @@ paths:
     put:
       summary: Update config (partial)
       description: >
-        Any subset of roots, showHidden, webhooks. Persists to config.json.
-        A token that can reach this route can widen roots — treat it as root
-        on the box.
+        Any subset of roots, showHidden, webhooks, presets. Only keys present
+        in the body are touched — an omitted key keeps its current value, an
+        explicit empty array clears the list. Validation runs before anything
+        is applied. Persists to config.json. A token that can reach this
+        route can widen roots — treat it as root on the box.
       requestBody:
         required: true
         content:
@@ -432,6 +582,9 @@ paths:
                 webhooks:
                   type: array
                   items: { $ref: "#/components/schemas/WebhookConfig" }
+                presets:
+                  type: array
+                  items: { $ref: "#/components/schemas/Preset" }
       responses:
         "200":
           description: Applied and persisted.

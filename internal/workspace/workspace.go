@@ -80,7 +80,16 @@ func slugify(label string) string {
 }
 
 func (m *Manager) Add(folder, branch, id, label string) (Info, error) {
-	wtPath := filepath.Join(m.base, filepath.Base(folder), id)
+	// the worktree directory's basename doubles as the environment's label in
+	// claude.ai's picker (environments are named by cwd basename — verified
+	// live on 2.1.210; --name reaches only the pre-created session), so it
+	// carries the run's label, id-suffixed for collision-freedom
+	slug := slugify(label)
+	dir := id
+	if slug != "" {
+		dir = slug + "-" + id
+	}
+	wtPath := filepath.Join(m.base, filepath.Base(folder), dir)
 	if err := os.MkdirAll(filepath.Join(m.base, filepath.Base(folder)), 0o755); err != nil {
 		return Info{}, err
 	}
@@ -91,7 +100,7 @@ func (m *Manager) Add(folder, branch, id, label string) (Info, error) {
 	// gc/<what-this-run-is-for>-<id>: the label answers "what is this branch"
 	// at a glance in `git branch`, the id keeps it collision-free
 	wtBranch := "gc/" + id
-	if slug := slugify(label); slug != "" {
+	if slug != "" {
 		wtBranch = "gc/" + slug + "-" + id
 	}
 	// each run works on its own branch cut from the base: the base may be checked

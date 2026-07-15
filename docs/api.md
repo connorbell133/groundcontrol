@@ -81,7 +81,7 @@ change; renaming one is breaking.
 | `not_found` | 404 | no such session or job |
 | `not_ready` | 409 | session exists but has no pairing URL yet |
 | `ready_timeout` | 504 | `?wait=ready` deadline passed — session still starting, keep polling |
-| `launch_failed` | 409 | spawn rejected — duplicate live name, unknown branch, dirty checkout on branch switch, worktree creation failed |
+| `launch_failed` | 409 | spawn rejected — duplicate live name, a live environment already in the folder (same-dir launches; one per folder), unknown branch, dirty checkout on branch switch, worktree creation failed |
 | `session_live` | 409 | tried to dismiss a session that's still running |
 | `job_live` | 409 | tried to dismiss a job that's still queued/running — cancel it first |
 | `worktree_error` | 400 | kept-worktree removal failed or path isn't runner-managed |
@@ -123,6 +123,7 @@ change; renaming one is breaking.
   "spawnMode": "worktree",
   "branch": "main",
   "permissionMode": "acceptEdits",
+  "capacity": 8,
   "callbackUrl": "http://n8n.local:5678/webhook/gc",
   "timeoutMs": 60000
 }
@@ -132,13 +133,36 @@ change; renaming one is breaking.
 - `name` — must not collide with a live session; omit to auto-generate.
 - `spawnMode` — `same-dir` (default) or `worktree`. Worktree mode requires
   `branch`, cuts a private `gc/<name-slug>-<id>` branch off it under
-  `~/.groundcontrol/worktrees/`, and cleans up on exit (dirty worktrees are
-  kept, never force-deleted). The slug comes from the session name (jobs: the
-  prompt), so `git branch` answers "what was this run for" at a glance.
+  `~/.groundcontrol/worktrees/<repo>/<name-slug>-<id>/`, and cleans up on exit
+  (dirty worktrees are kept, never force-deleted). The slug comes from the
+  session name (jobs: the prompt), so `git branch` answers "what was this run
+  for" at a glance. The worktree directory carries the slug too because
+  claude.ai's environment picker labels environments by their folder basename
+  (verified on CLI 2.1.210; `--name` reaches only the pre-created session) —
+  worktree launches appear there under the session name, same-dir launches
+  under the launch folder's name.
 - `branch` — in `same-dir` mode this switches the checkout first; git refuses
   if that would clobber local changes.
-- `permissionMode` — passed to `claude`: `default`, `acceptEdits`, `plan`, or
-  `bypassPermissions`.
+- `permissionMode` — passed to `claude`: `default`, `acceptEdits`, `plan`,
+  `auto`, `dontAsk`, or `bypassPermissions`; anything else is a 400
+  `invalid_param`. Note that `dontAsk` and `bypassPermissions` skip Claude
+  Code's confirmation prompts entirely — a launch-scoped token grants that
+  power, so hand those tokens out accordingly.
+- `capacity` — how many sessions claude.ai can create in this environment
+  (`--capacity`). Normalized, never rejected: absent or < 1 falls back to 32
+  (the CLI default), values above 256 clamp to 256. The flag is passed to
+  `claude` only when the normalized value differs from the default, so
+  launches keep working on CLIs that predate it. The session object always
+  carries the resolved `capacity`.
+- `presetName` — resolve a named [preset](#config) from config: the preset
+  fills only the options the request left empty (`permissionMode`,
+  `capacity`, `spawnMode` — an explicit request field always wins) and
+  supplies the settings JSON for
+  [injection](#preset-settings-injection). A name that no longer resolves
+  is **not** an error: the launch proceeds without injection and the
+  session carries `settingsSkipReason: "preset no longer exists"`, so
+  relaunching a recent whose preset was deleted keeps working. The name is
+  journaled either way.
 - `callbackUrl` — this launch's own webhook: every lifecycle event except
   `session.start` (`session.ready`, `session.kill`, `session.exit`) is POSTed
   to it (same payload shape as [events](#events--notifications)).
@@ -153,6 +177,39 @@ if the deadline passed while still provisioning.
 
 Session states: `starting` → `ready` (pairing URL scraped) → `exited`;
 `error` means it died before ever becoming ready.
+
+#### Preset settings injection
+
+A preset with `settingsJson` has it written to
+`<launch cwd>/.claude/settings.local.json` before spawn — the project-scoped
+settings file Claude Code merges natively — and removed when the session
+exits. For worktree launches the launch cwd is the worktree, so the file
+never touches your checkout. The mechanism never clobbers user files:
+
+- The injected file carries a top-level `"_groundcontrol": true` marker key.
+  Teardown and the boot sweep only ever remove files whose parse shows the
+  marker; a file that lost its marker mid-session is left alone.
+- Creation is an atomic create-if-absent, so two concurrent launches into
+  the same folder can never interleave. When a file already exists: unmarked
+  (or unparseable) means it's yours — injection refuses with
+  `settingsSkipReason: "settings file already exists"`; marked and owned by
+  another live session skips with `"in use by another session"`; marked with
+  no live owner is a crash leftover and is replaced (journaled as
+  `settingsNote: "replaced stale injection"`).
+- At exit the file is removed only when no other live session shares the
+  folder — otherwise removal defers to the last same-folder exit, and each
+  exit re-checks. On boot the runner sweeps marked leftovers in folders
+  whose recent `session.start` entries recorded an injection (crash
+  recovery).
+- While the file exists it affects **every** Claude session started in that
+  folder, including ones you start by hand.
+
+A skip never blocks the launch. The session object carries
+`settingsSkipReason` only when injection was requested but skipped —
+absence means either injected or never requested: the wire never claims
+success, only explains absence. The outcome is flattened into the
+`session.start` journal entry (`settingsInjected`, `settingsSkipReason`,
+`settingsNote`), never a standalone event.
 
 #### Debriefs
 
@@ -185,15 +242,53 @@ exit. It appears as `debrief` on the session object (and in the
 
 The same five fields are written flat into the `session.exit` journal entry
 (`filesChanged`, `insertions`, `deletions`, `uncommitted`, `branchState`,
-alongside `id` and `code`), which is what makes debriefs survive restarts:
-`GET /sessions` returns a third list, `landed`, joining `session.start`
-entries with their `session.exit` entries — id, launch config
+alongside `id`, `code`, and the `claudeSessionId` when one was captured),
+which is what makes debriefs survive restarts: `GET /sessions` returns a
+third list, `landed`, joining `session.start` entries with their
+`session.exit` entries — id, launch config
 (`name`/`folder`/`branch`/`spawnMode`/`permissionMode`),
-`startedAt`/`exitedAt`, `exitCode`, and the `debrief` when one was captured.
-Newest exits first, capped at 20, scoped to a 7-day window and the configured
-roots (folders that vanished are dropped). Sessions the runner still lists
-under `sessions` — live, or exited but not yet dismissed via
-`DELETE /sessions/:id/record` — are excluded from `landed`.
+`startedAt`/`exitedAt`, `exitCode`, `claudeSessionId` when the journal has
+it, and the `debrief` when one was captured. Newest exits first, capped at
+20, scoped to a 7-day window and the configured roots (folders that vanished
+are dropped). Sessions the runner still lists under `sessions` — live, or
+exited but not yet dismissed via `DELETE /sessions/:id/record` — are
+excluded from `landed`.
+
+#### Claude state enrichment
+
+While sessions are live, a runner-owned poll of `claude agents --json` (the
+CLI's documented scripting surface, 2.1.145+) enriches the session objects.
+Every field degrades to absence — an unreachable registry, an older CLI, or
+an exited session simply renders nothing — and none of it ever drives a state
+transition: the PTY remains the sole exit authority.
+
+- `claudeSessionId` — Claude Code's conversation UUID for the launch's
+  primary session (the id `claude --resume` wants). Captured once, first
+  capture wins; journaled as a `session.claude-id` entry and flattened into
+  the `session.exit` entry, so both `lost` and `landed` objects expose
+  `claudeSessionId` after a runner restart when the journal has it.
+- `activity` — `"busy"` or `"idle"`, copied from the registry row. Absent
+  when the registry hasn't confirmed it recently, reports an unknown value,
+  or the session exited — never a stale value. Activity flips are never
+  journaled and never fan out to webhooks.
+- `environmentSessions` — the environment's own live sessions (registry rows
+  descended from the spawned launcher, including sessions claude.ai creates
+  on demand), as `[{ "name": "...", "status": "busy" }]`, primary session
+  first, then by name. The primary row's status reads the same registry row
+  as `activity`, so the two surfaces never disagree. Rows clear on the first
+  successful poll that no longer lists them; the wall-clock grace window
+  applies only across failed polls. When the process snapshot is unavailable,
+  rows keep their last confident classification instead of demoting to
+  `folderSessions`, and age out on the wall-clock window.
+- `folderSessions` — live Claude sessions in the launch's directory that do
+  *not* belong to the environment (a manual `claude` in the same folder, IDE
+  sessions), sorted by name — "in this folder" is the literal contract. Rows
+  age out shortly after the registry stops listing them. In both lists
+  `status` is omitted when unknown, and a list with no rows is absent, never
+  empty.
+- `prLink` — `{ "number": 9, "url": "https://github.com/..." }`, the newest
+  `pr-link` record from the session's transcript. Best-effort enrichment of
+  an undocumented transcript detail; absence is the contract.
 
 ### Jobs (headless agents)
 
@@ -360,8 +455,27 @@ successful sweep writes an `orbit.swept {repo, branch}` journal entry.
 
 | method + path | what |
 |---|---|
-| `GET /config` | roots, showHidden, webhooks |
+| `GET /config` | roots, showHidden, webhooks, presets |
 | `PUT /config` | partial update of the same; persists to `config.json` |
+
+PUT is a partial update: only keys present in the body are touched. A payload
+carrying just `{"presets": [...]}` never disturbs roots or webhooks; an
+explicit empty array clears the list. Validation runs before anything is
+applied, so a rejected write leaves the config untouched.
+
+`presets` are named launch configurations. Each preset carries:
+
+- `name` (required) — unique and non-empty within the list.
+- `permissionMode` — empty, or one of `default`, `acceptEdits`, `plan`,
+  `auto`, `dontAsk`, `bypassPermissions`.
+- `spawnMode` — empty, or `same-dir` / `worktree`.
+- `capacity` — 0 (unset) or 1–256.
+- `settingsJson` — optional settings-file content as a string: at most 64 KB
+  and must parse as a JSON object. A top-level `hooks` key is rejected —
+  hooks run shell commands and are a separately gated feature. An `env` key
+  is allowed. Injected at launch as
+  `<launch cwd>/.claude/settings.local.json` for the session's lifetime —
+  see [Preset settings injection](#preset-settings-injection).
 
 A token that can reach `PUT /config` can widen `roots` — treat `authToken`
 and any `admin`-scoped token as root on the box. Give automations

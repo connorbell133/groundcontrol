@@ -25,7 +25,16 @@ func testManager(t *testing.T, roots []string) *Manager {
 	ws := workspace.New(t.TempDir(), jnl)
 	browser := browse.New()
 	browser.Configure(roots, false)
-	return NewManager(jnl, bus, ws, browser)
+	m := NewManager(jnl, bus, ws, browser)
+	t.Cleanup(func() {
+		// drain watcher goroutines before later-registered cleanups restore the
+		// package seams they read (cleanups run LIFO, so this runs first)
+		for _, s := range m.List() {
+			m.Kill(s.ID, "test-cleanup")
+		}
+		m.watchers.Wait()
+	})
+	return m
 }
 
 func TestLastMeaningfulLine(t *testing.T) {
@@ -124,6 +133,47 @@ func TestRecentLaunchesDedupAndOrder(t *testing.T) {
 	// newest first; the duplicate keeps its most recent occurrence
 	if out[0].Name != "n3" || out[1].Name != "n2" {
 		t.Errorf("unexpected order: %+v", out)
+	}
+}
+
+func TestNormalizeCapacity(t *testing.T) {
+	t.Parallel()
+	cases := []struct{ in, want int }{
+		{-3, defaultCapacity},
+		{0, defaultCapacity},
+		{1, 1},
+		{32, 32},
+		{256, 256},
+		{257, maxCapacity},
+		{5000, maxCapacity},
+	}
+	for _, tc := range cases {
+		if got := normalizeCapacity(tc.in); got != tc.want {
+			t.Errorf("normalizeCapacity(%d) = %d, want %d", tc.in, got, tc.want)
+		}
+	}
+}
+
+func TestRecentLaunchesCapacityRoundTrip(t *testing.T) {
+	t.Parallel()
+	root := testutil.ResolvedTempDir(t)
+	m := testManager(t, []string{root})
+
+	// a launch that overrode the default, journaled the way Create writes it
+	m.journal.Append(map[string]any{"event": evSessionStart, "id": "a", "name": "n1", "folder": root, "capacity": 4, "presetName": "fast"})
+	// a pre-capacity entry: no capacity or presetName keys at all
+	m.journal.Append(map[string]any{"event": evSessionStart, "id": "b", "name": "n2", "folder": root, "spawnMode": "worktree"})
+
+	out := m.RecentLaunches(10)
+	if len(out) != 2 {
+		t.Fatalf("expected 2 launches, got %+v", out)
+	}
+	// newest first: the pre-capacity entry defaults cleanly
+	if out[0].Capacity != defaultCapacity || out[0].PresetName != "" {
+		t.Errorf("pre-capacity entry did not default: %+v", out[0])
+	}
+	if out[1].Capacity != 4 || out[1].PresetName != "fast" {
+		t.Errorf("capacity/presetName round-trip failed: %+v", out[1])
 	}
 }
 

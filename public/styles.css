@@ -351,6 +351,61 @@ body {
   border-color: color-mix(in srgb, var(--stamp) 35%, transparent);
   background: var(--stamp-soft);
 }
+/* the row's only link — chip face, link behavior */
+.meta-chip.pr {
+  text-decoration: none; color: var(--accent);
+  border-color: color-mix(in srgb, var(--accent) 35%, transparent);
+  background: color-mix(in srgb, var(--accent) 10%, transparent);
+}
+
+/* header session counter — "N of <capacity> sessions", live cards only.
+   The environment's headline stat, so it reads at header weight, not as a footnote. */
+.session-usage {
+  flex: none; font-family: var(--mono); font-size: 11px; font-weight: 700; letter-spacing: 0.05em;
+  color: var(--text); white-space: nowrap;
+}
+
+/* environment identifiers — promoted to the card body; claude.ai addresses
+   environments by these, so they are identity, not debug detail */
+.env-stats {
+  margin-top: 12px; border: 1px solid var(--line); border-radius: 10px;
+  padding: 9px 12px; display: grid; gap: 5px;
+}
+.env-stat { display: flex; justify-content: space-between; gap: 12px; font-family: var(--mono); font-size: 10.5px; min-width: 0; }
+.env-stat-k { flex: none; color: var(--faint); text-transform: uppercase; letter-spacing: 0.06em; }
+.env-stat-v { color: var(--muted); overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
+
+/* settings-injection skip reason — a launch fact, one muted line under the header */
+.skip-reason {
+  margin-top: 7px; font-family: var(--mono); font-size: 10.5px; color: var(--faint);
+  overflow: hidden; text-overflow: ellipsis; white-space: nowrap;
+}
+
+/* environment session rows — the sessions claude.ai created inside this
+   environment, first-class on the card; the status chip ticks via
+   data-session-status and hides when empty */
+.session-rows { margin-top: 12px; display: flex; flex-direction: column; }
+.env-row { display: flex; align-items: center; gap: 8px; padding: 3px 0; min-width: 0; }
+.env-name {
+  flex: 1; min-width: 0; font-family: var(--mono); font-size: 11.5px; color: var(--muted);
+  overflow: hidden; text-overflow: ellipsis; white-space: nowrap;
+}
+.meta-chip.session-status { flex: none; text-transform: none; padding: 2px 7px; }
+.meta-chip.session-status:empty { display: none; }
+.env-more { padding: 3px 0; font-family: var(--mono); font-size: 10.5px; color: var(--faint); }
+
+/* same-folder foreign sessions — collapsed and visibly quieter than env rows */
+.folder-details { margin-top: 10px; font-family: var(--mono); color: var(--faint); }
+.folder-summary {
+  list-style: none; cursor: pointer;
+  font-size: 10px; letter-spacing: 0.04em;
+}
+.folder-summary::-webkit-details-marker { display: none; }
+.folder-summary::before { content: "\203A "; display: inline-block; transition: transform 0.12s var(--ease); }
+.folder-details[open] .folder-summary::before { transform: rotate(90deg); }
+.folder-body { margin-top: 2px; padding-left: 12px; }
+.folder-row { padding: 2px 0; font-size: 10.5px; overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
+.folder-more { padding: 2px 0; font-size: 10.5px; }
 
 /* staged launch sequence (starting cards) — three checkpoints, sweep on the active one */
 .launch-seq {
@@ -499,6 +554,8 @@ body {
   transition: transform 0.12s var(--ease);
 }
 .card-cta:active { transform: scale(0.98); }
+.cta-label { display: flex; flex-direction: column; align-items: center; gap: 2px; }
+.cta-sub { font-size: 9px; font-weight: 600; letter-spacing: 0.08em; opacity: 0.75; }
 .card-cta:focus-visible { outline: 2px solid var(--text); outline-offset: 3px; }
 
 .session-log { margin-top: 15px; }
@@ -698,7 +755,8 @@ body {
 .meta-chip.age { color: var(--faint); text-transform: none; }
 .meta-chip.age:empty { display: none; }
 .meta-chip.activity { text-transform: none; }
-.meta-chip.activity.hot {
+.meta-chip.activity.hot,
+.meta-chip.session-status.hot {
   color: var(--stamp); border-color: color-mix(in srgb, var(--stamp) 35%, transparent);
   background: var(--stamp-soft);
 }
@@ -869,3 +927,41 @@ html[data-hand="left"] .select-caret { right: auto; left: 14px; }
   border-radius: 6px; padding: 2px 7px;
 }
 .cta.warn { background: var(--danger); color: #fff2ec; }
+
+/* ---------- launch presets · capacity · six-mode segment (sheet + settings) ---------- */
+/* six buttons wrap 3+3; percentage basis keeps the rows aligned down to 390px */
+.segment-wrap { flex-wrap: wrap; }
+.segment-wrap button { flex: 1 1 30%; min-width: 0; font-size: 11px; padding: 10px 2px; white-space: nowrap; }
+
+.field input[type="number"] {
+  width: 100%; font-family: var(--mono); font-size: 15px; color: var(--text);
+  background: var(--panel); border: 1.5px solid var(--line-strong); border-radius: 10px;
+  padding: 13px 14px; letter-spacing: 0.02em;
+  appearance: textfield; -moz-appearance: textfield;
+}
+.field input[type="number"]::-webkit-outer-spin-button,
+.field input[type="number"]::-webkit-inner-spin-button { -webkit-appearance: none; margin: 0; }
+
+.preset-row {
+  display: flex; align-items: center; gap: 10px;
+  border: 1px solid var(--line-strong); border-radius: 10px;
+  background: var(--panel);
+  padding: 9px 10px; margin-bottom: 8px;
+}
+.preset-info {
+  flex: 1; min-width: 0; display: grid; gap: 3px; text-align: left;
+  background: none; border: 0; padding: 0;
+}
+.preset-name { font-family: var(--mono); font-size: 12.5px; font-weight: 700; color: var(--text); }
+.preset-meta {
+  font-family: var(--mono); font-size: 10px; color: var(--muted); letter-spacing: 0.04em;
+  overflow: hidden; text-overflow: ellipsis; white-space: nowrap;
+}
+.preset-x {
+  flex: none; font: inherit; font-family: var(--mono); font-weight: 700; line-height: 1;
+  color: var(--danger); background: color-mix(in srgb, var(--danger) 8%, transparent);
+  border: 0; border-radius: 5px; padding: 6px 9px;
+}
+.preset-json { font-family: var(--mono); font-size: 12px; }
+.preset-error { color: var(--danger); }
+html[data-hand="left"] .preset-row { flex-direction: row-reverse; }

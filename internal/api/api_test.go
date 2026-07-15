@@ -1,6 +1,7 @@
 package api
 
 import (
+	"context"
 	"encoding/json"
 	"encoding/xml"
 	"fmt"
@@ -267,6 +268,8 @@ func TestPostSessionsValidation(t *testing.T) {
 		{"folder outside roots", `{"folder":"/definitely/not/in/roots"}`, 400, "outside_roots"},
 		{"bad callbackUrl", fmt.Sprintf(`{"folder":%q,"callbackUrl":"not-a-url"}`, root), 400, "invalid_param"},
 		{"empty callbackUrl still validated", fmt.Sprintf(`{"folder":%q,"callbackUrl":""}`, root), 400, "invalid_param"},
+		{"unknown permissionMode", fmt.Sprintf(`{"folder":%q,"permissionMode":"yolo"}`, root), 400, "invalid_param"},
+		{"wrong-typed capacity", fmt.Sprintf(`{"folder":%q,"capacity":"lots"}`, root), 400, "invalid_param"},
 		// fails inside Create before any spawn: worktree mode needs a branch
 		{"worktree without branch", fmt.Sprintf(`{"folder":%q,"spawnMode":"worktree"}`, root), 409, "launch_failed"},
 	}
@@ -334,6 +337,201 @@ func waitForExitEntry(t *testing.T, env *testEnv, id string) map[string]any {
 	}
 	t.Fatalf("no session.exit journal entry for %s", id)
 	return nil
+}
+
+// startEntry finds the session.start journal entry for id — Create writes it
+// synchronously, so no polling is needed.
+func startEntry(t *testing.T, env *testEnv, id string) map[string]any {
+	t.Helper()
+	for _, e := range env.journal.Read() {
+		if e["event"] == "session.start" && e["id"] == id {
+			return e
+		}
+	}
+	t.Fatalf("no session.start journal entry for %s", id)
+	return nil
+}
+
+func TestPostSessionsPermissionModes(t *testing.T) {
+	testutil.FakeClaude(t)
+	root := testutil.ResolvedTempDir(t)
+	env := newTestEnv(t, config.Config{Roots: []string{root}})
+
+	for _, mode := range []string{"default", "acceptEdits", "plan", "auto", "dontAsk", "bypassPermissions"} {
+		// one live environment per folder: each mode launches in its own subfolder
+		folder := filepath.Join(root, "pm-"+mode)
+		if err := os.MkdirAll(folder, 0o755); err != nil {
+			t.Fatal(err)
+		}
+		created := createSession(t, env, fmt.Sprintf(`{"folder":%q,"name":"pm-%s","permissionMode":%q}`, folder, mode, mode))
+		if created.PermissionMode != mode {
+			t.Errorf("%s: session permissionMode = %q", mode, created.PermissionMode)
+		}
+		// the journal entry records the mode that reached the spawn args
+		if got := startEntry(t, env, created.ID)["permissionMode"]; got != mode {
+			t.Errorf("%s: journaled permissionMode = %v", mode, got)
+		}
+	}
+}
+
+func TestPostSessionsCapacity(t *testing.T) {
+	testutil.FakeClaude(t)
+	root := testutil.ResolvedTempDir(t)
+	env := newTestEnv(t, config.Config{Roots: []string{root}})
+
+	// one live environment per folder: each case launches in its own subfolder
+	sub := func(name string) string {
+		folder := filepath.Join(root, name)
+		if err := os.MkdirAll(folder, 0o755); err != nil {
+			t.Fatal(err)
+		}
+		return folder
+	}
+	cases := []struct {
+		name string
+		body string
+		want int  // capacity on the wire
+		flag bool // --capacity spawned — the journal entry mirrors the args
+	}{
+		{"absent defaults", fmt.Sprintf(`{"folder":%q,"name":"cap-absent"}`, sub("cap-absent")), 32, false},
+		{"zero defaults", fmt.Sprintf(`{"folder":%q,"name":"cap-zero","capacity":0}`, sub("cap-zero")), 32, false},
+		{"explicit default omits the flag", fmt.Sprintf(`{"folder":%q,"name":"cap-default","capacity":32}`, sub("cap-default")), 32, false},
+		{"non-default passes through", fmt.Sprintf(`{"folder":%q,"name":"cap-four","capacity":4}`, sub("cap-four")), 4, true},
+		{"oversized clamps", fmt.Sprintf(`{"folder":%q,"name":"cap-big","capacity":500}`, sub("cap-big")), 256, true},
+	}
+	for _, tc := range cases {
+		t.Run(tc.name, func(t *testing.T) {
+			created := createSession(t, env, tc.body)
+			if created.Capacity != tc.want {
+				t.Errorf("session capacity = %d, want %d", created.Capacity, tc.want)
+			}
+			got, journaled := startEntry(t, env, created.ID)["capacity"]
+			if journaled != tc.flag {
+				t.Errorf("capacity journaled = %v, want %v", journaled, tc.flag)
+			}
+			if tc.flag && got != float64(tc.want) {
+				t.Errorf("journaled capacity = %v, want %d", got, tc.want)
+			}
+		})
+	}
+
+	// a default launch shows the resolved capacity on GET /sessions too
+	rec := doReq(t, env.handler, "GET", "/sessions", "", nil)
+	if rec.Code != 200 {
+		t.Fatalf("GET /sessions = %d", rec.Code)
+	}
+	var listed struct {
+		Sessions []sessions.Session `json:"sessions"`
+	}
+	if err := json.Unmarshal(rec.Body.Bytes(), &listed); err != nil {
+		t.Fatalf("sessions body not JSON: %v", err)
+	}
+	found := false
+	for _, s := range listed.Sessions {
+		if s.Name == "cap-absent" {
+			found = true
+			if s.Capacity != 32 {
+				t.Errorf("listed capacity = %d, want 32", s.Capacity)
+			}
+		}
+	}
+	if !found {
+		t.Error("cap-absent session missing from GET /sessions")
+	}
+}
+
+// A recent journaled before capacity existed replays cleanly: the recents
+// view defaults capacity to 32, and re-POSTing it spawns no --capacity.
+func TestPostSessionsPreCapacityRelaunch(t *testing.T) {
+	testutil.FakeClaude(t)
+	root := testutil.ResolvedTempDir(t)
+	env := newTestEnv(t, config.Config{Roots: []string{root}})
+
+	// a pre-capacity session.start entry: no capacity or presetName keys at all
+	env.journal.Append(map[string]any{"event": "session.start", "id": "old1", "name": "old", "folder": root, "permissionMode": "acceptEdits"})
+
+	rec := doReq(t, env.handler, "GET", "/journal/recent", "", nil)
+	if rec.Code != 200 {
+		t.Fatalf("GET /journal/recent = %d", rec.Code)
+	}
+	var recents struct {
+		Recent []sessions.RecentLaunch `json:"recent"`
+	}
+	if err := json.Unmarshal(rec.Body.Bytes(), &recents); err != nil {
+		t.Fatalf("recent body not JSON: %v", err)
+	}
+	if len(recents.Recent) != 1 || recents.Recent[0].Capacity != 32 || recents.Recent[0].PresetName != "" {
+		t.Fatalf("pre-capacity recent did not default cleanly: %+v", recents.Recent)
+	}
+
+	// relaunch exactly what the recent carries
+	r0 := recents.Recent[0]
+	created := createSession(t, env, fmt.Sprintf(`{"folder":%q,"name":"relaunch","spawnMode":%q,"permissionMode":%q,"capacity":%d}`,
+		r0.Folder, r0.SpawnMode, r0.PermissionMode, r0.Capacity))
+	if created.Capacity != 32 {
+		t.Errorf("relaunch capacity = %d, want 32", created.Capacity)
+	}
+	if _, ok := startEntry(t, env, created.ID)["capacity"]; ok {
+		t.Error("default-capacity relaunch journaled a capacity (would spawn --capacity)")
+	}
+}
+
+// A launch naming a preset that no longer exists must keep working (deleted
+// presets stay relaunchable): no 4xx, no injection, the reason on the wire.
+func TestPostSessionsUnknownPreset(t *testing.T) {
+	testutil.FakeClaude(t)
+	root := testutil.ResolvedTempDir(t)
+	env := newTestEnv(t, config.Config{Roots: []string{root}})
+
+	created := createSession(t, env, fmt.Sprintf(`{"folder":%q,"name":"ghost","presetName":"deleted-preset"}`, root))
+	if created.SettingsSkipReason == nil || *created.SettingsSkipReason != "preset no longer exists" {
+		t.Errorf("settingsSkipReason = %v, want \"preset no longer exists\"", created.SettingsSkipReason)
+	}
+	entry := startEntry(t, env, created.ID)
+	if entry["settingsSkipReason"] != "preset no longer exists" {
+		t.Errorf("journaled skip reason = %v", entry["settingsSkipReason"])
+	}
+	if entry["presetName"] != "deleted-preset" {
+		t.Errorf("presetName must journal even when unresolvable: %v", entry["presetName"])
+	}
+}
+
+// A resolved preset fills only the options the request left empty (request
+// wins) and supplies the settings JSON for injection.
+func TestPostSessionsPresetResolution(t *testing.T) {
+	testutil.FakeClaude(t)
+	root := testutil.ResolvedTempDir(t)
+	sub := filepath.Join(root, "other")
+	if err := os.MkdirAll(sub, 0o755); err != nil {
+		t.Fatal(err)
+	}
+	env := newTestEnv(t, config.Config{
+		Roots: []string{root},
+		Presets: []config.Preset{
+			{Name: "fast", PermissionMode: "acceptEdits", Capacity: 4, SettingsJSON: `{"env":{"GC_PRESET":"1"}}`},
+		},
+	})
+
+	// empty request fields take the preset's values; settings are injected
+	created := createSession(t, env, fmt.Sprintf(`{"folder":%q,"name":"from-preset","presetName":"fast"}`, root))
+	if created.PermissionMode != "acceptEdits" || created.Capacity != 4 {
+		t.Errorf("preset did not fill empty options: %+v", created)
+	}
+	if created.SettingsSkipReason != nil {
+		t.Errorf("preset launch skipped injection: %q", *created.SettingsSkipReason)
+	}
+	if _, err := os.Stat(filepath.Join(root, ".claude", "settings.local.json")); err != nil {
+		t.Errorf("preset settings not injected: %v", err)
+	}
+	if startEntry(t, env, created.ID)["settingsInjected"] != true {
+		t.Error("injection outcome missing from the session.start entry")
+	}
+
+	// explicit request fields win over the preset's
+	override := createSession(t, env, fmt.Sprintf(`{"folder":%q,"name":"override","presetName":"fast","permissionMode":"plan","capacity":9}`, sub))
+	if override.PermissionMode != "plan" || override.Capacity != 9 {
+		t.Errorf("request fields must win over the preset: %+v", override)
+	}
 }
 
 // createWorktreeSession launches a fake-claude worktree session off main and
@@ -871,6 +1069,124 @@ func TestPutConfigPersists(t *testing.T) {
 	}
 }
 
+// getPresets decodes the presets list out of GET /config.
+func getPresets(t *testing.T, h http.Handler) []config.Preset {
+	t.Helper()
+	rec := doReq(t, h, "GET", "/config", "", nil)
+	if rec.Code != 200 {
+		t.Fatalf("GET /config = %d: %s", rec.Code, rec.Body.String())
+	}
+	var got struct {
+		Presets []config.Preset `json:"presets"`
+	}
+	if err := json.Unmarshal(rec.Body.Bytes(), &got); err != nil {
+		t.Fatal(err)
+	}
+	return got.Presets
+}
+
+func TestPutConfigPresets(t *testing.T) {
+	t.Parallel()
+	env := newTestEnv(t, config.Config{})
+	h := env.handler
+
+	// two presets round-trip: one fully loaded (env key in settings is fine),
+	// one bare name (no settings JSON is valid)
+	body := `{"presets":[
+		{"name":"yolo","permissionMode":"bypassPermissions","spawnMode":"worktree","capacity":4,"settingsJson":"{\"env\":{\"FOO\":\"bar\"}}"},
+		{"name":"plain"}
+	]}`
+	if rec := doReq(t, h, "PUT", "/config", body, nil); rec.Code != 200 {
+		t.Fatalf("PUT /config = %d: %s", rec.Code, rec.Body.String())
+	}
+	presets := getPresets(t, h)
+	if len(presets) != 2 {
+		t.Fatalf("presets = %+v, want 2", presets)
+	}
+	p := presets[0]
+	if p.Name != "yolo" || p.PermissionMode != "bypassPermissions" || p.SpawnMode != "worktree" || p.Capacity != 4 || p.SettingsJSON != `{"env":{"FOO":"bar"}}` {
+		t.Errorf("preset did not round-trip: %+v", p)
+	}
+	if presets[1].Name != "plain" || presets[1].SettingsJSON != "" {
+		t.Errorf("bare preset wrong: %+v", presets[1])
+	}
+
+	// survives a reload: a fresh instance built from the persisted file
+	// serves the same presets
+	onDisk, err := config.Load(env.configPath)
+	if err != nil {
+		t.Fatalf("persisted config does not load: %v", err)
+	}
+	env2 := newTestEnv(t, onDisk)
+	if reloaded := getPresets(t, env2.handler); len(reloaded) != 2 || reloaded[0].Name != "yolo" {
+		t.Errorf("presets after reload = %+v", reloaded)
+	}
+
+	// a partial update that omits presets leaves them alone
+	if rec := doReq(t, h, "PUT", "/config", `{"showHidden":true}`, nil); rec.Code != 200 {
+		t.Fatalf("partial PUT /config = %d: %s", rec.Code, rec.Body.String())
+	}
+	if presets := getPresets(t, h); len(presets) != 2 {
+		t.Errorf("partial update dropped presets: %+v", presets)
+	}
+
+	// an explicit empty array clears them
+	if rec := doReq(t, h, "PUT", "/config", `{"presets":[]}`, nil); rec.Code != 200 {
+		t.Fatalf("clearing PUT /config = %d: %s", rec.Code, rec.Body.String())
+	}
+	if presets := getPresets(t, h); len(presets) != 0 {
+		t.Errorf("empty array did not clear presets: %+v", presets)
+	}
+}
+
+func TestPutConfigPresetValidation(t *testing.T) {
+	t.Parallel()
+	env := newTestEnv(t, config.Config{})
+	h := env.handler
+
+	// seed a known-good preset so "config unchanged" is observable on disk
+	if rec := doReq(t, h, "PUT", "/config", `{"presets":[{"name":"keep"}]}`, nil); rec.Code != 200 {
+		t.Fatalf("seed PUT /config = %d: %s", rec.Code, rec.Body.String())
+	}
+
+	oversized := fmt.Sprintf(`{\"pad\":\"%s\"}`, strings.Repeat("a", 65*1024))
+	cases := []struct {
+		name string
+		body string
+	}{
+		{"duplicate names", `{"presets":[{"name":"a"},{"name":"a"}]}`},
+		{"empty name", `{"presets":[{"name":""}]}`},
+		{"unknown permission mode", `{"presets":[{"name":"a","permissionMode":"yolo"}]}`},
+		{"unknown spawn mode", `{"presets":[{"name":"a","spawnMode":"docker"}]}`},
+		{"capacity over 256", `{"presets":[{"name":"a","capacity":257}]}`},
+		{"negative capacity", `{"presets":[{"name":"a","capacity":-1}]}`},
+		{"malformed settings", `{"presets":[{"name":"a","settingsJson":"{not json"}]}`},
+		{"settings not an object", `{"presets":[{"name":"a","settingsJson":"[1,2]"}]}`},
+		{"settings null", `{"presets":[{"name":"a","settingsJson":"null"}]}`},
+		{"settings over 64KB", `{"presets":[{"name":"a","settingsJson":"` + oversized + `"}]}`},
+		{"hooks key", `{"presets":[{"name":"a","settingsJson":"{\"hooks\":{}}"}]}`},
+	}
+	for _, tc := range cases {
+		t.Run(tc.name, func(t *testing.T) {
+			rec := doReq(t, h, "PUT", "/config", tc.body, nil)
+			if rec.Code != 400 {
+				t.Fatalf("status = %d, want 400 (%s)", rec.Code, rec.Body.String())
+			}
+			if got := errCode(t, rec); got != "invalid_config" {
+				t.Errorf("error code = %s, want invalid_config", got)
+			}
+			// rejected writes must leave the persisted config untouched
+			onDisk, err := config.Load(env.configPath)
+			if err != nil {
+				t.Fatalf("persisted config does not load: %v", err)
+			}
+			if len(onDisk.Presets) != 1 || onDisk.Presets[0].Name != "keep" {
+				t.Errorf("rejected PUT changed the persisted presets: %+v", onDisk.Presets)
+			}
+		})
+	}
+}
+
 func TestJournalRecentEndpoint(t *testing.T) {
 	t.Parallel()
 	root := testutil.ResolvedTempDir(t)
@@ -1010,4 +1326,177 @@ func TestNotFoundAndParamErrors(t *testing.T) {
 	if rec.Code != 400 || errCode(t, rec) != "invalid_path" {
 		t.Errorf("browse outside roots = %d %s, want 400 invalid_path", rec.Code, rec.Body.String())
 	}
+}
+
+/* ---------- Claude state enrichment on the wire ---------- */
+
+// enrichmentKeys are the registry-sourced session fields; all five must be
+// absent (not null, not empty) when nothing was captured.
+var enrichmentKeys = []string{`"claudeSessionId"`, `"activity"`, `"environmentSessions"`, `"folderSessions"`, `"prLink"`}
+
+func TestSessionEnrichmentWireShape(t *testing.T) {
+	t.Parallel()
+	uuid := "6f0a2c1e-aaaa-bbbb-cccc-1234567890ab"
+	activity := "busy"
+	s := sessions.Session{
+		ID:              "abc12345",
+		Name:            "n",
+		Folder:          "/f",
+		ClaudeSessionID: &uuid,
+		Activity:        &activity,
+		EnvironmentSessions: []sessions.ExtraSession{
+			{Name: "gc-x-1", Status: "idle"},
+		},
+		FolderSessions: []sessions.ExtraSession{
+			{Name: "manual"}, // unknown status serializes to no status key
+		},
+		PRLink: &sessions.PRLink{Number: 9, URL: "https://github.com/o/r/pull/9"},
+	}
+	data, err := json.Marshal(s)
+	if err != nil {
+		t.Fatal(err)
+	}
+	body := string(data)
+	for _, want := range []string{
+		`"claudeSessionId":"` + uuid + `"`,
+		`"activity":"busy"`,
+		`"environmentSessions":[{"name":"gc-x-1","status":"idle"}]`,
+		`"folderSessions":[{"name":"manual"}]`,
+		`"prLink":{"number":9,"url":"https://github.com/o/r/pull/9"}`,
+	} {
+		if !strings.Contains(body, want) {
+			t.Errorf("session JSON missing %s: %s", want, body)
+		}
+	}
+
+	// an unenriched session omits all five keys entirely
+	empty, err := json.Marshal(sessions.Session{ID: "abc12345"})
+	if err != nil {
+		t.Fatal(err)
+	}
+	for _, key := range enrichmentKeys {
+		if strings.Contains(string(empty), key) {
+			t.Errorf("unenriched session must omit %s: %s", key, empty)
+		}
+	}
+}
+
+func TestSessionsPayloadOmitsEnrichmentWhenAbsent(t *testing.T) {
+	testutil.FakeClaude(t)
+	root := testutil.ResolvedTempDir(t)
+	env := newTestEnv(t, config.Config{Roots: []string{root}})
+
+	created := createSession(t, env, fmt.Sprintf(`{"folder":%q}`, root))
+	for _, target := range []string{"/sessions", "/sessions/" + created.ID} {
+		rec := doReq(t, env.handler, "GET", target, "", nil)
+		if rec.Code != 200 {
+			t.Fatalf("GET %s = %d: %s", target, rec.Code, rec.Body.String())
+		}
+		for _, key := range enrichmentKeys {
+			if strings.Contains(rec.Body.String(), key) {
+				t.Errorf("GET %s leaked %s for an unenriched session: %s", target, key, rec.Body.String())
+			}
+		}
+	}
+}
+
+func TestLostAndLandedClaudeSessionID(t *testing.T) {
+	t.Parallel()
+	root := testutil.ResolvedTempDir(t)
+	env := newTestEnv(t, config.Config{Roots: []string{root}})
+
+	// a lost session's UUID lives on its standalone session.claude-id entry
+	env.journal.Append(map[string]any{"event": "session.start", "id": "lost1", "name": "l1", "folder": root})
+	env.journal.Append(map[string]any{"event": "session.claude-id", "id": "lost1", "claudeSessionId": "uuid-lost"})
+	env.journal.Append(map[string]any{"event": "session.start", "id": "lost2", "name": "l2", "folder": root})
+	// a landed session's UUID rides the flattened session.exit entry
+	env.journal.Append(map[string]any{"event": "session.start", "id": "done1", "name": "d1", "folder": root})
+	env.journal.Append(map[string]any{"event": "session.exit", "id": "done1", "code": 0, "claudeSessionId": "uuid-done"})
+	env.journal.Append(map[string]any{"event": "session.start", "id": "done2", "name": "d2", "folder": root})
+	env.journal.Append(map[string]any{"event": "session.exit", "id": "done2", "code": 0})
+
+	rec := doReq(t, env.handler, "GET", "/sessions", "", nil)
+	if rec.Code != 200 {
+		t.Fatalf("GET /sessions = %d: %s", rec.Code, rec.Body.String())
+	}
+	var list struct {
+		Lost   []sessions.LostSession   `json:"lost"`
+		Landed []sessions.LandedSession `json:"landed"`
+	}
+	if err := json.Unmarshal(rec.Body.Bytes(), &list); err != nil {
+		t.Fatal(err)
+	}
+
+	lost := map[string]sessions.LostSession{}
+	for _, l := range list.Lost {
+		lost[l.ID] = l
+	}
+	if got := lost["lost1"].ClaudeSessionID; got == nil || *got != "uuid-lost" {
+		t.Errorf("lost1 claudeSessionId = %v, want uuid-lost", got)
+	}
+	if got := lost["lost2"].ClaudeSessionID; got != nil {
+		t.Errorf("lost2 claudeSessionId = %q, want absent", *got)
+	}
+
+	landed := map[string]sessions.LandedSession{}
+	for _, l := range list.Landed {
+		landed[l.ID] = l
+	}
+	if got := landed["done1"].ClaudeSessionID; got == nil || *got != "uuid-done" {
+		t.Errorf("done1 claudeSessionId = %v, want uuid-done", got)
+	}
+	if got := landed["done2"].ClaudeSessionID; got != nil {
+		t.Errorf("done2 claudeSessionId = %q, want absent", *got)
+	}
+
+	// absent means absent on the wire, not null
+	body := rec.Body.String()
+	if strings.Count(body, `"claudeSessionId"`) != 2 {
+		t.Errorf("expected exactly two claudeSessionId keys (lost1, done1): %s", body)
+	}
+}
+
+func TestSessionsExtrasOverHTTP(t *testing.T) {
+	root := testutil.ResolvedTempDir(t)
+	// one same-folder registry row that no launch owns: it must surface as a
+	// folder row on the launched session. startedAt predates any launch, so
+	// even the ps-less fallback can never mistake it for the primary.
+	agents := fmt.Sprintf(`[{"pid":999999,"cwd":%q,"sessionId":"conv-extra","name":"folder-mate","status":"busy","startedAt":1}]`, root)
+	testutil.FakeClaudeWith(t, testutil.FakeClaudeConfig{AgentsJSON: agents})
+	env := newTestEnv(t, config.Config{Roots: []string{root}})
+	ctx, cancel := context.WithCancel(context.Background())
+	t.Cleanup(cancel)
+	env.sessions.StartRegistryLoop(ctx)
+
+	created := createSession(t, env, fmt.Sprintf(`{"folder":%q}`, root))
+
+	deadline := time.Now().Add(15 * time.Second)
+	for time.Now().Before(deadline) {
+		rec := doReq(t, env.handler, "GET", "/sessions", "", nil)
+		if rec.Code != 200 {
+			t.Fatalf("GET /sessions = %d: %s", rec.Code, rec.Body.String())
+		}
+		var list struct {
+			Sessions []sessions.Session `json:"sessions"`
+		}
+		if err := json.Unmarshal(rec.Body.Bytes(), &list); err != nil {
+			t.Fatal(err)
+		}
+		for _, s := range list.Sessions {
+			if s.ID != created.ID {
+				continue
+			}
+			for _, e := range s.FolderSessions {
+				if e.Name == "folder-mate" && e.Status == "busy" {
+					// the unowned row must never join as the primary
+					if s.ClaudeSessionID != nil {
+						t.Errorf("folder-mate row must not be captured as the session's own uuid: %v", *s.ClaudeSessionID)
+					}
+					return
+				}
+			}
+		}
+		time.Sleep(100 * time.Millisecond)
+	}
+	t.Fatal("folder-mate extra never appeared on GET /sessions")
 }

@@ -66,6 +66,10 @@ func main() {
 	// first one's live worktrees out from under its sessions.
 	if ws.AcquireRunnerLock() {
 		ws.SweepOrphans()
+		// same single-runner gate: a crashed runner's injected settings files
+		// (journaled as settingsInjected on session.start) are leftovers only
+		// when no other instance could still own live sessions in them
+		sessionMgr.SweepSettingsLeftovers()
 	} else {
 		log.Printf("another groundcontrol instance is running — skipping the orphan-worktree sweep")
 		jnl.Append(map[string]any{"event": "worktree.sweep-skipped", "reason": "another runner holds the lock"})
@@ -135,6 +139,11 @@ func main() {
 
 	ctx, stop := signal.NotifyContext(context.Background(), syscall.SIGINT, syscall.SIGTERM)
 	defer stop()
+
+	// the registry poller (claude agents --json enrichment) rides the same
+	// signal context as the server: armed here, it runs only while sessions
+	// are live and dies with the process
+	sessionMgr.StartRegistryLoop(ctx)
 
 	srv := &http.Server{
 		Handler:           mux,

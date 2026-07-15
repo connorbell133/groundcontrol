@@ -197,10 +197,31 @@ async function relaunchFromRecent(cfg) {
 
 /* ---------- launch sheet ---------- */
 function syncBranchField() {
-  // visible in any git repo with branches; the mode only changes what picking one means
-  $("branchField").hidden = !state.current?.isGit || state.branchCount === 0;
+  // every control stays on screen in every mode — capability only changes copy + enabled state
+  const git = !!state.current?.isGit;
+  const noBranches = git && state.branchCount === 0; // repo with no commits yet
   const worktree = state.opts.spawnMode === "worktree";
+
+  document.querySelectorAll("#optSpawn button").forEach((b) => (b.disabled = !git || noBranches));
+  $("optBranch").disabled = !git || noBranches;
+
+  $("spawnHint").textContent = !git
+    ? "not a git folder — runs in place"
+    : noBranches
+      ? "no commits yet — worktrees need a branch"
+      : worktree
+        ? "isolated worktree — this folder stays untouched"
+        : "runs directly in this folder";
+
   $("branchLabel").textContent = worktree ? "Base branch" : "Branch";
+  if (!git) {
+    $("branchHint").textContent = "no git here — nothing to branch";
+    return;
+  }
+  if (noBranches) {
+    $("branchHint").textContent = "no branches yet — make a first commit";
+    return;
+  }
   const note = worktree
     ? state.current?.repoRoot && state.current.repoRoot !== state.current.path
       ? `worktree of ${state.current.repoName}`
@@ -220,7 +241,6 @@ async function loadBranches(folder) {
       // repo with no commits yet: no branches to pick and worktrees are impossible
       if (state.opts.spawnMode === "worktree") state.opts.spawnMode = "same-dir";
       syncSegment("optSpawn", state.opts.spawnMode);
-      $("spawnField").hidden = true;
       syncBranchField();
       return;
     }
@@ -246,20 +266,29 @@ function openSheet(prefill) {
   $("sheetPath").textContent = folder;
 
   const saved = JSON.parse(localStorage.getItem(`opts:${folder}`) || "null");
-  state.opts = prefill || saved || launchDefaults();
+  state.opts = { ...(prefill || saved || launchDefaults()) };
+  // name/prompt ride the prefill for one mission only — never into the per-repo opts
+  delete state.opts.name;
+  delete state.opts.prompt;
 
-  // capability-conditional: a non-git folder gets no workspace/branch machinery at all,
-  // not a disabled control — choices that can't be made shouldn't be on screen
+  // every control stays on screen; a non-git folder gets them disabled with the reason in the hint
   const git = state.current.isGit;
-  $("spawnField").hidden = !git;
-  if (!git && state.opts.spawnMode === "worktree") state.opts.spawnMode = "same-dir";
+  if (!git) {
+    state.opts.spawnMode = "same-dir";
+    // clear the select so a stale branch from the last git folder can't appear or ride the POST
+    $("optBranch").innerHTML = "";
+    $("optBranch").value = "";
+    state.branchCount = 0;
+  } else {
+    state.branchCount = undefined; // unknown until this folder's branches load
+  }
   syncSegment("optSpawn", state.opts.spawnMode);
   syncSegment("optPerm", state.opts.permissionMode);
-  state.branchCount = undefined; // unknown until this folder's branches load
   syncBranchField();
   if (git) loadBranches(folder);
 
-  $("optName").value = "";
+  $("optName").value = prefill?.name || "";
+  $("optPrompt").value = prefill?.prompt || "";
   $("sheet").hidden = false;
   $("scrim").hidden = false;
   requestAnimationFrame(() => {
@@ -315,13 +344,14 @@ async function launch() {
   try {
     const branch = state.current.isGit ? $("optBranch").value || undefined : undefined;
     state.opts.branch = branch;
-    localStorage.setItem(`opts:${state.path}`, JSON.stringify(state.opts));
+    localStorage.setItem(`opts:${state.path}`, JSON.stringify(state.opts)); // prompt/name never saved — per mission, not per repo
     await api("/api/v1/sessions", {
       method: "POST",
       headers: { "content-type": "application/json" },
       body: JSON.stringify({
         folder: state.path,
         name: $("optName").value || undefined,
+        initialPrompt: $("optPrompt").value.trim() || undefined,
         spawnMode: state.opts.spawnMode,
         branch,
         permissionMode: state.opts.permissionMode,

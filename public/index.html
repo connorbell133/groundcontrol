@@ -105,15 +105,22 @@
       <span class="field-hint">left blank → auto-named from folder</span>
     </label>
 
+    <label class="field">
+      <span class="field-label">The thought</span>
+      <textarea id="optPrompt" rows="2" maxlength="4096" placeholder="claude's first prompt (optional)" autocomplete="off" autocapitalize="off" spellcheck="false"></textarea>
+      <span class="field-hint">left blank → claude waits for your first message</span>
+    </label>
+
     <div class="field" id="spawnField">
       <span class="field-label">Workspace</span>
       <div class="segment" id="optSpawn">
         <button data-value="same-dir" class="active">In folder</button>
         <button data-value="worktree">Worktree</button>
       </div>
+      <span class="field-hint" id="spawnHint"></span>
     </div>
 
-    <div class="field" id="branchField" hidden>
+    <div class="field" id="branchField">
       <span class="field-label" id="branchLabel">Branch</span>
       <div class="select-wrap">
         <select id="optBranch" aria-label="Branch for the session"></select>

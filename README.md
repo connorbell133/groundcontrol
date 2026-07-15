@@ -141,6 +141,36 @@ The tower just binds `host:port` — how you get HTTPS to it is up to you. A few
 
 Whatever you pick, the `authToken` is defense-in-depth on top of that perimeter, not a substitute for one. **Do not port-forward this to the open internet** — it launches shells on your machine; that's the entire point of it.
 
+### Keeping it running
+
+`./groundcontrol` in a terminal dies with the terminal — fine for a first look, not for a tower you want to reach from the couch tomorrow. Pick one:
+
+- **tmux/screen**, the zero-config option: `tmux new -s groundcontrol -d 'cd ~/.groundcontrol && groundcontrol'`, reattach any time with `tmux attach -t groundcontrol`.
+- **systemd user service** (Linux) — survives logout, restarts on crash:
+
+  ```ini
+  # ~/.config/systemd/user/groundcontrol.service
+  [Unit]
+  Description=groundcontrol
+
+  [Service]
+  WorkingDirectory=%h/.groundcontrol
+  ExecStart=%h/go/bin/groundcontrol
+  Restart=on-failure
+
+  [Install]
+  WantedBy=default.target
+  ```
+
+  ```bash
+  systemctl --user enable --now groundcontrol
+  loginctl enable-linger "$USER"   # keeps it running after you log out
+  ```
+
+- **launchd** (macOS) — same idea, a `~/Library/LaunchAgents/com.groundcontrol.plist` with `ProgramArguments` pointing at the binary and `WorkingDirectory` set to `~/.groundcontrol`, loaded with `launchctl load -w ~/Library/LaunchAgents/com.groundcontrol.plist`.
+
+Adjust the binary path to wherever `go env GOPATH`/bin (or your build output) actually put it.
+
 ## Configuration
 
 | key | what it does |
@@ -151,7 +181,7 @@ Whatever you pick, the `authToken` is defense-in-depth on top of that perimeter,
 | `webhooks` | notification subscribers: `[{url, events?}]` — each lifecycle event is POSTed as JSON to every matching URL; filter with exact names, `session.*`, `session.failed`, or `*` |
 | `jobs` | headless-job bounds: `{concurrency, timeoutMs}` (default 2 parallel, 15 min) |
 | `showHidden` | show dotfolders in the browser |
-| `port`, `host` | where the server listens |
+| `port`, `host` | where the server listens. `host` defaults to `127.0.0.1` (loopback only) if omitted — the example config and `install.sh`'s generated config both set it to `0.0.0.0` so LAN/Tailscale/proxy access works out of the box; narrow it back to `127.0.0.1` if you're only ever reaching it through something on `localhost` (an SSH tunnel, a reverse proxy on the same box) |
 
 Everything user-facing — theme, launch defaults, roots, the notification webhook, kept-worktree cleanup — is also editable from the ⚙ Settings sheet in the app itself.
 

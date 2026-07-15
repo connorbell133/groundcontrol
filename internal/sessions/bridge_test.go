@@ -359,27 +359,27 @@ func TestReconcileScrapedURLAgreementRetiresScanQuietly(t *testing.T) {
 	}
 }
 
-func TestBridgeIsDescendantBounds(t *testing.T) {
+func TestReachesAncestorBounds(t *testing.T) {
 	t.Run("cycle-safe", func(t *testing.T) {
-		if bridgeIsDescendant(2, 100, map[int]int{2: 3, 3: 2}) {
+		if reachesAncestor(map[int]int{2: 3, 3: 2}, 2, 100) {
 			t.Error("cycle walked to a false match")
 		}
 	})
 	t.Run("depth-bounded", func(t *testing.T) {
 		ps := map[int]int{}
-		for pid := 2; pid <= 2+bridgeMaxAncestryDepth+5; pid++ {
+		for pid := 2; pid <= 2+maxAncestryDepth+5; pid++ {
 			ps[pid] = pid - 1
 		}
-		deep := 2 + bridgeMaxAncestryDepth + 5
-		if bridgeIsDescendant(deep, 1, ps) {
+		deep := 2 + maxAncestryDepth + 5
+		if reachesAncestor(ps, deep, 1) {
 			t.Error("walk exceeded the ancestry depth bound")
 		}
-		if !bridgeIsDescendant(4, 2, ps) {
+		if !reachesAncestor(ps, 4, 2) {
 			t.Error("short chain within the bound should match")
 		}
 	})
 	t.Run("nonpositive pids never match", func(t *testing.T) {
-		if bridgeIsDescendant(0, 0, map[int]int{}) || bridgeIsDescendant(5, 0, map[int]int{5: 0}) {
+		if reachesAncestor(map[int]int{}, 0, 0) || reachesAncestor(map[int]int{5: 0}, 5, 0) {
 			t.Error("pid 0 matched")
 		}
 	})

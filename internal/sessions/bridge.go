@@ -18,14 +18,10 @@ pointer belongs to this launch when its pid is the spawned pid or a descendant
 of it; procStart is a secondary sanity guard against freak pid reuse. */
 
 import (
-	"bytes"
-	"context"
 	"encoding/json"
 	"log"
 	"os"
-	"os/exec"
 	"path/filepath"
-	"strconv"
 	"strings"
 	"time"
 )
@@ -39,10 +35,7 @@ const (
 
 const (
 	bridgePointerFile = "bridge-pointer.json"
-	// launcher→server is one fork today; headroom for CLI re-forks, and the
-	// bound doubles as cycle safety against a torn ps snapshot
-	bridgeMaxAncestryDepth = 10
-	bridgePSTimeout        = 5 * time.Second
+	bridgePSTimeout   = 5 * time.Second
 	// procStart is a ctime-style local-time string with no format guarantee;
 	// the window is generous because it only needs to catch pointers from a
 	// different era, not race the clock
@@ -57,58 +50,10 @@ var (
 	bridgePollWindow   = 15 * time.Second
 )
 
-// bridgePSMap is the pid→ppid snapshot the descendant test walks; a package
-// var so tests inject synthetic process trees. Named apart from the registry
-// poller's ps helper landing in this package on a parallel branch.
-var bridgePSMap = bridgePSParents
-
-func bridgePSParents(timeout time.Duration) (map[int]int, error) {
-	ctx, cancel := context.WithTimeout(context.Background(), timeout)
-	defer cancel()
-	cmd := exec.CommandContext(ctx, "ps", "-axo", "pid=,ppid=")
-	var out bytes.Buffer
-	cmd.Stdout = &out
-	if err := cmd.Run(); err != nil {
-		if ctx.Err() != nil {
-			return nil, ctx.Err()
-		}
-		return nil, err
-	}
-	ps := map[int]int{}
-	for _, line := range strings.Split(out.String(), "\n") {
-		fields := strings.Fields(line)
-		if len(fields) != 2 {
-			continue
-		}
-		pid, errPid := strconv.Atoi(fields[0])
-		ppid, errPpid := strconv.Atoi(fields[1])
-		if errPid != nil || errPpid != nil {
-			continue // torn line — skip, never error
-		}
-		ps[pid] = ppid
-	}
-	return ps, nil
-}
-
-// bridgeIsDescendant walks pid's ancestry looking for ancestor. The depth
-// bound doubles as cycle safety: pid reuse in a torn snapshot can point a
-// ppid chain back at itself.
-func bridgeIsDescendant(pid, ancestor int, ps map[int]int) bool {
-	if pid <= 0 || ancestor <= 0 {
-		return false
-	}
-	for depth := 0; depth <= bridgeMaxAncestryDepth; depth++ {
-		if pid == ancestor {
-			return true
-		}
-		parent, ok := ps[pid]
-		if !ok || parent <= 0 || parent == pid {
-			return false
-		}
-		pid = parent
-	}
-	return false
-}
+// bridgePSMap is the pid→ppid snapshot the descendant test walks (shared exec
+// in ps.go); a package var kept separate from the registry poller's seam so
+// their test harnesses can swap process trees independently.
+var bridgePSMap = execPSParents
 
 // bridgePointer decodes only what acceptance needs; unknown fields ignored
 // per the tolerant-parse house rule (R7).
@@ -146,7 +91,7 @@ func acceptBridgePointer(p *bridgePointer, spawnPID int, launched time.Time, hav
 	}
 	if p.PID != spawnPID {
 		ps, err := bridgePSMap(bridgePSTimeout)
-		if err != nil || !bridgeIsDescendant(p.PID, spawnPID, ps) {
+		if err != nil || !reachesAncestor(ps, p.PID, spawnPID) {
 			// a live pointer we can't tie to our spawn is indistinguishable
 			// from a concurrent same-dir launch's — reject and ride the scrape
 			return false

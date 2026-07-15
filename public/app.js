@@ -212,13 +212,12 @@ async function loadRecents() {
 async function relaunchFromRecent(cfg) {
   try {
     await loadFolder(cfg.folder);
-    const prompt = cfg.initialPrompt ?? undefined;
     if (cfg.stale) {
       // the branch this config used no longer exists — degrade honestly
       toast(`branch ${cfg.branch} no longer exists — defaulting to in-folder`, true);
-      openSheet({ spawnMode: "same-dir", permissionMode: cfg.permissionMode, prompt });
+      openSheet({ spawnMode: "same-dir", permissionMode: cfg.permissionMode });
     } else {
-      openSheet({ spawnMode: cfg.spawnMode, permissionMode: cfg.permissionMode, branch: cfg.branch ?? undefined, prompt });
+      openSheet({ spawnMode: cfg.spawnMode, permissionMode: cfg.permissionMode, branch: cfg.branch ?? undefined });
     }
   } catch (e) {
     toast(e.message, true);
@@ -229,10 +228,6 @@ async function relaunchFromRecent(cfg) {
 // the currently rendered matches — Enter activates when exactly one is visible
 let missionMatches = [];
 let missionTimer;
-
-// shared/deep-linked text with no destination yet — rides into the next
-// launch sheet's prompt field, consumed once
-let pendingPrompt = null;
 
 // every typed token must land somewhere in folder basename, mission name, or
 // branch; newest-first journal order wins ties, one result per folder
@@ -377,9 +372,8 @@ function openSheet(prefill) {
 
   const saved = JSON.parse(localStorage.getItem(`opts:${folder}`) || "null");
   state.opts = { ...(prefill || saved || launchDefaults()) };
-  // name/prompt ride the prefill for one mission only — never into the per-repo opts
+  // name rides the prefill for one mission only — never into the per-repo opts
   delete state.opts.name;
-  delete state.opts.prompt;
 
   // every control stays on screen; a non-git folder gets them disabled with the reason in the hint
   const git = state.current.isGit;
@@ -398,10 +392,6 @@ function openSheet(prefill) {
   if (git) loadBranches(folder);
 
   $("optName").value = prefill?.name || "";
-  // a share/deep-link stashed a prompt with no destination — it lands here once,
-  // and being the fresher intent it outranks a recent's stored prompt
-  $("optPrompt").value = pendingPrompt || prefill?.prompt || "";
-  pendingPrompt = null;
   $("sheet").hidden = false;
   $("scrim").hidden = false;
   requestAnimationFrame(() => {
@@ -451,14 +441,13 @@ async function doLaunch() {
   try {
     const branch = state.current.isGit ? $("optBranch").value || undefined : undefined;
     state.opts.branch = branch;
-    localStorage.setItem(`opts:${state.path}`, JSON.stringify(state.opts)); // prompt/name never saved — per mission, not per repo
+    localStorage.setItem(`opts:${state.path}`, JSON.stringify(state.opts)); // name never saved — per mission, not per repo
     await api("/api/v1/sessions", {
       method: "POST",
       headers: { "content-type": "application/json" },
       body: JSON.stringify({
         folder: state.path,
         name: $("optName").value || undefined,
-        initialPrompt: $("optPrompt").value.trim() || undefined,
         spawnMode: state.opts.spawnMode,
         branch,
         permissionMode: state.opts.permissionMode,
@@ -576,22 +565,15 @@ function diffStatLine(d) {
   return parts.join(" · ");
 }
 
-// prompt block (one-tap copy) + diff stat + branch-state chip; each piece
-// renders only when its data exists — no placeholders on same-dir runs
-function debriefHTML(id, prompt, debrief) {
-  const promptBlock = prompt
-    ? `<div class="debrief-prompt">
-        <div class="debrief-prompt-text">${esc(prompt)}</div>
-        <button class="log-tool" data-copy-prompt="${id}">copy</button>
-      </div>`
-    : "";
-  const statBlock = debrief
+// diff stat + branch-state chip; renders only when the data exists — no
+// placeholders on same-dir runs
+function debriefHTML(debrief) {
+  return debrief
     ? `<div class="debrief-stat">
         <span class="debrief-diff">${diffStatLine(debrief)}</span>
         <span class="orbit-state ${esc(debrief.branchState)}">${esc(BRANCH_STATE_LABEL[debrief.branchState] || debrief.branchState)}</span>
       </div>`
     : "";
-  return promptBlock + statBlock;
 }
 
 // contextual cleanup for a live exited/error card. Landed journal entries
@@ -677,13 +659,13 @@ function renderShell(card, s) {
         <div class="seq-stage done"><span class="seq-mark">✓</span><span class="seq-label">request accepted</span></div>
         <div class="seq-stage failed"><span class="seq-mark">✕</span><span class="seq-label">ignition failed — launch scrubbed</span></div>
       </div>
-      ${debriefHTML(s.id, s.initialPrompt, s.debrief)}
+      ${debriefHTML(s.debrief)}
       <div class="session-actions">
         <button class="btn" data-relaunch="${s.id}">Relaunch</button>
         ${cleanupBtnHTML(s)}
         <button class="btn" data-remove="${s.id}">Dismiss</button>
       </div>` : `
-      ${debriefHTML(s.id, s.initialPrompt, s.debrief)}
+      ${debriefHTML(s.debrief)}
       <div class="session-actions">
         <button class="btn" data-relaunch="${s.id}">Relaunch</button>
         ${cleanupBtnHTML(s)}
@@ -742,7 +724,7 @@ function renderLandedShell(card, l) {
       <span class="meta-chip">${esc(l.permissionMode)}</span>
       <span class="meta-chip age">ran ${fmtDur(Date.parse(l.exitedAt) - Date.parse(l.startedAt))}</span>
     </div>
-    ${debriefHTML(l.id, l.initialPrompt, l.debrief)}
+    ${debriefHTML(l.debrief)}
     <div class="session-actions">
       <button class="btn" data-relaunch="${l.id}">Relaunch</button>
       ${l.debrief?.branchState === "in-orbit" ? `<button class="btn" data-orbit-clean="${l.id}">Clean branch</button>` : ""}
@@ -1034,22 +1016,8 @@ document.addEventListener("click", async (e) => {
   const relaunch = e.target.closest?.("[data-relaunch]");
   const kill = e.target.closest?.("[data-kill]");
   const remove = e.target.closest?.("[data-remove]");
-  const copyPrompt = e.target.closest?.("[data-copy-prompt]");
   const orbitClean = e.target.closest?.("[data-orbit-clean]");
   const wtClean = e.target.closest?.("[data-wt-clean]");
-
-  if (copyPrompt) {
-    const id = copyPrompt.dataset.copyPrompt;
-    const cfg = state.sessions.find((x) => x.id === id) || state.landed.find((l) => l.id === id);
-    if (!cfg?.initialPrompt) return;
-    try {
-      await navigator.clipboard.writeText(cfg.initialPrompt);
-      toast("Prompt copied");
-    } catch {
-      toast("Copy failed", true);
-    }
-    return;
-  }
 
   if (orbitClean) {
     const id = orbitClean.dataset.orbitClean;
@@ -1517,22 +1485,16 @@ wireSegment("optSpawn", "spawnMode", syncBranchField);
 wireSegment("optPerm", "permissionMode");
 $("optBranch").onchange = () => (state.opts.branch = $("optBranch").value);
 
-/* ---------- URL-parameter launch (manifest shortcuts, share target, scripts) ---------- */
-// Grammar: ?path=/abs/dir[&prompt=...][&name=...] | ?prompt=... | ?mission=1 | ?relaunch=last
-// Share target (GET) arrives as title/text/url and maps onto prompt when no explicit
-// param is present. Params only prefill UI — launching always takes a human tap.
+/* ---------- URL-parameter launch (manifest shortcuts, scripts) ---------- */
+// Grammar: ?path=/abs/dir[&name=...] | ?mission=1 | ?relaunch=last
+// Params only prefill UI — launching always takes a human tap.
 const PARAM_TEXT_MAX = 4096;
 
-// Land on Browse at roots and hand `text` to the mission input. The input ships in a
-// sibling unit, so it may not exist yet — degrade to a toast instead of dropping silently.
-async function missionEntry(text) {
+// Land on Browse at roots with the mission input focused. The input ships in a
+// sibling unit, so it may not exist yet — the focus simply no-ops.
+async function missionEntry() {
   switchTab("browse");
   if (state.path !== null) await loadFolder(null);
-  if (text) {
-    // shared text is a prompt, not a repo query — hold it for the next launch sheet
-    pendingPrompt = text;
-    toast("note saved — pick a repo and it rides along as the prompt");
-  }
   document.getElementById("missionInput")?.focus();
 }
 
@@ -1540,14 +1502,10 @@ async function consumeLaunchParams() {
   const qs = new URLSearchParams(location.search);
   const trunc = (v) => (v ? String(v).slice(0, PARAM_TEXT_MAX) : undefined);
   const path = qs.get("path");
-  let prompt = trunc(qs.get("prompt"));
   const name = trunc(qs.get("name"));
   const mission = qs.get("mission") === "1";
   const relaunch = qs.get("relaunch") === "last";
-  if (!path && !prompt && !name && !mission && !relaunch) {
-    prompt = trunc(qs.get("text") || qs.get("url") || qs.get("title")); // share-target mapping
-    if (!prompt) return; // nothing we understand — leave the URL alone
-  }
+  if (!path && !name && !mission && !relaunch) return; // nothing we understand — leave the URL alone
   try {
     history.replaceState(null, "", "/"); // consumed — reload/relaunch never replays
   } catch {
@@ -1561,11 +1519,11 @@ async function consumeLaunchParams() {
     if (inRoots) {
       await loadFolder(path);
       const saved = JSON.parse(localStorage.getItem(`opts:${path}`) || "null");
-      openSheet({ ...(saved || launchDefaults()), prompt, name });
+      openSheet({ ...(saved || launchDefaults()), name });
       return;
     }
     toast("path is outside the configured roots", true);
-    if (!prompt) return; // fall through: a share with a bad path still keeps its text
+    return;
   }
   if (relaunch) {
     const { recent } = await api("/api/v1/journal/recent?limit=1");
@@ -1576,10 +1534,6 @@ async function consumeLaunchParams() {
       return;
     }
     await relaunchFromRecent(last); // handles the stale-branch degrade + toast itself
-    return;
-  }
-  if (prompt) {
-    await missionEntry(prompt);
     return;
   }
   if (mission) await missionEntry();

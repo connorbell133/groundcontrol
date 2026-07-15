@@ -36,7 +36,7 @@ import (
 // Codes in use: unauthorized, insufficient_scope, invalid_json, missing_param,
 // invalid_param, invalid_path, invalid_config, outside_roots, not_found, not_ready,
 // ready_timeout, launch_failed, session_live, job_live, worktree_error, not_implemented,
-// prompt_too_long, branch_held, branch_not_merged.
+// branch_held, branch_not_merged.
 
 // scope names one capability a token can grant; the wire format stays the
 // plain string ("read" etc.) in config files and error messages.
@@ -299,17 +299,12 @@ func (s *Server) authMiddleware(next http.Handler) http.Handler {
 	})
 }
 
-// maxInitialPromptBytes caps the opening prompt: it rides every session
-// listing, journal line, and webhook payload, so keep it a prompt, not a document.
-const maxInitialPromptBytes = 4096
-
 type createSessionRequest struct {
 	Folder         string `json:"folder"`
 	Name           string `json:"name"`
 	SpawnMode      string `json:"spawnMode"`
 	Branch         string `json:"branch"`
 	PermissionMode string `json:"permissionMode"`
-	InitialPrompt  string `json:"initialPrompt"`
 	// pointers so "sent but empty/zero" still fails validation while "absent"
 	// falls back cleanly
 	CallbackURL *string  `json:"callbackUrl"`
@@ -601,10 +596,6 @@ func (s *Server) Handler() http.Handler {
 			apiErr(w, 400, "outside_roots", "folder outside configured roots")
 			return
 		}
-		if len(req.InitialPrompt) > maxInitialPromptBytes {
-			apiErr(w, 400, "prompt_too_long", fmt.Sprintf("initialPrompt must be at most %d bytes", maxInitialPromptBytes))
-			return
-		}
 		var callbackURL string
 		if req.CallbackURL != nil {
 			if !httpURL.MatchString(*req.CallbackURL) {
@@ -620,7 +611,6 @@ func (s *Server) Handler() http.Handler {
 			SpawnMode:      req.SpawnMode,
 			Branch:         req.Branch,
 			PermissionMode: req.PermissionMode,
-			InitialPrompt:  req.InitialPrompt,
 			CallbackURL:    callbackURL,
 			Actor:          actorOf(r).name,
 		})

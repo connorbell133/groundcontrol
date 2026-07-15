@@ -2,7 +2,6 @@ package sessions
 
 import (
 	"fmt"
-	"os"
 	"path/filepath"
 	"strings"
 	"testing"
@@ -128,36 +127,6 @@ func TestRecentLaunchesDedupAndOrder(t *testing.T) {
 	}
 }
 
-func TestRecentLaunchesInitialPrompt(t *testing.T) {
-	t.Parallel()
-	root := testutil.ResolvedTempDir(t)
-	m := testManager(t, []string{root})
-	// distinct folders so the dedup key keeps both entries
-	withDir := filepath.Join(root, "with")
-	withoutDir := filepath.Join(root, "without")
-	for _, d := range []string{withDir, withoutDir} {
-		if err := os.MkdirAll(d, 0o755); err != nil {
-			t.Fatal(err)
-		}
-	}
-	// markup and quotes must survive the journal round-trip byte-identical
-	prompt := `<script>alert(1)</script> "double" 'single'`
-	m.journal.Append(map[string]any{"event": evSessionStart, "id": "p1", "name": "with", "folder": withDir, "initialPrompt": prompt})
-	m.journal.Append(map[string]any{"event": evSessionStart, "id": "p2", "name": "without", "folder": withoutDir})
-
-	out := m.RecentLaunches(10)
-	if len(out) != 2 {
-		t.Fatalf("expected 2 launches, got %+v", out)
-	}
-	// newest first: the promptless launch, then the prompted one
-	if out[0].InitialPrompt != nil {
-		t.Errorf("promptless launch carries %q, want nil", *out[0].InitialPrompt)
-	}
-	if out[1].InitialPrompt == nil || *out[1].InitialPrompt != prompt {
-		t.Errorf("prompted launch = %+v, want initialPrompt %q", out[1], prompt)
-	}
-}
-
 func TestBranchStateAfterRemove(t *testing.T) {
 	t.Parallel()
 	repo := testutil.InitRepo(t)
@@ -194,7 +163,7 @@ func TestListLanded(t *testing.T) {
 	m := testManager(t, []string{root})
 
 	// worktree session whose exit entry carries a debrief
-	m.journal.Append(map[string]any{"event": evSessionStart, "id": "w1", "name": "wt", "folder": root, "spawnMode": "worktree", "branch": "main", "permissionMode": "acceptEdits", "initialPrompt": "fix it"})
+	m.journal.Append(map[string]any{"event": evSessionStart, "id": "w1", "name": "wt", "folder": root, "spawnMode": "worktree", "branch": "main", "permissionMode": "acceptEdits"})
 	m.journal.Append(map[string]any{"event": evSessionExit, "id": "w1", "code": 0, "filesChanged": 2, "insertions": 5, "deletions": 1, "uncommitted": 1, "branchState": "in-orbit"})
 	// same-dir session: no debrief fields on the exit entry
 	m.journal.Append(map[string]any{"event": evSessionStart, "id": "s1", "name": "plain", "folder": root})
@@ -236,9 +205,6 @@ func TestListLanded(t *testing.T) {
 	if w1.Debrief.FilesChanged != 2 || w1.Debrief.Insertions != 5 || w1.Debrief.Deletions != 1 || w1.Debrief.Uncommitted != 1 || w1.Debrief.BranchState != "in-orbit" {
 		t.Errorf("w1 debrief = %+v", w1.Debrief)
 	}
-	if w1.InitialPrompt == nil || *w1.InitialPrompt != "fix it" {
-		t.Errorf("w1 initialPrompt = %v", w1.InitialPrompt)
-	}
 	if w1.Branch == nil || *w1.Branch != "main" || w1.SpawnMode != "worktree" || w1.PermissionMode != "acceptEdits" {
 		t.Errorf("w1 launch config = %+v", w1)
 	}
@@ -266,21 +232,5 @@ func TestListLandedCap(t *testing.T) {
 	// newest first: the last-started session leads, the oldest five fall off
 	if landed[0].ID != fmt.Sprintf("id-%02d", landedCap+4) || landed[landedCap-1].ID != "id-05" {
 		t.Errorf("unexpected window: first %s, last %s", landed[0].ID, landed[landedCap-1].ID)
-	}
-}
-
-func TestListLostCarriesInitialPrompt(t *testing.T) {
-	t.Parallel()
-	root := testutil.ResolvedTempDir(t)
-	m := testManager(t, []string{root})
-	prompt := "resume the refactor"
-	m.journal.Append(map[string]any{"event": evSessionStart, "id": "lost1", "name": "one", "folder": root, "initialPrompt": prompt})
-
-	lost := m.ListLost()
-	if len(lost) != 1 {
-		t.Fatalf("expected one lost session, got %+v", lost)
-	}
-	if lost[0].InitialPrompt == nil || *lost[0].InitialPrompt != prompt {
-		t.Errorf("lost session = %+v, want initialPrompt %q", lost[0], prompt)
 	}
 }

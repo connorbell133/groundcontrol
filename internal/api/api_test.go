@@ -267,8 +267,6 @@ func TestPostSessionsValidation(t *testing.T) {
 		{"folder outside roots", `{"folder":"/definitely/not/in/roots"}`, 400, "outside_roots"},
 		{"bad callbackUrl", fmt.Sprintf(`{"folder":%q,"callbackUrl":"not-a-url"}`, root), 400, "invalid_param"},
 		{"empty callbackUrl still validated", fmt.Sprintf(`{"folder":%q,"callbackUrl":""}`, root), 400, "invalid_param"},
-		{"wrong-typed initialPrompt", fmt.Sprintf(`{"folder":%q,"initialPrompt":123}`, root), 400, "invalid_param"},
-		{"initialPrompt over 4096 bytes", fmt.Sprintf(`{"folder":%q,"initialPrompt":%q}`, root, strings.Repeat("a", 4097)), 400, "prompt_too_long"},
 		// fails inside Create before any spawn: worktree mode needs a branch
 		{"worktree without branch", fmt.Sprintf(`{"folder":%q,"spawnMode":"worktree"}`, root), 409, "launch_failed"},
 	}
@@ -318,85 +316,6 @@ func createSession(t *testing.T, env *testEnv, body string) sessions.Session {
 	}
 	t.Cleanup(func() { killAndWait(t, env, created.ID) })
 	return created
-}
-
-// Full lifecycle against the fake claude stub. FakeClaude uses t.Setenv,
-// which forbids t.Parallel in these tests.
-func TestSessionInitialPromptLifecycle(t *testing.T) {
-	testutil.FakeClaude(t)
-	root := testutil.ResolvedTempDir(t)
-	env := newTestEnv(t, config.Config{Roots: []string{root}})
-	h := env.handler
-
-	// markup and quotes stay verbatim — escaping is the client's job
-	prompt := `<script>alert(1)</script> "double" 'single' & <b>`
-	payload, err := json.Marshal(map[string]any{"folder": root, "name": "with-prompt", "initialPrompt": prompt})
-	if err != nil {
-		t.Fatal(err)
-	}
-	created := createSession(t, env, string(payload))
-	if created.InitialPrompt == nil || *created.InitialPrompt != prompt {
-		t.Errorf("created initialPrompt = %v, want %q byte-identical", created.InitialPrompt, prompt)
-	}
-
-	// the stub's pairing URL is scraped like the real CLI's
-	if outcome := env.sessions.WaitForReady(created.ID, 10*time.Second); outcome != "ready" {
-		t.Fatalf("WaitForReady = %q, want ready", outcome)
-	}
-
-	// GET /sessions carries it on the listed session
-	rec := doReq(t, h, "GET", "/sessions", "", nil)
-	var list struct {
-		Sessions []sessions.Session `json:"sessions"`
-	}
-	if err := json.Unmarshal(rec.Body.Bytes(), &list); err != nil {
-		t.Fatal(err)
-	}
-	found := false
-	for _, s := range list.Sessions {
-		if s.ID == created.ID {
-			found = true
-			if s.InitialPrompt == nil || *s.InitialPrompt != prompt {
-				t.Errorf("listed initialPrompt = %v, want %q", s.InitialPrompt, prompt)
-			}
-		}
-	}
-	if !found {
-		t.Fatalf("session %s missing from GET /sessions", created.ID)
-	}
-
-	// the session.start journal entry carries it verbatim
-	found = false
-	for _, e := range env.journal.Read() {
-		if e["event"] == "session.start" && e["id"] == created.ID {
-			found = true
-			if e["initialPrompt"] != prompt {
-				t.Errorf("journal initialPrompt = %v, want %q", e["initialPrompt"], prompt)
-			}
-		}
-	}
-	if !found {
-		t.Error("no session.start journal entry for the launch")
-	}
-
-	// /journal/recent surfaces it on the matching recent
-	rec = doReq(t, h, "GET", "/journal/recent", "", nil)
-	var recent struct {
-		Recent []sessions.RecentLaunch `json:"recent"`
-	}
-	if err := json.Unmarshal(rec.Body.Bytes(), &recent); err != nil {
-		t.Fatal(err)
-	}
-	if len(recent.Recent) == 0 || recent.Recent[0].InitialPrompt == nil || *recent.Recent[0].InitialPrompt != prompt {
-		t.Errorf("recent launch missing prompt: %+v", recent.Recent)
-	}
-
-	// a prompt of exactly 4096 bytes is inside the cap
-	payload, err = json.Marshal(map[string]any{"folder": root, "name": "max-prompt", "initialPrompt": strings.Repeat("a", 4096)})
-	if err != nil {
-		t.Fatal(err)
-	}
-	createSession(t, env, string(payload))
 }
 
 // waitForExitEntry polls for the session.exit journal entry: the exit
@@ -827,28 +746,6 @@ func TestOrbitHeldByKeptWorktree(t *testing.T) {
 	}
 	if out := testutil.MustGit(t, repo, "branch", "--list", branch); out == "" {
 		t.Error("held branch must survive the refused sweep")
-	}
-}
-
-func TestSessionWithoutInitialPrompt(t *testing.T) {
-	testutil.FakeClaude(t)
-	root := testutil.ResolvedTempDir(t)
-	env := newTestEnv(t, config.Config{Roots: []string{root}})
-
-	created := createSession(t, env, fmt.Sprintf(`{"folder":%q,"name":"no-prompt"}`, root))
-	if created.InitialPrompt != nil {
-		t.Errorf("initialPrompt = %q, want nil", *created.InitialPrompt)
-	}
-	rec := doReq(t, env.handler, "GET", "/sessions/"+created.ID, "", nil)
-	if strings.Contains(rec.Body.String(), "initialPrompt") {
-		t.Errorf("initialPrompt key must be absent when not sent: %s", rec.Body.String())
-	}
-	for _, e := range env.journal.Read() {
-		if e["event"] == "session.start" && e["id"] == created.ID {
-			if _, ok := e["initialPrompt"]; ok {
-				t.Errorf("journal entry must omit initialPrompt: %v", e)
-			}
-		}
 	}
 }
 

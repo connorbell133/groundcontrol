@@ -81,7 +81,6 @@ components:
                 - invalid_path
                 - invalid_config
                 - outside_roots
-                - prompt_too_long
                 - not_found
                 - not_ready
                 - ready_timeout
@@ -106,7 +105,6 @@ components:
         branch: { type: [string, "null"] }
         worktreePath: { type: [string, "null"] }
         permissionMode: { type: string, description: "claude permission mode: default, acceptEdits, plan, bypassPermissions" }
-        initialPrompt: { type: string, description: "Opening prompt captured at launch, ≤4096 bytes, stored verbatim (escape for HTML client-side); absent when the launch had none." }
         state:
           type: string
           enum: [starting, ready, exited, error]
@@ -152,7 +150,7 @@ components:
         listed under "sessions" (live, or exited but not yet dismissed) are
         excluded. Newest exits first, capped at 20, 7-day window, scoped to
         the configured roots.
-      required: [id, name, folder, branch, spawnMode, permissionMode, initialPrompt, startedAt, exitedAt, exitCode]
+      required: [id, name, folder, branch, spawnMode, permissionMode, startedAt, exitedAt, exitCode]
       properties:
         id: { type: string }
         name: { type: string }
@@ -160,7 +158,6 @@ components:
         branch: { type: [string, "null"] }
         spawnMode: { type: string }
         permissionMode: { type: string }
-        initialPrompt: { type: [string, "null"], description: The launch's opening prompt, when one was given. }
         startedAt: { type: string, format: date-time }
         exitedAt: { type: string, format: date-time }
         exitCode: { type: [integer, "null"] }
@@ -172,13 +169,6 @@ components:
       properties:
         folder: { type: string, description: Absolute path inside a configured root. }
         name: { type: string, description: Must not collide with a live session; omitted → auto-generated. }
-        initialPrompt:
-          type: string
-          maxLength: 4096
-          description: >
-            Optional opening prompt shown with the session; over 4096 bytes is
-            rejected with 400 prompt_too_long. Stored verbatim — not injected
-            into the Claude session.
         spawnMode: { type: string, enum: [same-dir, worktree], default: same-dir }
         branch:
           type: string
@@ -295,14 +285,13 @@ components:
 
     RecentLaunch:
       type: object
-      required: [folder, name, branch, spawnMode, permissionMode, initialPrompt, at, stale]
+      required: [folder, name, branch, spawnMode, permissionMode, at, stale]
       properties:
         folder: { type: string }
         name: { type: string }
         branch: { type: [string, "null"] }
         spawnMode: { type: string }
         permissionMode: { type: string }
-        initialPrompt: { type: [string, "null"], description: The launch's opening prompt, when one was given. }
         at: { type: string, format: date-time }
         stale: { type: boolean, description: The launch's branch no longer exists. }
 

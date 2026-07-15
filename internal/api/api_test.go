@@ -7,6 +7,7 @@ import (
 	"io"
 	"net/http"
 	"net/http/httptest"
+	"net/url"
 	"os"
 	"path/filepath"
 	"strings"
@@ -16,6 +17,7 @@ import (
 	"github.com/connorbell133/groundcontrol/internal/browse"
 	"github.com/connorbell133/groundcontrol/internal/config"
 	"github.com/connorbell133/groundcontrol/internal/events"
+	"github.com/connorbell133/groundcontrol/internal/gitx"
 	"github.com/connorbell133/groundcontrol/internal/jobs"
 	"github.com/connorbell133/groundcontrol/internal/journal"
 	"github.com/connorbell133/groundcontrol/internal/sessions"
@@ -226,6 +228,17 @@ func TestScopedTokens(t *testing.T) {
 	}
 	if rec := doReq(t, h, "PUT", "/config", "{}", launch); rec.Code != 403 {
 		t.Errorf("launch-scoped PUT /config = %d", rec.Code)
+	}
+
+	// orbit: listing is read, sweeping is admin-only
+	if rec := doReq(t, h, "GET", "/orbit", "", read); rec.Code != 200 {
+		t.Errorf("read-scoped GET /orbit = %d", rec.Code)
+	}
+	if rec := doReq(t, h, "DELETE", "/orbit?repo=/x&branch=gc/y", "", read); rec.Code != 403 || errCode(t, rec) != "insufficient_scope" {
+		t.Errorf("read-scoped DELETE /orbit = %d %s", rec.Code, rec.Body.String())
+	}
+	if rec := doReq(t, h, "DELETE", "/orbit?repo=/x&branch=gc/y", "", launch); rec.Code != 403 {
+		t.Errorf("launch-scoped DELETE /orbit = %d", rec.Code)
 	}
 
 	// the legacy authToken keeps full scope
@@ -573,6 +586,250 @@ func TestSessionExitDebriefAbsentOnGitFailure(t *testing.T) {
 	}
 }
 
+func orbitList(t *testing.T, env *testEnv) []sessions.OrbitBranch {
+	t.Helper()
+	rec := doReq(t, env.handler, "GET", "/orbit", "", nil)
+	if rec.Code != 200 {
+		t.Fatalf("GET /orbit = %d: %s", rec.Code, rec.Body.String())
+	}
+	if strings.Contains(rec.Body.String(), `"orbit":null`) {
+		t.Fatal("orbit must be an array, never null")
+	}
+	var out struct {
+		Orbit []sessions.OrbitBranch `json:"orbit"`
+	}
+	if err := json.Unmarshal(rec.Body.Bytes(), &out); err != nil {
+		t.Fatal(err)
+	}
+	return out.Orbit
+}
+
+func orbitDelete(t *testing.T, env *testEnv, repo, branch string) *httptest.ResponseRecorder {
+	t.Helper()
+	return doReq(t, env.handler, "DELETE", "/orbit?repo="+url.QueryEscape(repo)+"&branch="+url.QueryEscape(branch), "", nil)
+}
+
+func TestOrbitListAndSweep(t *testing.T) {
+	t.Parallel()
+	repo := testutil.InitRepo(t)
+	env := newTestEnv(t, config.Config{Roots: []string{repo}})
+
+	testutil.MustGit(t, repo, "branch", "gc/merged-fix")
+	testutil.MustGit(t, repo, "switch", "-c", "gc/unmerged-feat")
+	testutil.CommitFile(t, repo, "work.txt", "orbit work", "2026-01-02T00:00:00Z")
+	testutil.MustGit(t, repo, "switch", "main")
+
+	// the scan is journal-driven; a launch from a subfolder resolves to the repo root
+	sub := filepath.Join(repo, "pkg")
+	if err := os.MkdirAll(sub, 0o755); err != nil {
+		t.Fatal(err)
+	}
+	env.journal.Append(map[string]any{"event": "session.start", "id": "s1", "folder": sub})
+
+	orbit := orbitList(t, env)
+	if len(orbit) != 2 {
+		t.Fatalf("orbit = %+v, want 2 entries", orbit)
+	}
+	byBranch := map[string]sessions.OrbitBranch{}
+	for _, o := range orbit {
+		byBranch[o.Branch] = o
+		if o.Repo != repo {
+			t.Errorf("entry repo = %q, want %q", o.Repo, repo)
+		}
+		if o.HeldBy != nil {
+			t.Errorf("unattached branch carries heldBy: %+v", o)
+		}
+		if _, err := time.Parse(time.RFC3339, o.LastCommitAt); err != nil {
+			t.Errorf("lastCommitAt %q is not RFC3339: %v", o.LastCommitAt, err)
+		}
+	}
+	if !byBranch["gc/merged-fix"].Merged {
+		t.Errorf("gc/merged-fix = %+v, want merged", byBranch["gc/merged-fix"])
+	}
+	if byBranch["gc/unmerged-feat"].Merged {
+		t.Errorf("gc/unmerged-feat = %+v, want unmerged", byBranch["gc/unmerged-feat"])
+	}
+
+	// unmerged: the safe delete is refused and the branch survives
+	rec := orbitDelete(t, env, repo, "gc/unmerged-feat")
+	if rec.Code != 409 || errCode(t, rec) != "branch_not_merged" {
+		t.Errorf("sweep unmerged = %d %s, want 409 branch_not_merged", rec.Code, rec.Body.String())
+	}
+	if out := testutil.MustGit(t, repo, "branch", "--list", "gc/unmerged-feat"); out == "" {
+		t.Error("unmerged branch must survive a refused sweep")
+	}
+
+	// merged: swept and journaled
+	rec = orbitDelete(t, env, repo, "gc/merged-fix")
+	if rec.Code != 200 {
+		t.Fatalf("sweep merged = %d: %s", rec.Code, rec.Body.String())
+	}
+	if out := testutil.MustGit(t, repo, "branch", "--list", "gc/merged-fix"); out != "" {
+		t.Errorf("merged branch should be gone, still have %q", out)
+	}
+	found := false
+	for _, e := range env.journal.Read() {
+		if e["event"] == "orbit.swept" && e["repo"] == repo && e["branch"] == "gc/merged-fix" {
+			found = true
+		}
+	}
+	if !found {
+		t.Error("a successful sweep must journal orbit.swept")
+	}
+
+	// the swept branch is gone from the next list, and re-sweeping 404s
+	if got := orbitList(t, env); len(got) != 1 || got[0].Branch != "gc/unmerged-feat" {
+		t.Errorf("orbit after sweep = %+v, want only gc/unmerged-feat", got)
+	}
+	rec = orbitDelete(t, env, repo, "gc/merged-fix")
+	if rec.Code != 404 || errCode(t, rec) != "not_found" {
+		t.Errorf("re-sweep = %d %s, want 404 not_found", rec.Code, rec.Body.String())
+	}
+}
+
+func TestOrbitDeleteValidation(t *testing.T) {
+	t.Parallel()
+	repo := testutil.InitRepo(t)
+	plain := testutil.ResolvedTempDir(t)
+	env := newTestEnv(t, config.Config{Roots: []string{repo, plain}})
+
+	cases := []struct {
+		name     string
+		target   string
+		wantCode int
+		wantErr  string
+	}{
+		{"missing params", "/orbit", 400, "missing_param"},
+		{"missing branch", "/orbit?repo=" + url.QueryEscape(repo), 400, "missing_param"},
+		// the gc/ gate fires before the repo is even looked at — a flag-shaped
+		// or user branch name never reaches git
+		{"flag-shaped branch", "/orbit?repo=/definitely/not/there&branch=-D", 400, "invalid_param"},
+		{"user branch", "/orbit?repo=" + url.QueryEscape(repo) + "&branch=main", 400, "invalid_param"},
+		{"repo outside roots", "/orbit?repo=/definitely/not/there&branch=gc/x", 400, "invalid_path"},
+		{"repo path gone", "/orbit?repo=" + url.QueryEscape(filepath.Join(repo, "nope")) + "&branch=gc/x", 400, "invalid_path"},
+		{"repo not a git repo", "/orbit?repo=" + url.QueryEscape(plain) + "&branch=gc/x", 400, "invalid_path"},
+	}
+	for _, tc := range cases {
+		t.Run(tc.name, func(t *testing.T) {
+			rec := doReq(t, env.handler, "DELETE", tc.target, "", nil)
+			if rec.Code != tc.wantCode {
+				t.Fatalf("status = %d, want %d (%s)", rec.Code, tc.wantCode, rec.Body.String())
+			}
+			if got := errCode(t, rec); got != tc.wantErr {
+				t.Errorf("error code = %s, want %s", got, tc.wantErr)
+			}
+		})
+	}
+	// nothing was deleted along the way
+	if out := testutil.MustGit(t, repo, "branch", "--list", "main"); out == "" {
+		t.Error("main must survive every rejected sweep")
+	}
+}
+
+func TestOrbitLiveSessionBranchExcluded(t *testing.T) {
+	testutil.FakeClaude(t)
+	repo := testutil.InitRepo(t)
+	env := newTestEnv(t, config.Config{Roots: []string{repo}})
+
+	created, wt := createWorktreeSession(t, env, repo, "orbit-live")
+	branch := gitx.CurrentBranch(wt)
+	if !strings.HasPrefix(branch, "gc/") {
+		t.Fatalf("worktree branch = %q, want gc/*", branch)
+	}
+	// commit real work so the branch will be in orbit after exit
+	if err := os.WriteFile(filepath.Join(wt, "feat.txt"), []byte("one\n"), 0o644); err != nil {
+		t.Fatal(err)
+	}
+	testutil.MustGit(t, wt, "add", ".")
+	testutil.MustGit(t, wt, "commit", "-m", "feat")
+
+	// a running session's branch is never listed and never sweepable
+	for _, o := range orbitList(t, env) {
+		if o.Branch == branch {
+			t.Errorf("live session branch %q must not be in orbit: %+v", branch, o)
+		}
+	}
+	rec := orbitDelete(t, env, repo, branch)
+	if rec.Code != 409 || errCode(t, rec) != "branch_held" {
+		t.Errorf("sweep of live branch = %d %s, want 409 branch_held", rec.Code, rec.Body.String())
+	}
+
+	killAndWait(t, env, created.ID)
+	waitForExitEntry(t, env, created.ID)
+
+	// exited but undismissed: the surviving branch is exactly what orbit surfaces
+	found := false
+	for _, o := range orbitList(t, env) {
+		if o.Branch == branch {
+			found = true
+			if o.Merged {
+				t.Errorf("branch with unmerged commits flagged merged: %+v", o)
+			}
+			if o.HeldBy != nil {
+				t.Errorf("worktree is gone, heldBy = %q", *o.HeldBy)
+			}
+		}
+	}
+	if !found {
+		t.Errorf("exited session's surviving branch %q missing from orbit", branch)
+	}
+	// still unmerged, so the safe delete refuses
+	rec = orbitDelete(t, env, repo, branch)
+	if rec.Code != 409 || errCode(t, rec) != "branch_not_merged" {
+		t.Errorf("sweep after exit = %d %s, want 409 branch_not_merged", rec.Code, rec.Body.String())
+	}
+}
+
+func TestOrbitHeldByKeptWorktree(t *testing.T) {
+	testutil.FakeClaude(t)
+	repo := testutil.InitRepo(t)
+	env := newTestEnv(t, config.Config{Roots: []string{repo}})
+
+	created, wt := createWorktreeSession(t, env, repo, "orbit-dirty")
+	branch := gitx.CurrentBranch(wt)
+	// an untracked file blocks removal, so the exit keeps the worktree —
+	// which then holds the branch
+	if err := os.WriteFile(filepath.Join(wt, "wip.txt"), []byte("half-done\n"), 0o644); err != nil {
+		t.Fatal(err)
+	}
+	killAndWait(t, env, created.ID)
+	waitForExitEntry(t, env, created.ID)
+
+	var entry *sessions.OrbitBranch
+	for _, o := range orbitList(t, env) {
+		if o.Branch == branch {
+			entry = &o
+		}
+	}
+	if entry == nil {
+		t.Fatalf("kept-worktree branch %q missing from orbit", branch)
+	}
+	if entry.HeldBy == nil {
+		t.Fatalf("kept-worktree branch must carry heldBy: %+v", entry)
+	}
+	// compare symlink-resolved: git reports the worktree's resolved path
+	wantWt, err := filepath.EvalSymlinks(wt)
+	if err != nil {
+		t.Fatal(err)
+	}
+	gotWt, err := filepath.EvalSymlinks(*entry.HeldBy)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if gotWt != wantWt {
+		t.Errorf("heldBy = %q, want %q", *entry.HeldBy, wt)
+	}
+
+	// held branches route to DELETE /worktrees, not the sweep
+	rec := orbitDelete(t, env, repo, branch)
+	if rec.Code != 409 || errCode(t, rec) != "branch_held" {
+		t.Errorf("sweep of held branch = %d %s, want 409 branch_held", rec.Code, rec.Body.String())
+	}
+	if out := testutil.MustGit(t, repo, "branch", "--list", branch); out == "" {
+		t.Error("held branch must survive the refused sweep")
+	}
+}
+
 func TestSessionWithoutInitialPrompt(t *testing.T) {
 	testutil.FakeClaude(t)
 	root := testutil.ResolvedTempDir(t)
@@ -793,6 +1050,7 @@ func TestEmptyListsMarshalAsArrays(t *testing.T) {
 		{"/sessions", []string{`"sessions":[]`, `"lost":[]`, `"landed":[]`}},
 		{"/jobs", []string{`"jobs":[]`}},
 		{"/worktrees", []string{`"worktrees":[]`}},
+		{"/orbit", []string{`"orbit":[]`}},
 		{"/config", []string{`"webhooks":[]`}},
 		{"/journal/recent", []string{`"recent":[]`}},
 		{"/branches?path=" + root, []string{`"branches":[]`}}, // in roots, not a repo

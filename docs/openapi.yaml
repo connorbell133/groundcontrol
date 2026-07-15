@@ -89,6 +89,8 @@ components:
                 - session_live
                 - job_live
                 - worktree_error
+                - branch_held
+                - branch_not_merged
                 - not_implemented
             message:
               type: string
@@ -322,6 +324,26 @@ components:
         branch: { type: [string, "null"] }
         dirty: { type: boolean }
 
+    OrbitBranch:
+      type: object
+      description: >
+        One leftover gc/* session branch ("in orbit"). Branches checked out
+        by a live session are never listed. heldBy names the worktree (a
+        kept dirty one) that still has the branch checked out — clean that
+        up via DELETE /worktrees instead of the branch sweep.
+      required: [repo, branch, merged, lastCommitAt]
+      properties:
+        repo: { type: string, description: Repo root the branch lives in. }
+        branch: { type: string, description: Always gc/*. }
+        merged:
+          type: boolean
+          description: >
+            The branch tip is reachable from the repo's default branch
+            (origin's declared HEAD, else local main, else master; a repo
+            with no default reads everything as unmerged).
+        lastCommitAt: { type: string, format: date-time }
+        heldBy: { type: string, description: Worktree path that has the branch checked out; absent when unattached. }
+
     ConfigView:
       type: object
       required: [roots, showHidden, webhooks]
@@ -469,6 +491,72 @@ paths:
         "400": { $ref: "#/components/responses/BadRequest" }
         "401": { $ref: "#/components/responses/Unauthorized" }
         "403": { $ref: "#/components/responses/Forbidden" }
+
+  /orbit:
+    get:
+      summary: List leftover gc/* session branches
+      description: >
+        Scans the distinct repos named by recent session.start journal
+        entries (folders resolved to their repo root, deduped, scoped to the
+        configured roots). Repos absent from the journal's read window (last
+        2000 entries) aren't scanned — a recents-driven view, not an
+        archive.
+      responses:
+        "200":
+          description: Branches in orbit, most recently used repos first.
+          content:
+            application/json:
+              schema:
+                type: object
+                required: [orbit]
+                properties:
+                  orbit:
+                    type: array
+                    items: { $ref: "#/components/schemas/OrbitBranch" }
+        "401": { $ref: "#/components/responses/Unauthorized" }
+        "403": { $ref: "#/components/responses/Forbidden" }
+    delete:
+      summary: Safe-delete a gc/* session branch
+      description: >
+        Always git branch -d — there is no force parameter; unmerged
+        branches must be merged (or their holding worktree cleaned via
+        DELETE /worktrees) first. Non-gc/* names are rejected
+        (invalid_param) before any git work; the repo must be inside the
+        roots, exist, and be a git repo (invalid_path). A successful sweep
+        writes an orbit.swept journal entry.
+      parameters:
+        - name: repo
+          in: query
+          required: true
+          schema: { type: string }
+          description: Repo root, inside a configured root.
+        - name: branch
+          in: query
+          required: true
+          schema: { type: string }
+          description: The gc/* branch to delete.
+      responses:
+        "200":
+          description: Swept.
+          content:
+            application/json:
+              schema:
+                type: object
+                properties:
+                  ok: { type: boolean }
+        "400": { $ref: "#/components/responses/BadRequest" }
+        "401": { $ref: "#/components/responses/Unauthorized" }
+        "403": { $ref: "#/components/responses/Forbidden" }
+        "404":
+          description: "not_found: no such gc/ branch in that repo."
+          content:
+            application/json:
+              schema: { $ref: "#/components/schemas/Error" }
+        "409":
+          description: "branch_held: checked out by a live session or a kept worktree — or branch_not_merged: git's safe delete found unmerged commits; merge the work first."
+          content:
+            application/json:
+              schema: { $ref: "#/components/schemas/Error" }
 
   /sessions:
     get:

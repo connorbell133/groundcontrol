@@ -111,6 +111,66 @@ func BranchExists(folder, branch string) bool {
 	return ResolveBranch(folder, branch) != ""
 }
 
+// DefaultRef finds the branch "merged" is measured against: the remote's
+// declared default when one is set, else conventional local names. "" means
+// there is nothing to measure against.
+func DefaultRef(root string) string {
+	if out, err := Out(root, 2*time.Second, "symbolic-ref", "--quiet", "refs/remotes/origin/HEAD"); err == nil && out != "" {
+		return out
+	}
+	for _, name := range []string{"main", "master"} {
+		if Run(root, 2*time.Second, "rev-parse", "--verify", "--quiet", "refs/heads/"+name) == nil {
+			return "refs/heads/" + name
+		}
+	}
+	return ""
+}
+
+// SessionBranch is one gc/* run branch as the orbit view needs it: merged
+// verdict, last-commit time, and which worktree (if any) still has it
+// checked out.
+type SessionBranch struct {
+	Branch       string
+	Merged       bool
+	LastCommitAt string
+	WorktreePath string // "" unless some worktree has the branch checked out
+}
+
+// sessionBranchTimeout bounds each listing call: the orbit scan walks every
+// recently-used repo, so one wedged repo must not stall the whole response.
+const sessionBranchTimeout = 10 * time.Second
+
+// SessionBranches lists the repo's gc/* run branches. Merged means the tip
+// is reachable from the repo's default branch (DefaultRef) — measured
+// against the default, never HEAD, so a feature-branch checkout doesn't skew
+// the verdict; with no default at all every branch reads unmerged, the
+// honest answer when there is nothing to merge into.
+func SessionBranches(root string) ([]SessionBranch, error) {
+	// iso8601-strict so lastCommitAt is RFC3339 like every other timestamp on the wire
+	out, err := Out(root, sessionBranchTimeout, "for-each-ref", "refs/heads/gc/*",
+		"--format=%(refname:short)%00%(objectname)%00%(committerdate:iso8601-strict)%00%(worktreepath)")
+	if err != nil {
+		return nil, err
+	}
+	list := []SessionBranch{}
+	if out == "" {
+		return list, nil
+	}
+	def := DefaultRef(root)
+	for _, line := range strings.Split(out, "\n") {
+		parts := strings.Split(line, "\x00")
+		if len(parts) != 4 {
+			continue
+		}
+		b := SessionBranch{Branch: parts[0], LastCommitAt: parts[2], WorktreePath: parts[3]}
+		if def != "" {
+			b.Merged = Run(root, sessionBranchTimeout, "merge-base", "--is-ancestor", parts[1], def) == nil
+		}
+		list = append(list, b)
+	}
+	return list, nil
+}
+
 // DiffStats summarizes a run's work: committed plus working-tree changes
 // measured from the merge-base with the launch base, and the count of paths
 // with uncommitted changes. JSON tags because sessions embeds it in the

@@ -37,7 +37,7 @@ everywhere else — query strings leak into logs and proxies more readily.
 |---|---|
 | `read` | browse folders and branches; list/inspect sessions, jobs, worktrees, config; the QR; the SSE stream |
 | `launch` | spawn and kill sessions and jobs; dismiss finished records |
-| `admin` | `PUT /config`, force-removing kept worktrees |
+| `admin` | `PUT /config`, force-removing kept worktrees, sweeping orbit branches |
 
 A known token missing the needed scope gets `403 insufficient_scope`; a
 missing or unknown token gets `401 unauthorized`. The token's `name` travels
@@ -86,6 +86,8 @@ change; renaming one is breaking.
 | `session_live` | 409 | tried to dismiss a session that's still running |
 | `job_live` | 409 | tried to dismiss a job that's still queued/running — cancel it first |
 | `worktree_error` | 400 | kept-worktree removal failed or path isn't runner-managed |
+| `branch_held` | 409 | orbit sweep refused — the branch is checked out by a live session or a kept worktree (clean that up via `DELETE /worktrees` instead) |
+| `branch_not_merged` | 409 | orbit sweep refused — git's safe delete found unmerged commits; merge the work first (there is no force delete) |
 | `not_implemented` | 501 | the field is real but the feature isn't (Docker isolation) — rejected rather than silently ignored |
 
 ## Endpoints
@@ -312,6 +314,54 @@ about their own launch.
 |---|---|
 | `GET /worktrees` | kept worktrees — dirty orphans the sweeps refused to delete |
 | `DELETE /worktrees?path=` | force-remove one; merged `gc/*` branches are deleted, unmerged kept |
+
+### Orbit (leftover session branches)
+
+Worktree runs leave their `gc/*` branch behind whenever it accumulated
+commits (that's the point — the branch keeps the work reachable). Orbit is
+the cross-repo view of those leftovers, and the guarded cleanup for them.
+
+| method + path | what |
+|---|---|
+| `GET /orbit` | leftover `gc/*` branches across recently-used repos |
+| `DELETE /orbit?repo=&branch=` | safe-delete one (`git branch -d` — never force) |
+
+`GET /orbit` returns `{ "orbit": [...] }`:
+
+```json
+{
+  "orbit": [
+    {
+      "repo": "/home/you/repos/checkout-service",
+      "branch": "gc/fix-race-a1b2c3d4",
+      "merged": false,
+      "lastCommitAt": "2026-07-14T20:07:24+00:00",
+      "heldBy": "/home/you/.groundcontrol/worktrees/checkout-service/a1b2c3d4"
+    }
+  ]
+}
+```
+
+- Repos to scan come from the folders of recent `session.start` journal
+  entries — resolved to their repo root, deduped, scoped to the configured
+  roots. Repos absent from the journal's read window (last 2000 entries)
+  aren't scanned: orbit is a recents-driven tool, not an archive.
+- `merged` — the branch tip is reachable from the repo's default branch
+  (origin's declared HEAD, else local `main`, else `master`; a repo with no
+  default at all reads everything as unmerged).
+- Branches checked out by a **live session** never appear.
+- `heldBy` — present when some other worktree (a kept dirty one) still has
+  the branch checked out; clean that up via `DELETE /worktrees?path=`
+  instead of the branch sweep.
+
+`DELETE /orbit?repo=<repo-root>&branch=<gc/...>` (admin scope) validates in
+order: non-`gc/*` branch names are rejected (`400 invalid_param`) before
+anything else runs; the repo must be inside the roots, still exist, and be a
+git repo (`400 invalid_path`); a branch held by a live session or a worktree
+is refused (`409 branch_held`). The delete itself is always `git branch -d`
+— an unmerged branch comes back as `409 branch_not_merged`, and there is no
+force parameter: merge the work (or clean up its worktree) first. A
+successful sweep writes an `orbit.swept {repo, branch}` journal entry.
 
 ### Config
 

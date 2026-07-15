@@ -36,7 +36,7 @@ import (
 // Codes in use: unauthorized, insufficient_scope, invalid_json, missing_param,
 // invalid_param, invalid_path, invalid_config, outside_roots, not_found, not_ready,
 // ready_timeout, launch_failed, session_live, job_live, worktree_error, not_implemented,
-// prompt_too_long.
+// prompt_too_long, branch_held, branch_not_merged.
 
 // scope names one capability a token can grant; the wire format stays the
 // plain string ("read" etc.) in config files and error messages.
@@ -471,6 +471,48 @@ func (s *Server) Handler() http.Handler {
 		WriteJSON(w, 200, struct {
 			OK bool `json:"ok"`
 		}{true})
+	}))
+
+	mux.HandleFunc("GET /orbit", need(scopeRead, func(w http.ResponseWriter, r *http.Request) {
+		WriteJSON(w, 200, struct {
+			Orbit []sessions.OrbitBranch `json:"orbit"`
+		}{nonNil(s.sessions.ListOrbit())})
+	}))
+
+	mux.HandleFunc("DELETE /orbit", need(scopeAdmin, func(w http.ResponseWriter, r *http.Request) {
+		repo := r.URL.Query().Get("repo")
+		branch := r.URL.Query().Get("branch")
+		if repo == "" || branch == "" {
+			apiErr(w, 400, "missing_param", "repo and branch required")
+			return
+		}
+		// gc/ gate first — before any filesystem or git work, so a crafted
+		// name (a flag, a user branch) is refused outright
+		if !strings.HasPrefix(branch, "gc/") {
+			apiErr(w, 400, "invalid_param", "only gc/* session branches can be swept")
+			return
+		}
+		if !s.browser.WithinRoots(repo) || !util.PathExists(repo) {
+			apiErr(w, 400, "invalid_path", "repo outside configured roots, or gone")
+			return
+		}
+		err := s.sessions.SweepOrbitBranch(repo, branch)
+		switch {
+		case err == nil:
+			WriteJSON(w, 200, struct {
+				OK bool `json:"ok"`
+			}{true})
+		case errors.Is(err, sessions.ErrOrbitRepo):
+			apiErr(w, 400, "invalid_path", err.Error())
+		case errors.Is(err, sessions.ErrOrbitNotFound):
+			apiErr(w, 404, "not_found", err.Error())
+		case errors.Is(err, sessions.ErrOrbitHeld):
+			apiErr(w, 409, "branch_held", err.Error())
+		default:
+			// git refused the safe delete: unmerged commits — there is no
+			// force path; merge the work or clean its worktree first
+			apiErr(w, 409, "branch_not_merged", err.Error())
+		}
 	}))
 
 	mux.HandleFunc("GET /sessions", need(scopeRead, func(w http.ResponseWriter, r *http.Request) {

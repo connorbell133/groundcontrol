@@ -259,6 +259,21 @@ func (m *Manager) LiveWorktreePaths() map[string]bool {
 	return live
 }
 
+// LiveWorktreeBranches snapshots the gc/ branches checked out by running
+// sessions. Exited-but-undismissed sessions don't count: their surviving
+// branches are exactly what the orbit view exists to surface.
+func (m *Manager) LiveWorktreeBranches() map[string]bool {
+	live := map[string]bool{}
+	m.mu.Lock()
+	for _, s := range m.sessions {
+		if s.wtBranch != "" && s.State != StateExited && s.State != StateError {
+			live[s.wtBranch] = true
+		}
+	}
+	m.mu.Unlock()
+	return live
+}
+
 // WaitForReady blocks until the session pairs, dies, or the deadline passes —
 // 300ms poll is plenty against a multi-second provision and immune to event races.
 func (m *Manager) WaitForReady(id string, timeout time.Duration) string {
@@ -563,27 +578,12 @@ func branchStateAfterRemove(root, wtPath, wtBranch string) string {
 	if err != nil || tip == "" {
 		return branchMerged // Remove deleted the no-commit branch: nothing beyond the base survives
 	}
-	if def := defaultRef(root); def != "" {
+	if def := gitx.DefaultRef(root); def != "" {
 		if gitx.Run(root, 5*time.Second, "merge-base", "--is-ancestor", tip, def) == nil {
 			return branchMerged
 		}
 	}
 	return branchInOrbit
-}
-
-// defaultRef finds the branch "merged" is measured against: the remote's
-// declared default when one is set, else conventional local names. "" skips
-// the merged check.
-func defaultRef(root string) string {
-	if out, err := gitx.Out(root, 2*time.Second, "symbolic-ref", "--quiet", "refs/remotes/origin/HEAD"); err == nil && out != "" {
-		return out
-	}
-	for _, name := range []string{"main", "master"} {
-		if gitx.Run(root, 2*time.Second, "rev-parse", "--verify", "--quiet", "refs/heads/"+name) == nil {
-			return "refs/heads/" + name
-		}
-	}
-	return ""
 }
 
 func (m *Manager) Kill(id, actor string) *Session {

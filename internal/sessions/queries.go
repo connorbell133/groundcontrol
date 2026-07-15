@@ -1,6 +1,8 @@
 package sessions
 
 import (
+	"errors"
+	"fmt"
 	"time"
 
 	"github.com/connorbell133/groundcontrol/internal/gitx"
@@ -159,6 +161,104 @@ func (m *Manager) ListLost() []LostSession {
 	m.lostCache = out
 	m.lostComputed = true
 	return append([]LostSession(nil), m.lostCache...)
+}
+
+/* ---------- orbit: leftover gc/* branches across recently-used repos ---------- */
+
+// OrbitBranch is one leftover gc/* session branch. HeldBy names the worktree
+// that still has it checked out — cleanup for those routes through
+// DELETE /worktrees, not the branch sweep.
+type OrbitBranch struct {
+	Repo         string  `json:"repo"`
+	Branch       string  `json:"branch"`
+	Merged       bool    `json:"merged"`
+	LastCommitAt string  `json:"lastCommitAt"`
+	HeldBy       *string `json:"heldBy,omitempty"`
+}
+
+// ListOrbit lists gc/* branches across the distinct repos named by recent
+// session.start journal entries — a recents-driven view, so repos absent
+// from the journal's read window aren't scanned. Branches checked out by a
+// running session are excluded; ones attached to other worktrees carry HeldBy.
+func (m *Manager) ListOrbit() []OrbitBranch {
+	live := m.LiveWorktreeBranches()
+	seen := map[string]bool{}
+	out := []OrbitBranch{}
+	entries := m.journal.Read()
+	// newest first, like RecentLaunches: recently-used repos lead the list
+	for i := len(entries) - 1; i >= 0; i-- {
+		e := entries[i]
+		folder := jStr(e, "folder")
+		if jStr(e, "event") != evSessionStart || folder == "" || !util.PathExists(folder) {
+			continue
+		}
+		root := gitx.Root(folder) // launches happen in subdirs; branches live at the root
+		if root == "" || seen[root] {
+			continue
+		}
+		seen[root] = true
+		if !m.browser.WithinRoots(root) {
+			continue
+		}
+		branches, err := gitx.SessionBranches(root)
+		if err != nil {
+			continue // one repo that stopped answering must not sink the list
+		}
+		for _, b := range branches {
+			if live[b.Branch] {
+				continue
+			}
+			out = append(out, OrbitBranch{
+				Repo:         root,
+				Branch:       b.Branch,
+				Merged:       b.Merged,
+				LastCommitAt: b.LastCommitAt,
+				HeldBy:       util.StrPtr(b.WorktreePath),
+			})
+		}
+	}
+	return out
+}
+
+// Orbit sweep failures the API maps to distinct stable error codes.
+var (
+	ErrOrbitRepo     = errors.New("repo is not a git repository")
+	ErrOrbitNotFound = errors.New("no such gc/ branch")
+	ErrOrbitHeld     = errors.New("branch is held")
+)
+
+// SweepOrbitBranch safe-deletes one gc/* branch. Never a force delete: git's
+// own unmerged refusal comes back as the error, and the user merges the work
+// (or cleans the holding worktree) first.
+func (m *Manager) SweepOrbitBranch(repo, branch string) error {
+	branches, err := gitx.SessionBranches(repo)
+	if err != nil {
+		return fmt.Errorf("%w: %s", ErrOrbitRepo, repo)
+	}
+	var found *gitx.SessionBranch
+	for i := range branches {
+		if branches[i].Branch == branch {
+			found = &branches[i]
+			break
+		}
+	}
+	if found == nil {
+		return fmt.Errorf("%w: %s", ErrOrbitNotFound, branch)
+	}
+	if m.LiveWorktreeBranches()[branch] {
+		return fmt.Errorf("%w by a live session", ErrOrbitHeld)
+	}
+	if found.WorktreePath != "" {
+		// route the client to DELETE /worktrees — git rightly refuses to
+		// delete a branch out from under a checkout anyway
+		return fmt.Errorf("%w by worktree %s", ErrOrbitHeld, found.WorktreePath)
+	}
+	// "--" so a crafted branch name can never read as a flag
+	if err := gitx.Run(repo, 10*time.Second, "branch", "-d", "--", branch); err != nil {
+		return err
+	}
+	m.journal.Append(map[string]any{"event": "orbit.swept", "repo": repo, "branch": branch})
+	return nil
 }
 
 // LandedSession is a finished session reconstructed from its

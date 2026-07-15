@@ -9,6 +9,7 @@ import (
 	"context"
 	"errors"
 	"fmt"
+	"log"
 	"os"
 	"os/exec"
 	"path/filepath"
@@ -54,6 +55,9 @@ const (
 	evSessionClaudeID     = "session.claude-id"
 	evSessionInjectIntent = "session.inject-intent"
 	evSessionDismissed    = "session.dismissed"
+	// journal-only record that the scrape corrected a drifted pointer URL after
+	// ready; announced as session.ready so SSE clients re-render the card
+	evSessionPairingCorrected = "session.pairing-corrected"
 )
 
 type Session struct {
@@ -145,6 +149,9 @@ type liveSession struct {
 	// which source set PairingURL (bridge.go); the scrape keeps scanning while
 	// the pointer holds it, so a drifted constructed URL can still be corrected
 	pairingSource string
+	// logged once when the CLI prints a claude.ai URL matching no known pairing
+	// shape — a drift tripwire, not per-chunk noise
+	pairingShapeWarned bool
 	// worktree cleanup context, captured at launch
 	repoRoot   string
 	wtBranch   string
@@ -211,6 +218,11 @@ func NewManager(j *journal.Journal, bus *events.Bus, ws *workspace.Manager, brow
 var (
 	ansiRE = regexp.MustCompile(`\x1b\[[0-9;?]*[a-zA-Z]|\x1b\][^\x07]*\x07?`)
 	urlRE  = regexp.MustCompile(`https://[^\s"'\x1b]+`)
+	// the two observed claude.ai pairing-URL shapes (2.1.210). The scrape keys
+	// on this, not the broad urlRE: an unrelated https URL the CLI prints (an
+	// update banner, a docs link) must not be mistaken for the pairing URL and
+	// pin the source — which would let it clobber a correct pointer URL (R16).
+	pairingURLRE = regexp.MustCompile(`https://claude\.ai/(?:code\?environment=|remote/)[^\s"'\x1b]+`)
 	// box-drawing, blocks, braille spinners, and ASCII rule/spinner chars — lines of only these are visual noise
 	junkRE      = regexp.MustCompile(`[─-╿▀-▟⠀-⣿|\\/·•●◐◓◑◒~\-_=+*.\s]`)
 	trailingRE  = regexp.MustCompile(`[).,]+$`)
@@ -683,8 +695,8 @@ func (m *Manager) readLoop(s *liveSession) {
 		n, err := s.ptmx.Read(buf)
 		if n > 0 {
 			chunk := string(buf[:n])
-			var readySnap *Session
-			var readyURL string
+			var readySnap, correctedSnap *Session
+			var readyURL, correctedURL string
 			m.mu.Lock()
 			s.LastOutputAt = util.StrPtr(util.NowISO())
 			text := ansiRE.ReplaceAllString(chunk, "")
@@ -708,14 +720,24 @@ func (m *Manager) readLoop(s *liveSession) {
 			// keep scanning past ready while the bridge pointer holds the URL:
 			// the CLI's own output must be able to overrule a constructed URL
 			if s.PairingURL == nil || s.pairingSource == pairingSourcePointer {
-				if found := urlRE.FindString(strings.Join(s.log, "")); found != "" {
+				joined := strings.Join(s.log, "")
+				if found := pairingURLRE.FindString(joined); found != "" {
 					url := trailingRE.ReplaceAllString(found, "")
 					if snap := s.setReadyLocked(url, pairingSourceScrape); snap != nil {
-						readyURL = url
-						readySnap = snap
-					} else {
-						s.reconcileScrapedURLLocked(url)
+						readyURL, readySnap = url, snap
+					} else if snap := s.reconcileScrapedURLLocked(url); snap != nil {
+						// scrape corrected a drifted pointer URL — journal and
+						// announce it so SSE clients converge (R17). A distinct
+						// event, not a second session.ready: the ready transition
+						// still happens exactly once.
+						correctedURL, correctedSnap = url, snap
 					}
+				} else if strings.Contains(joined, "claude.ai/") && !s.pairingShapeWarned {
+					// a claude.ai URL is present but no known pairing shape
+					// matched — the CLI's URL shape may have drifted; surface it
+					// in logs instead of silently failing to pair (tripwire)
+					s.pairingShapeWarned = true
+					log.Printf("session %s: a claude.ai URL is present but matches no known pairing shape — the pairing-URL shape may have drifted", s.ID)
 				}
 			}
 			id := s.ID
@@ -723,6 +745,10 @@ func (m *Manager) readLoop(s *liveSession) {
 			if readySnap != nil {
 				m.journal.Append(map[string]any{"event": evSessionReady, "id": id, "pairingUrl": readyURL})
 				m.announce(evSessionReady, *readySnap, false)
+			}
+			if correctedSnap != nil {
+				m.journal.Append(map[string]any{"event": evSessionPairingCorrected, "id": id, "pairingUrl": correctedURL})
+				m.announce(evSessionReady, *correctedSnap, false)
 			}
 		}
 		if err != nil {

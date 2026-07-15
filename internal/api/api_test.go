@@ -998,6 +998,124 @@ func TestPutConfigPersists(t *testing.T) {
 	}
 }
 
+// getPresets decodes the presets list out of GET /config.
+func getPresets(t *testing.T, h http.Handler) []config.Preset {
+	t.Helper()
+	rec := doReq(t, h, "GET", "/config", "", nil)
+	if rec.Code != 200 {
+		t.Fatalf("GET /config = %d: %s", rec.Code, rec.Body.String())
+	}
+	var got struct {
+		Presets []config.Preset `json:"presets"`
+	}
+	if err := json.Unmarshal(rec.Body.Bytes(), &got); err != nil {
+		t.Fatal(err)
+	}
+	return got.Presets
+}
+
+func TestPutConfigPresets(t *testing.T) {
+	t.Parallel()
+	env := newTestEnv(t, config.Config{})
+	h := env.handler
+
+	// two presets round-trip: one fully loaded (env key in settings is fine),
+	// one bare name (no settings JSON is valid)
+	body := `{"presets":[
+		{"name":"yolo","permissionMode":"bypassPermissions","spawnMode":"worktree","capacity":4,"settingsJson":"{\"env\":{\"FOO\":\"bar\"}}"},
+		{"name":"plain"}
+	]}`
+	if rec := doReq(t, h, "PUT", "/config", body, nil); rec.Code != 200 {
+		t.Fatalf("PUT /config = %d: %s", rec.Code, rec.Body.String())
+	}
+	presets := getPresets(t, h)
+	if len(presets) != 2 {
+		t.Fatalf("presets = %+v, want 2", presets)
+	}
+	p := presets[0]
+	if p.Name != "yolo" || p.PermissionMode != "bypassPermissions" || p.SpawnMode != "worktree" || p.Capacity != 4 || p.SettingsJSON != `{"env":{"FOO":"bar"}}` {
+		t.Errorf("preset did not round-trip: %+v", p)
+	}
+	if presets[1].Name != "plain" || presets[1].SettingsJSON != "" {
+		t.Errorf("bare preset wrong: %+v", presets[1])
+	}
+
+	// survives a reload: a fresh instance built from the persisted file
+	// serves the same presets
+	onDisk, err := config.Load(env.configPath)
+	if err != nil {
+		t.Fatalf("persisted config does not load: %v", err)
+	}
+	env2 := newTestEnv(t, onDisk)
+	if reloaded := getPresets(t, env2.handler); len(reloaded) != 2 || reloaded[0].Name != "yolo" {
+		t.Errorf("presets after reload = %+v", reloaded)
+	}
+
+	// a partial update that omits presets leaves them alone
+	if rec := doReq(t, h, "PUT", "/config", `{"showHidden":true}`, nil); rec.Code != 200 {
+		t.Fatalf("partial PUT /config = %d: %s", rec.Code, rec.Body.String())
+	}
+	if presets := getPresets(t, h); len(presets) != 2 {
+		t.Errorf("partial update dropped presets: %+v", presets)
+	}
+
+	// an explicit empty array clears them
+	if rec := doReq(t, h, "PUT", "/config", `{"presets":[]}`, nil); rec.Code != 200 {
+		t.Fatalf("clearing PUT /config = %d: %s", rec.Code, rec.Body.String())
+	}
+	if presets := getPresets(t, h); len(presets) != 0 {
+		t.Errorf("empty array did not clear presets: %+v", presets)
+	}
+}
+
+func TestPutConfigPresetValidation(t *testing.T) {
+	t.Parallel()
+	env := newTestEnv(t, config.Config{})
+	h := env.handler
+
+	// seed a known-good preset so "config unchanged" is observable on disk
+	if rec := doReq(t, h, "PUT", "/config", `{"presets":[{"name":"keep"}]}`, nil); rec.Code != 200 {
+		t.Fatalf("seed PUT /config = %d: %s", rec.Code, rec.Body.String())
+	}
+
+	oversized := fmt.Sprintf(`{\"pad\":\"%s\"}`, strings.Repeat("a", 65*1024))
+	cases := []struct {
+		name string
+		body string
+	}{
+		{"duplicate names", `{"presets":[{"name":"a"},{"name":"a"}]}`},
+		{"empty name", `{"presets":[{"name":""}]}`},
+		{"unknown permission mode", `{"presets":[{"name":"a","permissionMode":"yolo"}]}`},
+		{"unknown spawn mode", `{"presets":[{"name":"a","spawnMode":"docker"}]}`},
+		{"capacity over 256", `{"presets":[{"name":"a","capacity":257}]}`},
+		{"negative capacity", `{"presets":[{"name":"a","capacity":-1}]}`},
+		{"malformed settings", `{"presets":[{"name":"a","settingsJson":"{not json"}]}`},
+		{"settings not an object", `{"presets":[{"name":"a","settingsJson":"[1,2]"}]}`},
+		{"settings null", `{"presets":[{"name":"a","settingsJson":"null"}]}`},
+		{"settings over 64KB", `{"presets":[{"name":"a","settingsJson":"` + oversized + `"}]}`},
+		{"hooks key", `{"presets":[{"name":"a","settingsJson":"{\"hooks\":{}}"}]}`},
+	}
+	for _, tc := range cases {
+		t.Run(tc.name, func(t *testing.T) {
+			rec := doReq(t, h, "PUT", "/config", tc.body, nil)
+			if rec.Code != 400 {
+				t.Fatalf("status = %d, want 400 (%s)", rec.Code, rec.Body.String())
+			}
+			if got := errCode(t, rec); got != "invalid_config" {
+				t.Errorf("error code = %s, want invalid_config", got)
+			}
+			// rejected writes must leave the persisted config untouched
+			onDisk, err := config.Load(env.configPath)
+			if err != nil {
+				t.Fatalf("persisted config does not load: %v", err)
+			}
+			if len(onDisk.Presets) != 1 || onDisk.Presets[0].Name != "keep" {
+				t.Errorf("rejected PUT changed the persisted presets: %+v", onDisk.Presets)
+			}
+		})
+	}
+}
+
 func TestJournalRecentEndpoint(t *testing.T) {
 	t.Parallel()
 	root := testutil.ResolvedTempDir(t)

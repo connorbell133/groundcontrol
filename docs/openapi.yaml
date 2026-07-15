@@ -312,6 +312,32 @@ components:
             Filter tokens: exact names, prefix wildcards (session.*), "*" or
             omitted for everything, and the derived token session.failed.
 
+    Preset:
+      type: object
+      required: [name]
+      properties:
+        name: { type: string, description: Unique and non-empty within the list. }
+        permissionMode:
+          type: string
+          enum: [default, acceptEdits, plan, auto, dontAsk, bypassPermissions]
+          description: Absent/empty means the launch default.
+        spawnMode:
+          type: string
+          enum: [same-dir, worktree]
+          description: Absent/empty means the launch default.
+        capacity:
+          type: integer
+          minimum: 1
+          maximum: 256
+          description: Absent/0 means unset.
+        settingsJson:
+          type: string
+          description: >
+            Optional settings-file content as a string. At most 64 KB and
+            must parse as a JSON object; a top-level "hooks" key is rejected
+            (hooks run shell commands and are a separately gated feature).
+            An "env" key is allowed.
+
     Job:
       type: object
       required: [id, folder, prompt, spawnMode, branch, permissionMode, timeoutMs, callbackUrl, state, createdAt, startedAt, finishedAt, exitCode, result, costUsd, durationMs, numTurns, worktreePath]
@@ -435,7 +461,7 @@ components:
 
     ConfigView:
       type: object
-      required: [roots, showHidden, webhooks]
+      required: [roots, showHidden, webhooks, presets]
       properties:
         roots:
           type: array
@@ -444,6 +470,9 @@ components:
         webhooks:
           type: array
           items: { $ref: "#/components/schemas/WebhookConfig" }
+        presets:
+          type: array
+          items: { $ref: "#/components/schemas/Preset" }
 
 paths:
   /roots:
@@ -515,9 +544,11 @@ paths:
     put:
       summary: Update config (partial)
       description: >
-        Any subset of roots, showHidden, webhooks. Persists to config.json.
-        A token that can reach this route can widen roots — treat it as root
-        on the box.
+        Any subset of roots, showHidden, webhooks, presets. Only keys present
+        in the body are touched — an omitted key keeps its current value, an
+        explicit empty array clears the list. Validation runs before anything
+        is applied. Persists to config.json. A token that can reach this
+        route can widen roots — treat it as root on the box.
       requestBody:
         required: true
         content:
@@ -532,6 +563,9 @@ paths:
                 webhooks:
                   type: array
                   items: { $ref: "#/components/schemas/WebhookConfig" }
+                presets:
+                  type: array
+                  items: { $ref: "#/components/schemas/Preset" }
       responses:
         "200":
           description: Applied and persisted.

@@ -343,6 +343,7 @@ type putConfigRequest struct {
 	Roots      *[]string               `json:"roots"`
 	ShowHidden *bool                   `json:"showHidden"`
 	Webhooks   *[]events.WebhookConfig `json:"webhooks"`
+	Presets    *[]config.Preset        `json:"presets"`
 }
 
 // Handler returns the API handler, mounted by main at /api/v1 (canonical) and
@@ -391,6 +392,7 @@ func (s *Server) Handler() http.Handler {
 		roots := append([]string(nil), s.cfg.Roots...)
 		showHidden := s.cfg.ShowHidden
 		webhooks := append([]events.WebhookConfig(nil), s.cfg.Webhooks...)
+		presets := append([]config.Preset(nil), s.cfg.Presets...)
 		s.configMu.Unlock()
 		if webhooks == nil {
 			webhooks = []events.WebhookConfig{}
@@ -399,7 +401,8 @@ func (s *Server) Handler() http.Handler {
 			Roots      []string               `json:"roots"`
 			ShowHidden bool                   `json:"showHidden"`
 			Webhooks   []events.WebhookConfig `json:"webhooks"`
-		}{nonNil(roots), showHidden, webhooks})
+			Presets    []config.Preset        `json:"presets"`
+		}{nonNil(roots), showHidden, webhooks, nonNil(presets)})
 	}))
 
 	mux.HandleFunc("PUT /config", need(scopeAdmin, func(w http.ResponseWriter, r *http.Request) {
@@ -443,6 +446,53 @@ func (s *Server) Handler() http.Handler {
 				}
 			}
 		}
+		if req.Presets != nil {
+			seen := map[string]bool{}
+			for _, p := range *req.Presets {
+				if strings.TrimSpace(p.Name) == "" {
+					apiErr(w, 400, "invalid_config", "preset name must be non-empty")
+					return
+				}
+				if seen[p.Name] {
+					apiErr(w, 400, "invalid_config", fmt.Sprintf("duplicate preset name: %s", p.Name))
+					return
+				}
+				seen[p.Name] = true
+				switch p.PermissionMode {
+				case "", "default", "acceptEdits", "plan", "auto", "dontAsk", "bypassPermissions":
+				default:
+					apiErr(w, 400, "invalid_config", fmt.Sprintf("preset %s: unknown permission mode: %s", p.Name, p.PermissionMode))
+					return
+				}
+				switch p.SpawnMode {
+				case "", "same-dir", "worktree":
+				default:
+					apiErr(w, 400, "invalid_config", fmt.Sprintf("preset %s: unknown spawn mode: %s", p.Name, p.SpawnMode))
+					return
+				}
+				// 0 means unset — the launch default applies
+				if p.Capacity < 0 || p.Capacity > 256 {
+					apiErr(w, 400, "invalid_config", fmt.Sprintf("preset %s: capacity must be 1..256: %d", p.Name, p.Capacity))
+					return
+				}
+				if p.SettingsJSON != "" {
+					if len(p.SettingsJSON) > 64*1024 {
+						apiErr(w, 400, "invalid_config", fmt.Sprintf("preset %s: settings JSON exceeds 64 KB", p.Name))
+						return
+					}
+					// a nil map after a clean parse means the literal null
+					var settings map[string]json.RawMessage
+					if err := json.Unmarshal([]byte(p.SettingsJSON), &settings); err != nil || settings == nil {
+						apiErr(w, 400, "invalid_config", fmt.Sprintf("preset %s: settings JSON must be a JSON object", p.Name))
+						return
+					}
+					if _, ok := settings["hooks"]; ok {
+						apiErr(w, 400, "invalid_config", fmt.Sprintf("preset %s: settings must not carry a hooks key — hooks run shell commands and are a separately gated feature", p.Name))
+						return
+					}
+				}
+			}
+		}
 
 		s.configMu.Lock()
 		defer s.configMu.Unlock()
@@ -454,6 +504,9 @@ func (s *Server) Handler() http.Handler {
 		}
 		if req.Webhooks != nil {
 			s.cfg.Webhooks = *req.Webhooks
+		}
+		if req.Presets != nil {
+			s.cfg.Presets = *req.Presets
 		}
 		s.applyAndPersistConfigLocked()
 		WriteJSON(w, 200, struct {

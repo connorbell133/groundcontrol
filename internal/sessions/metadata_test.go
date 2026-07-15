@@ -182,7 +182,7 @@ func TestApplyPRLinksSetsAndUpdates(t *testing.T) {
 		_, scans := m.applyRegistryTick(
 			[]regSessionSnap{{id: "s1"}},
 			map[string]*regJoin{"s1": {rowSeen: true, activity: "busy"}},
-			time.Minute, time.Now(),
+			true, time.Minute, time.Now(),
 		)
 		if len(scans) != 1 || scans[0].path != transcript {
 			t.Fatalf("scan inputs = %+v, want the uuid-named transcript %s", scans, transcript)
@@ -221,7 +221,7 @@ func TestApplyPRLinksAbsenceAndStateGuard(t *testing.T) {
 	goneUUID := "conv-gone"
 	m.sessions["gone"].ClaudeSessionID = &goneUUID
 	m.mu.Unlock()
-	_, scans := m.applyRegistryTick([]regSessionSnap{{id: "gone"}}, map[string]*regJoin{"gone": {}}, time.Minute, time.Now())
+	_, scans := m.applyRegistryTick([]regSessionSnap{{id: "gone"}}, map[string]*regJoin{"gone": {}}, true, time.Minute, time.Now())
 	m.applyPRLinks(scans)
 	if got := m.Get("gone"); got.PRLink != nil {
 		t.Errorf("missing transcript must yield absence, got %+v", got.PRLink)
@@ -235,7 +235,7 @@ func TestApplyPRLinksAbsenceAndStateGuard(t *testing.T) {
 	m.sessions["dead"].ClaudeSessionID = &deadUUID
 	m.mu.Unlock()
 	writeTranscript(t, filepath.Join(projects, claudeProjectDirName(deadCwd), "conv-dead.jsonl"), prLine1)
-	_, scans = m.applyRegistryTick([]regSessionSnap{{id: "dead"}}, map[string]*regJoin{"dead": {}}, time.Minute, time.Now())
+	_, scans = m.applyRegistryTick([]regSessionSnap{{id: "dead"}}, map[string]*regJoin{"dead": {}}, true, time.Minute, time.Now())
 	m.mu.Lock()
 	m.sessions["dead"].State = StateExited
 	m.mu.Unlock()
@@ -246,7 +246,7 @@ func TestApplyPRLinksAbsenceAndStateGuard(t *testing.T) {
 
 	// sessions without a captured uuid produce no scan work at all
 	insertLive(t, m, "no-uuid", "/w/nouuid", StateReady)
-	_, scans = m.applyRegistryTick([]regSessionSnap{{id: "no-uuid"}}, map[string]*regJoin{"no-uuid": {}}, time.Minute, time.Now())
+	_, scans = m.applyRegistryTick([]regSessionSnap{{id: "no-uuid"}}, map[string]*regJoin{"no-uuid": {}}, true, time.Minute, time.Now())
 	if len(scans) != 0 {
 		t.Errorf("uuid-less session produced scan inputs: %+v", scans)
 	}

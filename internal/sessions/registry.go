@@ -155,7 +155,7 @@ func (m *Manager) registryLoop(ctx context.Context) {
 				normRows[i].Cwd = normalizePath(normRows[i].Cwd)
 			}
 			joins := joinRegistry(snaps, normRows, ps)
-			captures, scans := m.applyRegistryTick(snaps, joins, retentionWindow(interval), now)
+			captures, scans := m.applyRegistryTick(snaps, joins, ps != nil, retentionWindow(interval), now)
 			for _, c := range captures {
 				// journaled, never announced: the UUID is a durable fact the
 				// UI polls for, not a lifecycle event to fan out (R8)
@@ -295,11 +295,15 @@ func normalizeActivity(status string) string {
 	return ""
 }
 
-// extraRow is one tick's sighting of a non-primary registry row.
+// extraRow is one tick's sighting of a registry row attached to a session.
+// Ownership is decided here, at join time — the only point where descendant
+// vs same-folder is knowable — and carried through to the wire split.
 type extraRow struct {
-	key    string // stable identity for wall-clock aging
-	name   string
-	status string
+	key     string // stable identity for wall-clock aging
+	name    string
+	status  string
+	owned   bool // descendant of the spawned pid — an environment row
+	primary bool // the environment's primary session, emitted explicitly
 }
 
 // regJoin is one session's slice of a tick's join result.
@@ -317,8 +321,9 @@ type regJoin struct {
 // ancestry walk reaches; with no ps map at all, a cwd+startedAt pair may bind
 // only when it is unambiguous from both sides — a wrong guess here would be
 // journaled forever, so ambiguity means no capture. The primary row is the
-// earliest-started owned row; later owned rows and unowned rows in a
-// session's folder surface as extras ("in this folder"), never as joins.
+// earliest-started owned row; it and later owned rows surface as environment
+// rows (owned, primary first), unowned rows in a session's folder as folder
+// rows — never as joins.
 func joinRegistry(snaps []regSessionSnap, rows []claudex.Agent, ps map[int]int) map[string]*regJoin {
 	joins := make(map[string]*regJoin, len(snaps))
 	for i := range snaps {
@@ -393,8 +398,16 @@ func joinRegistry(snaps []regSessionSnap, rows []claudex.Agent, ps map[int]int) 
 		j.rowSeen = true
 		j.uuid = primary.SessionID
 		j.activity = normalizeActivity(primary.Status)
+		// the primary is itself an environment row, emitted explicitly: its
+		// status reads the same registry row as the card-level activity, so
+		// the two surfaces can never disagree
+		p := extraRowOf(primary)
+		p.owned, p.primary = true, true
+		j.extras = append(j.extras, p)
 		for _, ri := range owned[1:] {
-			j.extras = append(j.extras, extraRowOf(rows[ri]))
+			r := extraRowOf(rows[ri])
+			r.owned = true
+			j.extras = append(j.extras, r)
 		}
 	}
 	// unowned rows in a session's folder are visible as extras on every
@@ -438,9 +451,12 @@ type claudeIDCapture struct {
 	id, uuid string
 }
 
-// extraRecord is the aging state behind one ExtraSession row.
+// extraRecord is the aging state behind one wire row, carrying the
+// classification decided at join time so it can hold across ps outages.
 type extraRecord struct {
 	name, status string
+	owned        bool // environment row vs same-folder foreign
+	primary      bool // the environment's primary session — sorts first
 	seen         time.Time
 }
 
@@ -450,8 +466,10 @@ type extraRecord struct {
 // state here because the registry snapshot predates this lock: a session that
 // exited in between takes no writes at all — activity must never resurrect on
 // a dead card, and a reaped pid can already belong to a stranger, so even a
-// first UUID capture is dropped.
-func (m *Manager) applyRegistryTick(snaps []regSessionSnap, joins map[string]*regJoin, window time.Duration, now time.Time) ([]claudeIDCapture, []prScanInput) {
+// first UUID capture is dropped. psOK reports whether the tick had a ps
+// snapshot: only then is ownership freshly provable, so only then may a
+// row's classification change or an environment row clear on absence.
+func (m *Manager) applyRegistryTick(snaps []regSessionSnap, joins map[string]*regJoin, psOK bool, window time.Duration, now time.Time) ([]claudeIDCapture, []prScanInput) {
 	captures := []claudeIDCapture{}
 	scans := []prScanInput{}
 	m.mu.Lock()
@@ -494,8 +512,31 @@ func (m *Manager) applyRegistryTick(snaps []regSessionSnap, joins map[string]*re
 		if s.extrasSeen == nil {
 			s.extrasSeen = map[string]extraRecord{}
 		}
+		tickKeys := make(map[string]bool, len(j.extras))
 		for _, e := range j.extras {
-			s.extrasSeen[e.key] = extraRecord{name: e.name, status: e.status, seen: now}
+			rec := extraRecord{name: e.name, status: e.status, owned: e.owned, primary: e.primary, seen: now}
+			if !psOK && !e.owned {
+				// sticky ownership: without a ps snapshot the join can't prove
+				// ancestry, so a row it now reads as foreign keeps its last
+				// confident classification — demoting an environment row to
+				// the folder group would be a wrong answer, not a degraded one
+				if prev, ok := s.extrasSeen[e.key]; ok && prev.owned {
+					rec.owned, rec.primary = true, prev.primary
+				}
+			}
+			s.extrasSeen[e.key] = rec
+			tickKeys[e.key] = true
+		}
+		if psOK {
+			// registry and ps both answered: absence is authoritative for
+			// environment rows — clear now, no grace, mirroring the activity
+			// rule above. Folder rows keep the wall-clock aging; without ps,
+			// environment rows fall back to it too.
+			for k, rec := range s.extrasSeen {
+				if rec.owned && !tickKeys[k] {
+					delete(s.extrasSeen, k)
+				}
+			}
 		}
 		s.refreshExtrasLocked(window, now)
 		if s.ClaudeSessionID != nil {
@@ -569,24 +610,42 @@ func (m *Manager) ageRegistryState(window time.Duration, now time.Time) {
 	}
 }
 
-// refreshExtrasLocked rebuilds the wire slice from the sighting map, dropping
-// entries unconfirmed past the window. Always a fresh slice: Session
+// refreshExtrasLocked rebuilds the two wire slices from the sighting map,
+// dropping entries unconfirmed past the window. Always fresh slices: Session
 // snapshots escape the lock, so a slice already handed out must stay
-// immutable. Caller holds m.mu.
+// immutable. An empty list is nil — absence on the wire, never []. Caller
+// holds m.mu.
 func (s *liveSession) refreshExtrasLocked(window time.Duration, now time.Time) {
 	for k, rec := range s.extrasSeen {
 		if now.Sub(rec.seen) > window {
 			delete(s.extrasSeen, k)
 		}
 	}
-	if len(s.extrasSeen) == 0 {
-		s.ExtraSessions = nil
-		return
-	}
-	out := make([]ExtraSession, 0, len(s.extrasSeen))
+	var env []extraRecord
+	var folder []ExtraSession
 	for _, rec := range s.extrasSeen {
-		out = append(out, ExtraSession{Name: rec.name, Status: rec.status})
+		if rec.owned {
+			env = append(env, rec)
+		} else {
+			folder = append(folder, ExtraSession{Name: rec.name, Status: rec.status})
+		}
 	}
-	sort.Slice(out, func(a, b int) bool { return out[a].Name < out[b].Name })
-	s.ExtraSessions = out
+	s.EnvironmentSessions, s.FolderSessions = nil, nil
+	if len(env) > 0 {
+		sort.Slice(env, func(a, b int) bool {
+			if env[a].primary != env[b].primary {
+				return env[a].primary
+			}
+			return env[a].name < env[b].name
+		})
+		out := make([]ExtraSession, len(env))
+		for i, rec := range env {
+			out[i] = ExtraSession{Name: rec.name, Status: rec.status}
+		}
+		s.EnvironmentSessions = out
+	}
+	if len(folder) > 0 {
+		sort.Slice(folder, func(a, b int) bool { return folder[a].Name < folder[b].Name })
+		s.FolderSessions = folder
+	}
 }

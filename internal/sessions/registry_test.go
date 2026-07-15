@@ -198,22 +198,40 @@ func journalEntries(m *Manager, event, id string) []map[string]any {
 
 /* ---------- pure join ---------- */
 
+// rowBits is the classification triple the split cares about per extra row.
+type rowBits struct {
+	status  string
+	owned   bool
+	primary bool
+}
+
+func extrasByName(j *regJoin) map[string]rowBits {
+	out := map[string]rowBits{}
+	for _, e := range j.extras {
+		out[e.name] = rowBits{e.status, e.owned, e.primary}
+	}
+	return out
+}
+
 func TestJoinRegistryAncestry(t *testing.T) {
 	t.Parallel()
 	// two same-dir launches: A spawned pid 100, B spawned pid 200; the
-	// characterization topology is launcher → forked server → session child
+	// characterization topology (observed live 2026-07-15) is launcher →
+	// forked server → session children — every registry row, including the
+	// claude.ai-created on-demand ones, is a grandchild of the spawned pid
 	snaps := []regSessionSnap{
 		{id: "a", pid: 100, cwd: "/w/shared"},
 		{id: "b", pid: 200, cwd: "/w/shared"},
 	}
 	ps := map[int]int{
-		101: 100, 110: 101, 111: 101, // A: server 101, sessions 110 + 111
+		101: 100, 110: 101, 111: 101, 112: 101, // A: server 101, sessions 110/111/112
 		201: 200, 210: 201, // B: server 201, session 210
 		300: 1, // manual claude in the same folder
 	}
 	rows := []claudex.Agent{
 		{PID: 111, Cwd: "/w/shared", SessionID: "u-a2", Name: "gc-a-2", Status: "idle", StartedAt: 2000},
 		{PID: 110, Cwd: "/w/shared", SessionID: "u-a1", Name: "gc-a-1", Status: "busy", StartedAt: 1000},
+		{PID: 112, Cwd: "/w/shared", SessionID: "deadbeef-3333", Status: "idle", StartedAt: 3000}, // nameless on-demand session
 		{PID: 210, Cwd: "/w/shared", SessionID: "u-b1", Name: "gc-b-1", Status: "compacting", StartedAt: 1500},
 		{PID: 300, Cwd: "/w/shared", SessionID: "u-m", Name: "manual", Status: "idle", StartedAt: 500},
 		{PID: 400, Cwd: "/w/other", SessionID: "u-x", Name: "elsewhere", Status: "busy", StartedAt: 500},
@@ -224,12 +242,20 @@ func TestJoinRegistryAncestry(t *testing.T) {
 	if !a.rowSeen || a.uuid != "u-a1" || a.activity != "busy" {
 		t.Fatalf("a joined wrong: %+v (primary must be the earliest-started descendant)", a)
 	}
-	aExtras := map[string]string{}
-	for _, e := range a.extras {
-		aExtras[e.name] = e.status
+	aRows := extrasByName(a)
+	wantA := map[string]rowBits{
+		"gc-a-1":   {"busy", true, true}, // the primary is an explicit row, same status source as activity
+		"gc-a-2":   {"idle", true, false},
+		"deadbeef": {"idle", true, false}, // nameless env row falls back to its sessionId prefix
+		"manual":   {"idle", false, false},
 	}
-	if len(aExtras) != 2 || aExtras["gc-a-2"] != "idle" || aExtras["manual"] != "idle" {
-		t.Errorf("a extras = %v, want later descendant gc-a-2 and the manual folder-mate", aExtras)
+	if len(aRows) != len(wantA) {
+		t.Fatalf("a extras = %v, want %v", aRows, wantA)
+	}
+	for name, w := range wantA {
+		if aRows[name] != w {
+			t.Errorf("a extras[%s] = %+v, want %+v", name, aRows[name], w)
+		}
 	}
 
 	b := joins["b"]
@@ -240,13 +266,11 @@ func TestJoinRegistryAncestry(t *testing.T) {
 		t.Errorf("unknown status %q must read as absent, got %q", "compacting", b.activity)
 	}
 	// no cross-binding: A's descendants never appear on B, and vice versa —
-	// only the unowned manual session is shared
-	bExtras := map[string]string{}
-	for _, e := range b.extras {
-		bExtras[e.name] = e.status
-	}
-	if len(bExtras) != 1 || bExtras["manual"] != "idle" {
-		t.Errorf("b extras = %v, want only the manual folder-mate", bExtras)
+	// only the unowned manual session is shared. B's primary row carries the
+	// same absent status as its activity.
+	bRows := extrasByName(b)
+	if len(bRows) != 2 || bRows["gc-b-1"] != (rowBits{"", true, true}) || bRows["manual"] != (rowBits{"idle", false, false}) {
+		t.Errorf("b extras = %v, want owned primary gc-b-1 and the foreign manual row", bRows)
 	}
 }
 
@@ -277,10 +301,14 @@ func TestJoinRegistryAncestryBounds(t *testing.T) {
 		t.Errorf("shallow descendant should join: %+v", joins["a"])
 	}
 
-	// a row with no path to any launch never joins
+	// a row with no path to any launch never joins — and a row that is
+	// neither a descendant nor same-cwd lands in neither extras list
 	joins = joinRegistry(snaps, []claudex.Agent{{PID: 999, Cwd: "/w/elsewhere", SessionID: "u-stranger"}}, map[int]int{999: 1})
 	if joins["a"].rowSeen {
 		t.Errorf("unrelated row must not join: %+v", joins["a"])
+	}
+	if len(joins["a"].extras) != 0 {
+		t.Errorf("neither-descendant-nor-same-cwd row must not surface at all: %+v", joins["a"].extras)
 	}
 }
 
@@ -298,6 +326,9 @@ func TestJoinRegistryFallback(t *testing.T) {
 		if !j.rowSeen || j.uuid != "u-1" || j.activity != "busy" {
 			t.Errorf("unambiguous fallback should bind: %+v", j)
 		}
+		if len(j.extras) != 1 || !j.extras[0].owned || !j.extras[0].primary {
+			t.Errorf("bound primary must emit as an owned primary row: %+v", j.extras)
+		}
 	})
 
 	t.Run("row started before launch never binds", func(t *testing.T) {
@@ -308,9 +339,9 @@ func TestJoinRegistryFallback(t *testing.T) {
 		if j.rowSeen {
 			t.Errorf("pre-launch row bound via fallback: %+v", j)
 		}
-		// still visible as a folder-mate
-		if len(j.extras) != 1 {
-			t.Errorf("pre-launch row should list as an extra: %+v", j.extras)
+		// still visible as a folder-mate — foreign, never an environment row
+		if len(j.extras) != 1 || j.extras[0].owned {
+			t.Errorf("pre-launch row should list as a foreign extra: %+v", j.extras)
 		}
 	})
 
@@ -325,8 +356,8 @@ func TestJoinRegistryFallback(t *testing.T) {
 		if j.rowSeen || j.uuid != "" {
 			t.Errorf("ambiguous fallback must not guess: %+v", j)
 		}
-		if len(j.extras) != 2 {
-			t.Errorf("ambiguous rows should still list as extras: %+v", j.extras)
+		if len(j.extras) != 2 || j.extras[0].owned || j.extras[1].owned {
+			t.Errorf("ambiguous rows should still list as foreign extras: %+v", j.extras)
 		}
 	})
 
@@ -351,6 +382,9 @@ func TestJoinRegistryFallback(t *testing.T) {
 		if !j.rowSeen || j.activity != "idle" {
 			t.Errorf("uuid match should bind regardless of cwd and ps: %+v", j)
 		}
+		if len(j.extras) != 1 || !j.extras[0].owned || !j.extras[0].primary {
+			t.Errorf("uuid-bound primary must emit as an owned primary row: %+v", j.extras)
+		}
 	})
 }
 
@@ -374,7 +408,7 @@ func TestApplyRegistryTickFirstCaptureWins(t *testing.T) {
 	window := time.Minute
 	snaps := []regSessionSnap{{id: "s1"}}
 
-	captures, _ := m.applyRegistryTick(snaps, map[string]*regJoin{"s1": {rowSeen: true, uuid: "conv-1", activity: "busy"}}, window, now)
+	captures, _ := m.applyRegistryTick(snaps, map[string]*regJoin{"s1": {rowSeen: true, uuid: "conv-1", activity: "busy"}}, true, window, now)
 	if len(captures) != 1 || captures[0].uuid != "conv-1" {
 		t.Fatalf("first tick should capture conv-1, got %+v", captures)
 	}
@@ -387,7 +421,7 @@ func TestApplyRegistryTickFirstCaptureWins(t *testing.T) {
 	}
 
 	// a later disagreeing sessionId never overwrites and never re-captures
-	captures, _ = m.applyRegistryTick(snaps, map[string]*regJoin{"s1": {rowSeen: true, uuid: "conv-2", activity: "idle"}}, window, now.Add(time.Second))
+	captures, _ = m.applyRegistryTick(snaps, map[string]*regJoin{"s1": {rowSeen: true, uuid: "conv-2", activity: "idle"}}, true, window, now.Add(time.Second))
 	if len(captures) != 0 {
 		t.Errorf("disagreement must not produce a capture: %+v", captures)
 	}
@@ -412,8 +446,8 @@ func TestApplyRegistryTickStateGuard(t *testing.T) {
 		insertLive(t, m, id, "/w/a", state)
 		captures, scans := m.applyRegistryTick(
 			[]regSessionSnap{{id: id}},
-			map[string]*regJoin{id: {rowSeen: true, uuid: "conv-late", activity: "busy", extras: []extraRow{{key: "k", name: "n"}}}},
-			time.Minute, time.Now(),
+			map[string]*regJoin{id: {rowSeen: true, uuid: "conv-late", activity: "busy", extras: []extraRow{{key: "k", name: "n", owned: true, primary: true}, {key: "k2", name: "n2"}}}},
+			true, time.Minute, time.Now(),
 		)
 		if len(scans) != 0 {
 			t.Errorf("%s: non-live session produced scan work: %+v", state, scans)
@@ -422,7 +456,7 @@ func TestApplyRegistryTickStateGuard(t *testing.T) {
 			t.Errorf("%s: capture on a non-live session (pid-reuse hazard): %+v", state, captures)
 		}
 		got := m.Get(id)
-		if got.ClaudeSessionID != nil || got.Activity != nil || got.ExtraSessions != nil {
+		if got.ClaudeSessionID != nil || got.Activity != nil || got.EnvironmentSessions != nil || got.FolderSessions != nil {
 			t.Errorf("%s: registry writes leaked onto a non-live session: %+v", state, got)
 		}
 	}
@@ -436,13 +470,16 @@ func TestApplyRegistryTickRowGoneClearsActivity(t *testing.T) {
 	snaps := []regSessionSnap{{id: "s1"}}
 	window := time.Minute
 
-	m.applyRegistryTick(snaps, map[string]*regJoin{"s1": {rowSeen: true, activity: "busy"}}, window, now)
+	m.applyRegistryTick(snaps, map[string]*regJoin{"s1": {rowSeen: true, activity: "busy"}}, true, window, now)
 	// a successful query with the row gone clears immediately — the registry
 	// answered authoritatively, even though the grace window hasn't passed
-	m.applyRegistryTick(snaps, map[string]*regJoin{"s1": {}}, window, now.Add(time.Millisecond))
+	m.applyRegistryTick(snaps, map[string]*regJoin{"s1": {}}, true, window, now.Add(time.Millisecond))
 	got := m.Get("s1")
 	if got.Activity != nil {
 		t.Errorf("activity = %q, want cleared on an authoritative miss", *got.Activity)
+	}
+	if got.EnvironmentSessions != nil || got.FolderSessions != nil {
+		t.Errorf("no rows ever sighted: both lists must stay nil (omitempty), got env=%+v folder=%+v", got.EnvironmentSessions, got.FolderSessions)
 	}
 	if got.State != StateReady {
 		t.Errorf("state = %s; a vanished row must never drive a transition", got.State)
@@ -457,28 +494,32 @@ func TestAgeRegistryStateGrace(t *testing.T) {
 	window := 100 * time.Millisecond
 	m.applyRegistryTick(
 		[]regSessionSnap{{id: "s1"}},
-		map[string]*regJoin{"s1": {rowSeen: true, activity: "busy", extras: []extraRow{{key: "k1", name: "mate", status: "idle"}}}},
-		window, now,
+		map[string]*regJoin{"s1": {rowSeen: true, activity: "busy", extras: []extraRow{
+			{key: "k0", name: "gc-1", status: "busy", owned: true, primary: true},
+			{key: "k1", name: "mate", status: "idle"},
+		}}},
+		true, window, now,
 	)
 
-	// a failed query inside the window retains the last answer
+	// a failed query inside the window retains the last answer — environment
+	// rows included: the immediate-clear rule needs a successful tick
 	m.ageRegistryState(window, now.Add(50*time.Millisecond))
 	got := m.Get("s1")
 	if got.Activity == nil || *got.Activity != "busy" {
 		t.Fatalf("activity should ride out a failure inside the window, got %v", got.Activity)
 	}
-	if len(got.ExtraSessions) != 1 {
-		t.Fatalf("extras should ride out a failure inside the window, got %v", got.ExtraSessions)
+	if len(got.EnvironmentSessions) != 1 || len(got.FolderSessions) != 1 {
+		t.Fatalf("both lists should ride out a failure inside the window, got env=%v folder=%v", got.EnvironmentSessions, got.FolderSessions)
 	}
 
-	// past the window both degrade to absence
+	// past the window everything degrades to absence
 	m.ageRegistryState(window, now.Add(150*time.Millisecond))
 	got = m.Get("s1")
 	if got.Activity != nil {
 		t.Errorf("activity = %q, want cleared past the grace window", *got.Activity)
 	}
-	if got.ExtraSessions != nil {
-		t.Errorf("extras = %v, want aged out past the window", got.ExtraSessions)
+	if got.EnvironmentSessions != nil || got.FolderSessions != nil {
+		t.Errorf("env=%v folder=%v, want both aged out past the window", got.EnvironmentSessions, got.FolderSessions)
 	}
 }
 
@@ -509,31 +550,123 @@ func TestExtrasRefreshAndAging(t *testing.T) {
 	window := 100 * time.Millisecond
 	snaps := []regSessionSnap{{id: "s1"}}
 
+	env := extraRow{key: "u-0", name: "gc-1", status: "busy", owned: true, primary: true}
 	m.applyRegistryTick(snaps, map[string]*regJoin{"s1": {rowSeen: true, extras: []extraRow{
+		env,
 		{key: "u-1", name: "mate-1", status: "busy"},
 		{key: "u-2", name: "mate-2", status: ""}, // unknown status renders as absent
-	}}}, window, now)
+	}}}, true, window, now)
 	got := m.Get("s1")
-	if len(got.ExtraSessions) != 2 {
-		t.Fatalf("extras = %+v, want 2", got.ExtraSessions)
+	if len(got.EnvironmentSessions) != 1 || got.EnvironmentSessions[0].Name != "gc-1" {
+		t.Fatalf("environment = %+v, want the owned row alone", got.EnvironmentSessions)
 	}
-	if got.ExtraSessions[0].Name != "mate-1" || got.ExtraSessions[0].Status != "busy" {
-		t.Errorf("extras[0] = %+v", got.ExtraSessions[0])
+	if len(got.FolderSessions) != 2 {
+		t.Fatalf("folder = %+v, want 2", got.FolderSessions)
 	}
-	if got.ExtraSessions[1].Name != "mate-2" || got.ExtraSessions[1].Status != "" {
-		t.Errorf("extras[1] = %+v, want empty status", got.ExtraSessions[1])
+	if got.FolderSessions[0].Name != "mate-1" || got.FolderSessions[0].Status != "busy" {
+		t.Errorf("folder[0] = %+v", got.FolderSessions[0])
+	}
+	if got.FolderSessions[1].Name != "mate-2" || got.FolderSessions[1].Status != "" {
+		t.Errorf("folder[1] = %+v, want empty status", got.FolderSessions[1])
 	}
 
 	// a tick that no longer sees mate-2 keeps it inside the window and drops
-	// it once unconfirmed past the window
-	m.applyRegistryTick(snaps, map[string]*regJoin{"s1": {rowSeen: true, extras: []extraRow{{key: "u-1", name: "mate-1", status: "busy"}}}}, window, now.Add(50*time.Millisecond))
-	if got = m.Get("s1"); len(got.ExtraSessions) != 2 {
-		t.Errorf("extras inside the window = %+v, want both retained", got.ExtraSessions)
+	// it once unconfirmed past the window — folder aging never touches env rows
+	m.applyRegistryTick(snaps, map[string]*regJoin{"s1": {rowSeen: true, extras: []extraRow{env, {key: "u-1", name: "mate-1", status: "busy"}}}}, true, window, now.Add(50*time.Millisecond))
+	if got = m.Get("s1"); len(got.FolderSessions) != 2 {
+		t.Errorf("folder inside the window = %+v, want both retained", got.FolderSessions)
 	}
-	m.applyRegistryTick(snaps, map[string]*regJoin{"s1": {rowSeen: true, extras: []extraRow{{key: "u-1", name: "mate-1", status: "busy"}}}}, window, now.Add(150*time.Millisecond))
+	m.applyRegistryTick(snaps, map[string]*regJoin{"s1": {rowSeen: true, extras: []extraRow{env, {key: "u-1", name: "mate-1", status: "busy"}}}}, true, window, now.Add(150*time.Millisecond))
 	got = m.Get("s1")
-	if len(got.ExtraSessions) != 1 || got.ExtraSessions[0].Name != "mate-1" {
-		t.Errorf("extras past the window = %+v, want only mate-1", got.ExtraSessions)
+	if len(got.FolderSessions) != 1 || got.FolderSessions[0].Name != "mate-1" {
+		t.Errorf("folder past the window = %+v, want only mate-1", got.FolderSessions)
+	}
+	if len(got.EnvironmentSessions) != 1 || got.EnvironmentSessions[0].Name != "gc-1" {
+		t.Errorf("environment = %+v, folder aging must not disturb env rows", got.EnvironmentSessions)
+	}
+}
+
+func TestEnvironmentRowsClearOnAuthoritativeAbsence(t *testing.T) {
+	t.Parallel()
+	m := testManager(t, nil)
+	insertLive(t, m, "s1", "/w/a", StateReady)
+	now := time.Now()
+	window := time.Minute
+	snaps := []regSessionSnap{{id: "s1"}}
+
+	m.applyRegistryTick(snaps, map[string]*regJoin{"s1": {rowSeen: true, extras: []extraRow{
+		{key: "u-2", name: "gc-2", status: "idle", owned: true},
+		{key: "u-1", name: "gc-1", status: "busy", owned: true, primary: true},
+		{key: "u-m", name: "manual", status: "idle"},
+	}}}, true, window, now)
+	got := m.Get("s1")
+	if len(got.EnvironmentSessions) != 2 || got.EnvironmentSessions[0].Name != "gc-1" || got.EnvironmentSessions[1].Name != "gc-2" {
+		t.Fatalf("environment = %+v, want primary-first gc-1 then gc-2", got.EnvironmentSessions)
+	}
+
+	// a successful tick without gc-2 clears it immediately — absence is
+	// authoritative, no grace (the Activity rule) — while the folder row
+	// keeps its wall-clock window
+	m.applyRegistryTick(snaps, map[string]*regJoin{"s1": {rowSeen: true, extras: []extraRow{
+		{key: "u-1", name: "gc-1", status: "busy", owned: true, primary: true},
+	}}}, true, window, now.Add(time.Millisecond))
+	got = m.Get("s1")
+	if len(got.EnvironmentSessions) != 1 || got.EnvironmentSessions[0].Name != "gc-1" {
+		t.Errorf("environment = %+v, want gc-2 cleared on an authoritative miss", got.EnvironmentSessions)
+	}
+	if len(got.FolderSessions) != 1 || got.FolderSessions[0].Name != "manual" {
+		t.Errorf("folder = %+v, want manual retained inside its window", got.FolderSessions)
+	}
+
+	// the environment vanishing entirely (rowSeen false) empties the list to
+	// nil on the same tick
+	m.applyRegistryTick(snaps, map[string]*regJoin{"s1": {}}, true, window, now.Add(2*time.Millisecond))
+	if got = m.Get("s1"); got.EnvironmentSessions != nil {
+		t.Errorf("environment = %+v, want nil after the environment vanished", got.EnvironmentSessions)
+	}
+}
+
+func TestStickyOwnershipAcrossPsOutage(t *testing.T) {
+	t.Parallel()
+	m := testManager(t, nil)
+	insertLive(t, m, "s1", "/w/a", StateReady)
+	now := time.Now()
+	window := 100 * time.Millisecond
+	snaps := []regSessionSnap{{id: "s1"}}
+
+	// tick 1: confident classification, ps available
+	m.applyRegistryTick(snaps, map[string]*regJoin{"s1": {rowSeen: true, extras: []extraRow{
+		{key: "u-1", name: "gc-1", status: "busy", owned: true, primary: true},
+		{key: "u-2", name: "gc-2", status: "idle", owned: true},
+	}}}, true, window, now)
+
+	// tick 2: no ps snapshot — the join reads the same rows as same-cwd
+	// foreigners; the recorded classification must hold, never demote
+	m.applyRegistryTick(snaps, map[string]*regJoin{"s1": {rowSeen: true, extras: []extraRow{
+		{key: "u-1", name: "gc-1", status: "idle"},
+		{key: "u-2", name: "gc-2", status: "idle"},
+	}}}, false, window, now.Add(20*time.Millisecond))
+	got := m.Get("s1")
+	if len(got.EnvironmentSessions) != 2 || got.FolderSessions != nil {
+		t.Fatalf("env=%+v folder=%+v, want sticky ownership across the ps outage", got.EnvironmentSessions, got.FolderSessions)
+	}
+	if got.EnvironmentSessions[0].Name != "gc-1" || got.EnvironmentSessions[0].Status != "idle" {
+		t.Errorf("primary = %+v, want gc-1 still first, with the fresh status", got.EnvironmentSessions[0])
+	}
+
+	// during the outage an absent env row ages on the wall-clock window
+	// instead of clearing immediately — absence isn't authoritative without ps
+	m.applyRegistryTick(snaps, map[string]*regJoin{"s1": {rowSeen: true, extras: []extraRow{
+		{key: "u-1", name: "gc-1", status: "idle"},
+	}}}, false, window, now.Add(40*time.Millisecond))
+	if got = m.Get("s1"); len(got.EnvironmentSessions) != 2 {
+		t.Errorf("env = %+v, want gc-2 retained inside the window on a ps-less tick", got.EnvironmentSessions)
+	}
+	m.applyRegistryTick(snaps, map[string]*regJoin{"s1": {rowSeen: true, extras: []extraRow{
+		{key: "u-1", name: "gc-1", status: "idle"},
+	}}}, false, window, now.Add(150*time.Millisecond))
+	if got = m.Get("s1"); len(got.EnvironmentSessions) != 1 || got.EnvironmentSessions[0].Name != "gc-1" {
+		t.Errorf("env = %+v, want gc-2 aged out past the window", got.EnvironmentSessions)
 	}
 }
 
@@ -622,7 +755,8 @@ func TestExitForceClearsActivityAndFreezesExtras(t *testing.T) {
 	uuid := "conv-exit"
 	ls.Activity = &busy
 	ls.ClaudeSessionID = &uuid
-	ls.ExtraSessions = []ExtraSession{{Name: "frozen-mate", Status: "idle"}}
+	ls.EnvironmentSessions = []ExtraSession{{Name: "frozen-env", Status: "busy"}}
+	ls.FolderSessions = []ExtraSession{{Name: "frozen-mate", Status: "idle"}}
 	m.mu.Unlock()
 
 	killSessionAndWait(t, m, created.ID)
@@ -630,8 +764,9 @@ func TestExitForceClearsActivityAndFreezesExtras(t *testing.T) {
 	if got.Activity != nil {
 		t.Errorf("exit must force-clear activity, got %q", *got.Activity)
 	}
-	if len(got.ExtraSessions) != 1 || got.ExtraSessions[0].Name != "frozen-mate" {
-		t.Errorf("extras must freeze at exit, got %+v", got.ExtraSessions)
+	if len(got.EnvironmentSessions) != 1 || got.EnvironmentSessions[0].Name != "frozen-env" ||
+		len(got.FolderSessions) != 1 || got.FolderSessions[0].Name != "frozen-mate" {
+		t.Errorf("both lists must freeze at exit, got env=%+v folder=%+v", got.EnvironmentSessions, got.FolderSessions)
 	}
 	if got.ClaudeSessionID == nil || *got.ClaudeSessionID != "conv-exit" {
 		t.Errorf("claudeSessionId must survive exit, got %v", got.ClaudeSessionID)
@@ -724,9 +859,12 @@ func TestRegistryLoopCaptureActivityAndJournal(t *testing.T) {
 		return s.ClaudeSessionID != nil && *s.ClaudeSessionID == "conv-1" &&
 			s.Activity != nil && *s.Activity == "busy"
 	})
-	waitFor(t, 10*time.Second, "folder-mate extra", func() bool {
+	waitFor(t, 10*time.Second, "environment and folder rows", func() bool {
 		s := m.Get(created.ID)
-		return len(s.ExtraSessions) == 1 && s.ExtraSessions[0].Name == "folder-mate" && s.ExtraSessions[0].Status == "idle"
+		// the primary lands in environmentSessions (ancestry-owned, primary
+		// bit); the unowned same-cwd row lands in folderSessions
+		return len(s.EnvironmentSessions) == 1 && s.EnvironmentSessions[0].Name == "gc-auto-1" && s.EnvironmentSessions[0].Status == "busy" &&
+			len(s.FolderSessions) == 1 && s.FolderSessions[0].Name == "folder-mate" && s.FolderSessions[0].Status == "idle"
 	})
 
 	// a later disagreeing sessionId never overwrites the capture
@@ -760,8 +898,9 @@ func TestRegistryLoopCaptureActivityAndJournal(t *testing.T) {
 		return m.Get(created.ID).State == StateReady
 	})
 	h.set([]claudex.Agent{}, nil)
-	waitFor(t, 10*time.Second, "activity cleared after the row vanished", func() bool {
-		return m.Get(created.ID).Activity == nil
+	waitFor(t, 10*time.Second, "activity and environment rows cleared after the row vanished", func() bool {
+		s := m.Get(created.ID)
+		return s.Activity == nil && s.EnvironmentSessions == nil
 	})
 	if s := m.Get(created.ID); s.State != StateReady || s.ClaudeSessionID == nil {
 		t.Errorf("row loss must not touch state or uuid: %+v", s)

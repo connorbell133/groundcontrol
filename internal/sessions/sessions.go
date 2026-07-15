@@ -73,18 +73,24 @@ type Session struct {
 	// registry-sourced enrichment: every field degrades to absence and none
 	// of them ever drives a state transition — the PTY stays the sole exit
 	// authority (R6)
-	ClaudeSessionID *string        `json:"claudeSessionId,omitempty"`
-	Activity        *string        `json:"activity,omitempty"`
-	ExtraSessions   []ExtraSession `json:"extraSessions,omitempty"`
-	PRLink          *PRLink        `json:"prLink,omitempty"`
-	Debrief         *Debrief       `json:"debrief,omitempty"`
+	ClaudeSessionID *string `json:"claudeSessionId,omitempty"`
+	Activity        *string `json:"activity,omitempty"`
+	// the environment's own live sessions (registry rows descended from the
+	// spawned pid, primary first) vs foreign sessions that merely share the
+	// launch folder — split at join time, where ownership is still knowable
+	EnvironmentSessions []ExtraSession `json:"environmentSessions,omitempty"`
+	FolderSessions      []ExtraSession `json:"folderSessions,omitempty"`
+	PRLink              *PRLink        `json:"prLink,omitempty"`
+	Debrief             *Debrief       `json:"debrief,omitempty"`
 }
 
-// ExtraSession is one additional live Claude session observed in the launch's
-// directory — a phone-spawned sibling behind the same remote-control server,
-// or an unrelated session (manual, IDE) that happens to run in the folder.
-// "In this folder" is the literal contract. Status carries only "busy"/"idle";
-// any other registry value reads as absent, mirroring the primary activity rule.
+// ExtraSession is one live Claude session row, listed under
+// EnvironmentSessions (the environment's own sessions — descendants of the
+// spawned pid, phone- or claude.ai-created, primary first) or FolderSessions
+// (unrelated sessions — manual, IDE — that happen to run in the folder;
+// "in this folder" is the literal contract). Status carries only
+// "busy"/"idle"; any other registry value reads as absent, mirroring the
+// primary activity rule.
 type ExtraSession struct {
 	Name   string `json:"name"`
 	Status string `json:"status,omitempty"`

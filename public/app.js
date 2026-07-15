@@ -470,8 +470,8 @@ async function doLaunch() {
 const killing = new Set();
 // Ids whose runtime-log <details> is currently open — preserved across innerHTML rewrites.
 const openLogs = new Set();
-// Same trick for the conversation <details>.
-const openConvos = new Set();
+// Same trick for the environment <details>.
+const openEnvs = new Set();
 // Ids whose pairing-QR <details> is expanded — same trick, so a tap survives re-renders.
 const openQrs = new Set();
 let lastSyncAt = Date.now();
@@ -605,6 +605,35 @@ function patchSweptDebrief(branch) {
   });
 }
 
+// the environment id rides the pairing URL (?environment=env_…). claude.ai's
+// picker names remote-control environments by folder basename, so this card
+// section is where an environment is actually identifiable
+function envIdOf(s) {
+  if (!s.pairingUrl) return "";
+  try {
+    return new URL(s.pairingUrl).searchParams.get("environment") || "";
+  } catch {
+    return "";
+  }
+}
+
+// the environment face of a ready card: static rows render here; capacity and
+// the claude conversation id arrive late and drift, so they fill via data-*
+// slots in updateDynamic per the renderShell contract
+function envDetailsHTML(s) {
+  const envId = envIdOf(s);
+  return `
+    <details class="session-log session-env" data-env="${s.id}"><summary>environment</summary>
+      <div class="env-grid">
+        ${envId ? `<div class="env-row"><span class="env-key">env</span><span class="env-val">${esc(envId)}</span></div>` : ""}
+        <div class="env-row" data-env-capacity hidden><span class="env-key">sessions</span><span class="env-val"></span></div>
+        <div class="env-row" data-env-claude hidden><span class="env-key">claude session</span><span class="env-val"></span></div>
+        <div class="env-row"><span class="env-key">host</span><span class="env-val">${esc(location.hostname)}</span></div>
+        <div class="env-row"><span class="env-key">workspace</span><span class="env-val">${esc(s.worktreePath || s.folder)}</span></div>
+      </div>
+    </details>`;
+}
+
 // live claude sessions sharing the launch folder — capped rows, no disclosure;
 // a status other than busy/idle is unknown and renders nothing, per the
 // unknown-means-absent rule the primary activity chip follows
@@ -623,7 +652,7 @@ function extrasHTML(extras) {
 // time-varying). Everything time-varying updates via data-* lookups in updateDynamic().
 function renderShell(card, s) {
   const logWasOpen = openLogs.has(s.id);
-  const convoWasOpen = openConvos.has(s.id);
+  const envWasOpen = openEnvs.has(s.id);
   const qrWasOpen = openQrs.has(s.id);
   const shareBtn = navigator.share ? `<button class="log-tool" data-share-log="${s.id}">share</button>` : "";
   card.innerHTML = `
@@ -686,16 +715,16 @@ function renderShell(card, s) {
         ${cleanupBtnHTML(s)}
         <button class="btn" data-remove="${s.id}">Dismiss</button>
       </div>`}
-    <details class="session-log session-convo"><summary>conversation</summary><div class="convo" data-convo="${s.id}">…</div></details>
+    ${s.state === "ready" ? envDetailsHTML(s) : ""}
     <details class="session-log"><summary>runtime log
       <span class="log-tools"><button class="log-tool" data-copy-log="${s.id}">copy</button>${shareBtn}</span>
     </summary><pre data-log="${s.id}">…</pre></details>`;
   if (logWasOpen) {
-    const details = card.querySelector(".session-log:not(.session-convo)");
+    const details = card.querySelector(".session-log:not(.session-env)");
     if (details) details.open = true; // fires the toggle listener, which refills the log
   }
-  if (convoWasOpen) {
-    const details = card.querySelector(".session-convo");
+  if (envWasOpen) {
+    const details = card.querySelector(".session-env");
     if (details) details.open = true;
   }
   if (qrWasOpen) {
@@ -794,6 +823,23 @@ function updateDynamic(card, s) {
     }
   }
 
+  // environment rows whose data arrives late or drifts: the capacity scrape
+  // and the registry-captured conversation id. Row hidden until data exists.
+  const cap = card.querySelector("[data-env-capacity] .env-val");
+  if (cap) {
+    const have = s.capacityUsed != null && s.capacityMax != null;
+    cap.closest("[data-env-capacity]").hidden = !have;
+    if (have) {
+      const text = `${s.capacityUsed} of ${s.capacityMax}`;
+      if (cap.textContent !== text) cap.textContent = text;
+    }
+  }
+  const cid = card.querySelector("[data-env-claude] .env-val");
+  if (cid) {
+    cid.closest("[data-env-claude]").hidden = !s.claudeSessionId;
+    if (s.claudeSessionId && cid.textContent !== s.claudeSessionId) cid.textContent = s.claudeSessionId;
+  }
+
   // elapsed ticker on the active launch-sequence stage (starting cards only)
   const provision = card.querySelector("[data-provision]");
   if (provision) provision.textContent = `t+${fmtDur(now - started)}`;
@@ -886,8 +932,8 @@ function renderSessions() {
     const id = card.dataset.id;
     if (!state.sessions.some((s) => s.id === id) && !state.lost.some((l) => l.id === id) && !landed.some((l) => l.id === id)) {
       openLogs.delete(id);
-      openConvos.delete(id);
-      convoKeys.delete(id);
+      openEnvs.delete(id);
+      tailKeys.delete(id);
       openQrs.delete(id);
       tails.delete(id);
       card.remove();
@@ -914,76 +960,34 @@ function fillLog(pre, text) {
   if (atBottom || wasPlaceholder) pre.scrollTop = pre.scrollHeight;
 }
 
-/* ---------- conversation view ---------- */
-// last rendered payload per session — a re-render only happens when the
-// transcript actually changed, so scroll position survives idle polls
-const convoKeys = new Map();
+/* ---------- transcript tails (card snippet + status verb) ---------- */
+// last fetched payload per session — a repaint only happens when the
+// transcript actually changed
+const tailKeys = new Map();
 
-function renderConvo(box, transcripts) {
-  const atBottom = box.scrollTop + box.clientHeight >= box.scrollHeight - 4;
-  const wasPlaceholder = box.textContent === "…";
-  box.innerHTML = "";
-  if (!transcripts.length) {
-    const empty = document.createElement("div");
-    empty.className = "convo-empty";
-    empty.textContent = "no conversation yet — send a prompt from the Claude app";
-    box.appendChild(empty);
-    return;
-  }
-  transcripts.forEach((t, i) => {
-    if (transcripts.length > 1) {
-      const div = document.createElement("div");
-      div.className = "convo-divider";
-      div.textContent = `conversation ${i + 1}`;
-      box.appendChild(div);
-    }
-    for (const m of t.messages) {
-      const el = document.createElement("div");
-      el.className = `convo-msg ${m.role === "user" ? "user" : "assistant"}`;
-      el.textContent = m.text;
-      box.appendChild(el);
-    }
-  });
-  if (atBottom || wasPlaceholder) box.scrollTop = box.scrollHeight;
-}
-
-async function refreshConvo(id) {
+async function refreshTail(id) {
   try {
     const { transcripts } = await api(`/api/v1/sessions/${id}/transcript`);
     const key = JSON.stringify(transcripts);
-    if (convoKeys.get(id) === key) return; // unchanged payload — skip all repaints
-    convoKeys.set(id, key);
+    if (tailKeys.get(id) === key) return; // unchanged payload — skip the repaint
+    tailKeys.set(id, key);
     tails.set(id, deriveTail(transcripts));
-    const box = document.querySelector(`.convo[data-convo="${id}"]`); // fresh lookup — survives rewrites
-    if (box && openConvos.has(id)) renderConvo(box, transcripts);
     renderSessions(); // new tail can flip quiet↔your-move: verb, snippet, and order
   } catch {
-    /* transient failure: keep the last good view */
+    /* transient failure: keep the last good tail */
   }
 }
 
-// transcripts feed two consumers on the same 2.5s cadence: open conversation
-// views, and the card-face snippet/verb of every visible ready session
-async function tailConvos() {
-  const ids = new Set();
-  if (state.tab === "sessions" && !document.hidden) {
-    const ready = state.sessions.filter((s) => s.state === "ready");
-    for (const s of ready.slice(0, SNIPPET_POLL_CAP)) ids.add(s.id);
-    if (ready.length > SNIPPET_POLL_CAP && !snippetCapWarned) {
-      snippetCapWarned = true;
-      console.warn(`snippet polling capped at the first ${SNIPPET_POLL_CAP} ready sessions`);
-    }
+// the card-face snippet/verb of every visible ready session, one fetch per
+// session per 2.5s cycle; reading the full conversation lives in the Claude app
+async function tailTranscripts() {
+  if (state.tab !== "sessions" || document.hidden) return;
+  const ready = state.sessions.filter((s) => s.state === "ready");
+  for (const s of ready.slice(0, SNIPPET_POLL_CAP)) await refreshTail(s.id);
+  if (ready.length > SNIPPET_POLL_CAP && !snippetCapWarned) {
+    snippetCapWarned = true;
+    console.warn(`snippet polling capped at the first ${SNIPPET_POLL_CAP} ready sessions`);
   }
-  for (const id of [...openConvos]) {
-    const s = state.sessions.find((x) => x.id === id);
-    if (!s) {
-      openConvos.delete(id);
-      continue;
-    }
-    if (s.state !== "starting" && s.state !== "ready") continue; // frozen but stays open
-    ids.add(id);
-  }
-  for (const id of ids) await refreshConvo(id);
 }
 
 async function tailLogs() {
@@ -1011,16 +1015,10 @@ document.addEventListener("toggle", async (e) => {
     else openQrs.delete(qrId);
     return;
   }
-  const convoBox = e.target.querySelector?.(".convo[data-convo]");
-  if (convoBox) {
-    const id = convoBox.dataset.convo;
-    if (e.target.open) {
-      openConvos.add(id);
-      convoKeys.delete(id); // force a repaint even if the payload is unchanged
-      refreshConvo(id);
-    } else {
-      openConvos.delete(id);
-    }
+  const envId = e.target.dataset?.env;
+  if (envId !== undefined) {
+    if (e.target.open) openEnvs.add(envId);
+    else openEnvs.delete(envId);
     return;
   }
   const pre = e.target.querySelector?.("pre[data-log]");
@@ -1254,7 +1252,7 @@ function switchTab(tab) {
   if (tab === "sessions") {
     refreshSessions();
     loadOrbit();
-    tailConvos(); // warm the verbs/snippets right away, not a poll-cycle later
+    tailTranscripts(); // warm the verbs/snippets right away, not a poll-cycle later
   }
   if (tab === "settings") openSettings();
 }
@@ -1579,7 +1577,7 @@ setInterval(health, 10000);
 setInterval(() => {
   if (state.tab === "sessions" || state.sessions.some((s) => s.state === "starting")) refreshSessions();
   tailLogs();
-  tailConvos();
+  tailTranscripts();
 }, 2500);
 setInterval(secondTick, 1000);
 refreshSessions();

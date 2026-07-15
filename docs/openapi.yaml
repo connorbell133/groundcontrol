@@ -116,6 +116,15 @@ components:
         exitCode: { type: [integer, "null"] }
         lastOutputAt: { type: [string, "null"], format: date-time }
         lastLine: { type: [string, "null"], description: "Last meaningful log line, ≤120 chars." }
+        capacityUsed:
+          type: integer
+          description: >
+            The environment's live session count, scraped from the CLI's own
+            "Capacity: used/max" status line. Absent until the line first
+            appears and after exit; never journaled.
+        capacityMax:
+          type: integer
+          description: Companion maximum from the same scrape; present exactly when capacityUsed is.
         claudeSessionId:
           type: string
           description: >

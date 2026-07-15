@@ -103,6 +103,7 @@ func FakeClaudeWith(t *testing.T, cfg FakeClaudeConfig) {
 		"--version) cat \"" + versionFile + "\" ;;\n" +
 		"agents) cat \"" + agentsFile + "\" ;;\n" +
 		"*)\n" +
+		"echo \"Capacity: 1/32 · New sessions will be created in the current directory\"\n" +
 		"echo \"https://claude.ai/remote/abc123\"\n" +
 		"exec sleep 300\n" +
 		";;\n" +

@@ -1082,6 +1082,34 @@ func TestSessionsPayloadOmitsEnrichmentWhenAbsent(t *testing.T) {
 	}
 }
 
+// Capacity rides the PTY stream ahead of the pairing URL, so a ready session
+// has already scraped it; exit clears it — a dead card must not claim a live
+// environment.
+func TestSessionCapacityLifecycle(t *testing.T) {
+	testutil.FakeClaude(t)
+	root := testutil.ResolvedTempDir(t)
+	env := newTestEnv(t, config.Config{Roots: []string{root}})
+
+	created := createSession(t, env, fmt.Sprintf(`{"folder":%q}`, root))
+	if outcome := env.sessions.WaitForReady(created.ID, 10*time.Second); outcome != "ready" {
+		t.Fatalf("WaitForReady = %q, want ready", outcome)
+	}
+	rec := doReq(t, env.handler, "GET", "/sessions/"+created.ID, "", nil)
+	var ready sessions.Session
+	if err := json.Unmarshal(rec.Body.Bytes(), &ready); err != nil {
+		t.Fatal(err)
+	}
+	if ready.CapacityUsed == nil || *ready.CapacityUsed != 1 || ready.CapacityMax == nil || *ready.CapacityMax != 32 {
+		t.Errorf("ready capacity = %v/%v, want 1/32 (body %s)", ready.CapacityUsed, ready.CapacityMax, rec.Body.String())
+	}
+
+	killAndWait(t, env, created.ID)
+	rec = doReq(t, env.handler, "GET", "/sessions/"+created.ID, "", nil)
+	if strings.Contains(rec.Body.String(), "capacityUsed") || strings.Contains(rec.Body.String(), "capacityMax") {
+		t.Errorf("exited session must omit capacity keys: %s", rec.Body.String())
+	}
+}
+
 func TestLostAndLandedClaudeSessionID(t *testing.T) {
 	t.Parallel()
 	root := testutil.ResolvedTempDir(t)

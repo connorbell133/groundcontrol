@@ -70,6 +70,11 @@ type Session struct {
 	ExitCode       *int                `json:"exitCode"`
 	LastOutputAt   *string             `json:"lastOutputAt"`
 	LastLine       *string             `json:"lastLine"`
+	// scraped from the CLI's own "Capacity: used/max" status line — the
+	// environment's live session count. Absent until the line first appears,
+	// cleared at exit, never journaled.
+	CapacityUsed *int `json:"capacityUsed,omitempty"`
+	CapacityMax  *int `json:"capacityMax,omitempty"`
 	// registry-sourced enrichment: every field degrades to absence and none
 	// of them ever drives a state transition — the PTY stays the sole exit
 	// authority (R6)
@@ -177,7 +182,24 @@ var (
 	trailingRE  = regexp.MustCompile(`[).,]+$`)
 	lineSplitRE = regexp.MustCompile(`[\r\n]+`)
 	alnumRE     = regexp.MustCompile(`[A-Za-z0-9]`)
+	capacityRE  = regexp.MustCompile(`Capacity:\s*(\d+)\s*/\s*(\d+)`)
 )
+
+// scanCapacity finds the newest "Capacity: used/max" pair in text — the TUI
+// redraws its status area, so later occurrences supersede earlier ones.
+func scanCapacity(text string) (used, max int, ok bool) {
+	ms := capacityRE.FindAllStringSubmatch(text, -1)
+	if len(ms) == 0 {
+		return 0, 0, false
+	}
+	last := ms[len(ms)-1]
+	u, err1 := strconv.Atoi(last[1])
+	x, err2 := strconv.Atoi(last[2])
+	if err1 != nil || err2 != nil {
+		return 0, 0, false
+	}
+	return u, x, true
+}
 
 func lastMeaningfulLine(log []string) string {
 	start := len(log) - 8
@@ -532,6 +554,16 @@ func (m *Manager) readLoop(s *liveSession) {
 			if line := lastMeaningfulLine(s.log); line != "" {
 				s.LastLine = util.StrPtr(line)
 			}
+			// a chunk boundary can split the capacity line, so scan a short log
+			// tail rather than the chunk; no match keeps the last known value
+			capTail := s.log
+			if len(capTail) > 4 {
+				capTail = capTail[len(capTail)-4:]
+			}
+			if used, max, ok := scanCapacity(strings.Join(capTail, "")); ok {
+				s.CapacityUsed = util.IntPtr(used)
+				s.CapacityMax = util.IntPtr(max)
+			}
 			// keep scanning past ready while the bridge pointer holds the URL:
 			// the CLI's own output must be able to overrule a constructed URL
 			if s.PairingURL == nil || s.pairingSource == pairingSourcePointer {
@@ -584,6 +616,8 @@ func (m *Manager) readLoop(s *liveSession) {
 	// die with the session (the poller's state guard keeps a stale snapshot
 	// from resurrecting it), while the extras list freezes as-is
 	s.Activity = nil
+	// capacity describes a live environment; a dead card must not claim one
+	s.CapacityUsed, s.CapacityMax = nil, nil
 	s.ptmx = nil
 	id := s.ID
 	killed := s.killed

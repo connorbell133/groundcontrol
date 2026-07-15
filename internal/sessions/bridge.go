@@ -85,13 +85,12 @@ func readBridgePointer(path string) *bridgePointer {
 // launcher forks once; the pointer records the fork). Secondary: procStart
 // within a generous window of our launch time — but an unparseable procStart
 // passes, because formats drift and ancestry already vouched for the pid.
-func acceptBridgePointer(p *bridgePointer, spawnPID int, launched time.Time, haveLaunched bool) bool {
+func acceptBridgePointer(p *bridgePointer, spawnPID int, launched time.Time, haveLaunched bool, ps func() map[int]int) bool {
 	if spawnPID <= 0 {
 		return false
 	}
 	if p.PID != spawnPID {
-		ps, err := bridgePSMap(bridgePSTimeout)
-		if err != nil || !reachesAncestor(ps, p.PID, spawnPID) {
+		if m := ps(); m == nil || !reachesAncestor(m, p.PID, spawnPID) {
 			// a live pointer we can't tie to our spawn is indistinguishable
 			// from a concurrent same-dir launch's — reject and ride the scrape
 			return false
@@ -152,6 +151,19 @@ func (m *Manager) watchBridgePointer(s *liveSession, spawnPID int) {
 	path := filepath.Join(claudeProjectsDir, claudeProjectDirName(s.cwd), bridgePointerFile)
 	launched, launchedErr := time.Parse(time.RFC3339, s.StartedAt)
 	deadline := time.Now().Add(bridgePollWindow)
+	// stale/foreign pointers persist by design, so a parked pointer would
+	// otherwise cost one ps exec per poll iteration for the whole window —
+	// cache the snapshot and refresh at most once a second
+	var psCache map[int]int
+	var psAt time.Time
+	psFn := func() map[int]int {
+		if psCache == nil || time.Since(psAt) > time.Second {
+			if m, err := bridgePSMap(bridgePSTimeout); err == nil {
+				psCache, psAt = m, time.Now()
+			}
+		}
+		return psCache
+	}
 	for {
 		m.mu.Lock()
 		resolved := s.PairingURL != nil
@@ -160,7 +172,7 @@ func (m *Manager) watchBridgePointer(s *liveSession, spawnPID int) {
 		if resolved || !alive {
 			return
 		}
-		if p := readBridgePointer(path); p != nil && acceptBridgePointer(p, spawnPID, launched, launchedErr == nil) {
+		if p := readBridgePointer(path); p != nil && acceptBridgePointer(p, spawnPID, launched, launchedErr == nil, psFn) {
 			// URL shape observed on 2.1.210, undocumented — drift surfaces via
 			// the scrape reconcile above, never as a silent wrong link
 			url := "https://claude.ai/code?environment=" + p.EnvironmentID

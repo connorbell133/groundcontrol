@@ -10,7 +10,6 @@ missing file, an unrecognized shape, or a removed record type all degrade to
 "no PR link", never to an error. */
 
 import (
-	"bufio"
 	"encoding/json"
 	"os"
 )
@@ -61,8 +60,7 @@ func scanPRLink(path string) *PRLink {
 		return nil
 	}
 	defer f.Close()
-	sc := bufio.NewScanner(f)
-	sc.Buffer(make([]byte, 0, 64*1024), 8*1024*1024)
+	sc := transcriptScanner(f)
 	var link *PRLink
 	for sc.Scan() {
 		var e struct {

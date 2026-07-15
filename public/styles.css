@@ -881,3 +881,41 @@ html[data-hand="left"] .select-caret { right: auto; left: 14px; }
   border-radius: 6px; padding: 2px 7px;
 }
 .cta.warn { background: var(--danger); color: #fff2ec; }
+
+/* ---------- launch presets · capacity · six-mode segment (sheet + settings) ---------- */
+/* six buttons wrap 3+3; percentage basis keeps the rows aligned down to 390px */
+.segment-wrap { flex-wrap: wrap; }
+.segment-wrap button { flex: 1 1 30%; min-width: 0; font-size: 11px; padding: 10px 2px; white-space: nowrap; }
+
+.field input[type="number"] {
+  width: 100%; font-family: var(--mono); font-size: 15px; color: var(--text);
+  background: var(--panel); border: 1.5px solid var(--line-strong); border-radius: 10px;
+  padding: 13px 14px; letter-spacing: 0.02em;
+  appearance: textfield; -moz-appearance: textfield;
+}
+.field input[type="number"]::-webkit-outer-spin-button,
+.field input[type="number"]::-webkit-inner-spin-button { -webkit-appearance: none; margin: 0; }
+
+.preset-row {
+  display: flex; align-items: center; gap: 10px;
+  border: 1px solid var(--line-strong); border-radius: 10px;
+  background: var(--panel);
+  padding: 9px 10px; margin-bottom: 8px;
+}
+.preset-info {
+  flex: 1; min-width: 0; display: grid; gap: 3px; text-align: left;
+  background: none; border: 0; padding: 0;
+}
+.preset-name { font-family: var(--mono); font-size: 12.5px; font-weight: 700; color: var(--text); }
+.preset-meta {
+  font-family: var(--mono); font-size: 10px; color: var(--muted); letter-spacing: 0.04em;
+  overflow: hidden; text-overflow: ellipsis; white-space: nowrap;
+}
+.preset-x {
+  flex: none; font: inherit; font-family: var(--mono); font-weight: 700; line-height: 1;
+  color: var(--danger); background: color-mix(in srgb, var(--danger) 8%, transparent);
+  border: 0; border-radius: 5px; padding: 6px 9px;
+}
+.preset-json { font-family: var(--mono); font-size: 12px; }
+.preset-error { color: var(--danger); }
+html[data-hand="left"] .preset-row { flex-direction: row-reverse; }

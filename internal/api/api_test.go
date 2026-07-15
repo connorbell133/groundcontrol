@@ -358,7 +358,12 @@ func TestPostSessionsPermissionModes(t *testing.T) {
 	env := newTestEnv(t, config.Config{Roots: []string{root}})
 
 	for _, mode := range []string{"default", "acceptEdits", "plan", "auto", "dontAsk", "bypassPermissions"} {
-		created := createSession(t, env, fmt.Sprintf(`{"folder":%q,"name":"pm-%s","permissionMode":%q}`, root, mode, mode))
+		// one live environment per folder: each mode launches in its own subfolder
+		folder := filepath.Join(root, "pm-"+mode)
+		if err := os.MkdirAll(folder, 0o755); err != nil {
+			t.Fatal(err)
+		}
+		created := createSession(t, env, fmt.Sprintf(`{"folder":%q,"name":"pm-%s","permissionMode":%q}`, folder, mode, mode))
 		if created.PermissionMode != mode {
 			t.Errorf("%s: session permissionMode = %q", mode, created.PermissionMode)
 		}
@@ -374,17 +379,25 @@ func TestPostSessionsCapacity(t *testing.T) {
 	root := testutil.ResolvedTempDir(t)
 	env := newTestEnv(t, config.Config{Roots: []string{root}})
 
+	// one live environment per folder: each case launches in its own subfolder
+	sub := func(name string) string {
+		folder := filepath.Join(root, name)
+		if err := os.MkdirAll(folder, 0o755); err != nil {
+			t.Fatal(err)
+		}
+		return folder
+	}
 	cases := []struct {
 		name string
 		body string
 		want int  // capacity on the wire
 		flag bool // --capacity spawned — the journal entry mirrors the args
 	}{
-		{"absent defaults", fmt.Sprintf(`{"folder":%q,"name":"cap-absent"}`, root), 32, false},
-		{"zero defaults", fmt.Sprintf(`{"folder":%q,"name":"cap-zero","capacity":0}`, root), 32, false},
-		{"explicit default omits the flag", fmt.Sprintf(`{"folder":%q,"name":"cap-default","capacity":32}`, root), 32, false},
-		{"non-default passes through", fmt.Sprintf(`{"folder":%q,"name":"cap-four","capacity":4}`, root), 4, true},
-		{"oversized clamps", fmt.Sprintf(`{"folder":%q,"name":"cap-big","capacity":500}`, root), 256, true},
+		{"absent defaults", fmt.Sprintf(`{"folder":%q,"name":"cap-absent"}`, sub("cap-absent")), 32, false},
+		{"zero defaults", fmt.Sprintf(`{"folder":%q,"name":"cap-zero","capacity":0}`, sub("cap-zero")), 32, false},
+		{"explicit default omits the flag", fmt.Sprintf(`{"folder":%q,"name":"cap-default","capacity":32}`, sub("cap-default")), 32, false},
+		{"non-default passes through", fmt.Sprintf(`{"folder":%q,"name":"cap-four","capacity":4}`, sub("cap-four")), 4, true},
+		{"oversized clamps", fmt.Sprintf(`{"folder":%q,"name":"cap-big","capacity":500}`, sub("cap-big")), 256, true},
 	}
 	for _, tc := range cases {
 		t.Run(tc.name, func(t *testing.T) {

@@ -112,6 +112,9 @@ type liveSession struct {
 	log    []string
 	killed bool
 	cwd    string // where claude actually runs: the worktree (or subfolder) in worktree mode
+	// which source set PairingURL (bridge.go); the scrape keeps scanning while
+	// the pointer holds it, so a drifted constructed URL can still be corrected
+	pairingSource string
 	// worktree cleanup context, captured at launch
 	repoRoot   string
 	wtBranch   string
@@ -498,6 +501,8 @@ func (m *Manager) Create(opts CreateOpts) (Session, error) {
 	m.announce(evSessionStart, snap, false)
 
 	go m.readLoop(s)
+	// primary pairing-URL source; short-lived, ends at first resolution or timeout
+	go m.watchBridgePointer(s, cmd.Process.Pid)
 
 	return snap, nil
 }
@@ -520,14 +525,17 @@ func (m *Manager) readLoop(s *liveSession) {
 			if line := lastMeaningfulLine(s.log); line != "" {
 				s.LastLine = util.StrPtr(line)
 			}
-			if s.PairingURL == nil {
+			// keep scanning past ready while the bridge pointer holds the URL:
+			// the CLI's own output must be able to overrule a constructed URL
+			if s.PairingURL == nil || s.pairingSource == pairingSourcePointer {
 				if found := urlRE.FindString(strings.Join(s.log, "")); found != "" {
 					url := trailingRE.ReplaceAllString(found, "")
-					s.PairingURL = &url
-					s.State = StateReady
-					readyURL = url
-					snap := s.Session
-					readySnap = &snap
+					if snap := s.setReadyLocked(url, pairingSourceScrape); snap != nil {
+						readyURL = url
+						readySnap = snap
+					} else {
+						s.reconcileScrapedURLLocked(url)
+					}
 				}
 			}
 			id := s.ID

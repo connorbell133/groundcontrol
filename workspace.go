@@ -98,6 +98,8 @@ func gitRun(dir string, timeout time.Duration, args ...string) error {
 
 // runnerLockFile stays referenced for the process lifetime — a finalizer
 // closing it would release the flock.
+//
+//lint:ignore U1000 write-only by design; the assignment itself keeps the *os.File alive
 var runnerLockFile *os.File
 
 // acquireRunnerLock takes a non-blocking exclusive flock scoped to the shared

@@ -109,6 +109,15 @@
       <p class="sheet-path" id="sheetPath"></p>
     </div>
 
+    <div class="field">
+      <span class="field-label">Preset</span>
+      <div class="select-wrap">
+        <select id="optPreset" aria-label="Launch preset"></select>
+        <span class="select-caret" aria-hidden="true">⌄</span>
+      </div>
+      <span class="field-hint" id="presetHint"></span>
+    </div>
+
     <label class="field">
       <span class="field-label">What's this run for?</span>
       <input type="text" id="optName" placeholder="fix checkout race" autocomplete="off" autocapitalize="off" spellcheck="false" />
@@ -135,13 +144,22 @@
 
     <div class="field">
       <span class="field-label">Permissions</span>
-      <div class="segment segment-4" id="optPerm">
+      <div class="segment segment-wrap" id="optPerm">
         <button data-value="default" class="active">Ask</button>
         <button data-value="acceptEdits">Edits</button>
         <button data-value="plan">Plan</button>
+        <button data-value="auto">Auto</button>
+        <button data-value="dontAsk">Don't ask</button>
         <button data-value="bypassPermissions" class="is-danger">YOLO</button>
       </div>
+      <span class="field-hint" id="permHint"></span>
     </div>
+
+    <label class="field">
+      <span class="field-label">Max sessions</span>
+      <input type="number" id="optCapacity" min="1" inputmode="numeric" value="32" />
+      <span class="field-hint">how many sessions claude.ai can open in this environment — the server clamps out-of-range values</span>
+    </label>
 
     <button class="cta" id="launchBtn">
       <span class="cta-glyph">▶</span> Launch session
@@ -184,10 +202,12 @@
     </div>
     <div class="field">
       <span class="field-label">Permissions</span>
-      <div class="segment segment-4" id="setPerm">
+      <div class="segment segment-wrap" id="setPerm">
         <button data-value="default" class="active">Ask</button>
         <button data-value="acceptEdits">Edits</button>
         <button data-value="plan">Plan</button>
+        <button data-value="auto">Auto</button>
+        <button data-value="dontAsk">Don't ask</button>
         <button data-value="bypassPermissions" class="is-danger">YOLO</button>
       </div>
     </div>
@@ -225,6 +245,46 @@
       </div>
       <span class="field-hint">tap × to remove — validated on save</span>
     </div>
+
+    <div class="settings-group">Environment presets</div>
+    <p class="settings-note">named launch configurations, saved in config.json — pick one at the top of the launch sheet; tap a row to edit it</p>
+    <div id="presetList"></div>
+    <label class="field">
+      <span class="field-label">Name</span>
+      <input type="text" id="presetName" placeholder="unique name" autocomplete="off" autocapitalize="off" spellcheck="false" />
+    </label>
+    <div class="field">
+      <span class="field-label">Permissions</span>
+      <div class="select-wrap">
+        <select id="presetPerm" aria-label="Preset permission mode">
+          <option value="default">default</option>
+          <option value="acceptEdits">acceptEdits</option>
+          <option value="plan">plan</option>
+          <option value="auto">auto</option>
+          <option value="dontAsk">dontAsk</option>
+          <option value="bypassPermissions">bypassPermissions</option>
+        </select>
+        <span class="select-caret" aria-hidden="true">⌄</span>
+      </div>
+    </div>
+    <div class="field">
+      <span class="field-label">Workspace</span>
+      <div class="segment" id="presetSpawn">
+        <button data-value="same-dir" class="active">In folder</button>
+        <button data-value="worktree">Worktree</button>
+      </div>
+    </div>
+    <label class="field">
+      <span class="field-label">Max sessions</span>
+      <input type="number" id="presetCapacity" min="1" inputmode="numeric" placeholder="32" />
+    </label>
+    <label class="field">
+      <span class="field-label">Settings JSON</span>
+      <textarea id="presetSettings" class="preset-json" rows="3" placeholder='{"env": {"MAX_THINKING_TOKENS": "31999"}}' autocapitalize="off" spellcheck="false"></textarea>
+      <span class="field-hint">optional — written to .claude/settings.local.json in the launch folder for the run; hooks keys are rejected</span>
+    </label>
+    <p class="settings-note preset-error" id="presetError" hidden></p>
+    <button class="log-tool" id="presetAddBtn">Add preset</button>
 
     <div class="settings-group">Kept worktrees</div>
     <p class="settings-note">worktrees the cleanup refused to delete (dirty or orphaned) — they hold their branch until cleaned</p>

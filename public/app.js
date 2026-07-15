@@ -35,6 +35,7 @@ const state = {
   orbit: null, // null = never fetched; [] = fetched, empty (or fetch failed → chip hidden)
   tab: "browse",
   opts: { spawnMode: "same-dir", permissionMode: "default" },
+  presets: null, // config launch presets — null until the sheet's first GET /config
 };
 
 /* ---------- preferences & theme (light is the baseline) ---------- */
@@ -212,12 +213,16 @@ async function loadRecents() {
 async function relaunchFromRecent(cfg) {
   try {
     await loadFolder(cfg.folder);
+    // capacity and preset ride along; a preset name that no longer resolves in
+    // config still goes on the payload — the server re-resolves it and surfaces
+    // the "preset no longer exists" skip on the card (plan R8)
+    const carry = { capacity: cfg.capacity || undefined, presetName: cfg.presetName || undefined };
     if (cfg.stale) {
       // the branch this config used no longer exists — degrade honestly
       toast(`branch ${cfg.branch} no longer exists — defaulting to in-folder`, true);
-      openSheet({ spawnMode: "same-dir", permissionMode: cfg.permissionMode });
+      openSheet({ spawnMode: "same-dir", permissionMode: cfg.permissionMode, ...carry });
     } else {
-      openSheet({ spawnMode: cfg.spawnMode, permissionMode: cfg.permissionMode, branch: cfg.branch ?? undefined });
+      openSheet({ spawnMode: cfg.spawnMode, permissionMode: cfg.permissionMode, branch: cfg.branch ?? undefined, ...carry });
     }
   } catch (e) {
     toast(e.message, true);
@@ -301,6 +306,108 @@ $("missionInput").addEventListener("keydown", (e) => {
 });
 
 /* ---------- launch sheet ---------- */
+// one line per mode, stating its literal function — copy mirrors the official
+// permissions doc (code.claude.com/docs/en/permissions, checked 2026-07-15)
+const PERM_HINTS = {
+  default: "asks before file edits and commands",
+  acceptEdits: "auto-accepts file edits — commands still ask",
+  plan: "read-only: plans without editing files or running commands",
+  auto: "auto-approves tool calls with background safety checks",
+  dontAsk: "auto-denies tools unless pre-approved by permission rules",
+  bypassPermissions: "skips all permission prompts",
+};
+
+function syncPermHint() {
+  $("permHint").textContent = PERM_HINTS[state.opts.permissionMode] || "";
+}
+
+/* ---------- launch presets ---------- */
+// the sheet's non-preset basis (this folder's saved opts, else the launch
+// defaults) — picking "none" in the preset select restores exactly this
+let sheetBaseOpts = null;
+
+async function loadSheetPresets() {
+  try {
+    const cfg = await api("/api/v1/config");
+    state.presets = Array.isArray(cfg.presets) ? cfg.presets : [];
+  } catch {
+    state.presets = []; // config unreachable — the sheet still works, just presetless
+  }
+  renderPresetSelect();
+}
+
+function renderPresetSelect() {
+  const select = $("optPreset");
+  select.innerHTML = "";
+  const presets = state.presets || [];
+  const none = document.createElement("option");
+  none.value = "";
+  none.textContent = "none";
+  select.appendChild(none);
+  for (const p of presets) {
+    const opt = document.createElement("option");
+    opt.value = p.name;
+    opt.textContent = p.name;
+    select.appendChild(opt);
+  }
+  const active = state.opts.presetName || "";
+  if (active && !presets.some((p) => p.name === active)) {
+    // a relaunch carried a preset that's gone from config — keep it selected and
+    // honest; the server re-resolves the name and reports the skip on the card
+    const opt = document.createElement("option");
+    opt.value = active;
+    opt.textContent = `${active} (missing)`;
+    select.appendChild(opt);
+  }
+  select.value = active;
+  select.disabled = !presets.length && !active;
+  syncPresetHint();
+}
+
+function syncPresetHint() {
+  const active = state.opts.presetName || "";
+  const p = (state.presets || []).find((x) => x.name === active);
+  $("presetHint").textContent =
+    !(state.presets || []).length && !active
+      ? "no presets saved — add one in Settings"
+      : active && !p
+        ? "not in config anymore — launches with the values shown, without its settings file"
+        : p?.settingsJson
+          ? "sets the options below and writes its settings file for the run"
+          : active
+            ? "sets the options below"
+            : "replaces the options below · none = this folder's last-used options";
+}
+
+function applyPreset(name) {
+  if (!name) {
+    state.opts = { ...sheetBaseOpts };
+  } else {
+    const p = (state.presets || []).find((x) => x.name === name);
+    if (p) {
+      // a preset replaces the whole opts object; unset fields fall to defaults
+      const d = launchDefaults();
+      state.opts = {
+        spawnMode: p.spawnMode || d.spawnMode,
+        permissionMode: p.permissionMode || d.permissionMode,
+        ...(p.capacity ? { capacity: p.capacity } : {}),
+        presetName: p.name,
+      };
+    } else {
+      // deleted preset off a recent: keep the stored literal values, keep the
+      // name on the payload — the server resolves or skips it (plan R8)
+      state.opts = { ...state.opts, presetName: name };
+    }
+  }
+  if (!state.current?.isGit || state.branchCount === 0) state.opts.spawnMode = "same-dir";
+  syncSegment("optSpawn", state.opts.spawnMode);
+  syncSegment("optPerm", state.opts.permissionMode);
+  $("optCapacity").value = state.opts.capacity ?? 32;
+  syncBranchField();
+  syncPermHint();
+  syncPresetHint();
+}
+
 function syncBranchField() {
   // every control stays on screen in every mode — capability only changes copy + enabled state
   const git = !!state.current?.isGit;
@@ -371,7 +478,10 @@ function openSheet(prefill) {
   $("sheetPath").textContent = folder;
 
   const saved = JSON.parse(localStorage.getItem(`opts:${folder}`) || "null");
-  state.opts = { ...(prefill || saved || launchDefaults()) };
+  sheetBaseOpts = { ...(saved || launchDefaults()) };
+  delete sheetBaseOpts.presetName; // never saved per-folder, but stay defensive
+  // precedence: explicit prefill → (interactive preset pick, later) → saved per-folder opts → defaults
+  state.opts = { ...(prefill || sheetBaseOpts) };
   // name rides the prefill for one mission only — never into the per-repo opts
   delete state.opts.name;
 
@@ -388,6 +498,10 @@ function openSheet(prefill) {
   }
   syncSegment("optSpawn", state.opts.spawnMode);
   syncSegment("optPerm", state.opts.permissionMode);
+  syncPermHint();
+  $("optCapacity").value = state.opts.capacity ?? 32;
+  renderPresetSelect(); // instant, from the last-fetched list…
+  loadSheetPresets(); // …then refreshed from GET /config (tolerates absence)
   syncBranchField();
   if (git) loadBranches(folder);
 
@@ -441,7 +555,12 @@ async function doLaunch() {
   try {
     const branch = state.current.isGit ? $("optBranch").value || undefined : undefined;
     state.opts.branch = branch;
-    localStorage.setItem(`opts:${state.path}`, JSON.stringify(state.opts)); // name never saved — per mission, not per repo
+    const cap = parseInt($("optCapacity").value, 10);
+    state.opts.capacity = Number.isFinite(cap) ? cap : undefined; // min=1 is a browser hint — the server normalizes
+    if (!state.opts.presetName) {
+      // preset launches never overwrite the folder's remembered options
+      localStorage.setItem(`opts:${state.path}`, JSON.stringify(state.opts)); // name never saved — per mission, not per repo
+    }
     await api("/api/v1/sessions", {
       method: "POST",
       headers: { "content-type": "application/json" },
@@ -451,6 +570,8 @@ async function doLaunch() {
         spawnMode: state.opts.spawnMode,
         branch,
         permissionMode: state.opts.permissionMode,
+        capacity: state.opts.capacity,
+        presetName: state.opts.presetName || undefined,
       }),
     });
     closeSheet();
@@ -1422,6 +1543,103 @@ function renderRootChips() {
   }
 }
 
+/* ---------- environment presets (settings) ---------- */
+let presetsDraft = [];
+let presetSpawnVal = "same-dir";
+
+function presetSummary(p) {
+  return [
+    p.permissionMode || "default",
+    p.spawnMode || "same-dir",
+    `${p.capacity || 32} sessions`,
+    ...(p.settingsJson ? ["settings file"] : []),
+  ].join(" · ");
+}
+
+function renderPresetRows() {
+  const box = $("presetList");
+  box.innerHTML = "";
+  if (!presetsDraft.length) {
+    box.innerHTML = `<div class="wt-empty">No presets — add one below.</div>`;
+    return;
+  }
+  for (const p of presetsDraft) {
+    const row = document.createElement("div");
+    row.className = "preset-row";
+    const info = document.createElement("button");
+    info.className = "preset-info";
+    info.innerHTML = `<span class="preset-name">${esc(p.name)}</span><span class="preset-meta">${esc(presetSummary(p))}</span>`;
+    info.onclick = () => {
+      // load into the form — "Add preset" under the same name saves the edit
+      $("presetName").value = p.name;
+      $("presetPerm").value = p.permissionMode || "default";
+      presetSpawnVal = p.spawnMode || "same-dir";
+      syncSegment("presetSpawn", presetSpawnVal);
+      $("presetCapacity").value = p.capacity || "";
+      $("presetSettings").value = p.settingsJson || "";
+    };
+    const x = document.createElement("button");
+    x.className = "preset-x";
+    x.textContent = "×";
+    x.setAttribute("aria-label", `delete preset ${p.name}`);
+    x.onclick = () => savePresets(presetsDraft.filter((q) => q.name !== p.name), `Preset ${p.name} deleted`);
+    row.append(info, x);
+    box.appendChild(row);
+  }
+}
+
+// preset saves are a dedicated PUT carrying only {presets} — never bundled with
+// the roots/webhooks save, so a rejected preset can't block unrelated settings
+async function savePresets(next, okMsg) {
+  const err = $("presetError");
+  try {
+    await api("/api/v1/config", {
+      method: "PUT",
+      headers: { "content-type": "application/json" },
+      body: JSON.stringify({ presets: next }),
+    });
+    presetsDraft = next;
+    err.hidden = true;
+    renderPresetRows();
+    toast(okMsg);
+    return true;
+  } catch (e) {
+    err.textContent = e.message; // the 4xx envelope names the preset and the rule it broke
+    err.hidden = false;
+    return false;
+  }
+}
+
+document.querySelectorAll("#presetSpawn button").forEach((b) => {
+  b.onclick = () => {
+    presetSpawnVal = b.dataset.value;
+    syncSegment("presetSpawn", b.dataset.value);
+  };
+});
+
+$("presetAddBtn").onclick = async () => {
+  const name = $("presetName").value.trim();
+  const cap = parseInt($("presetCapacity").value, 10);
+  const settings = $("presetSettings").value.trim();
+  const preset = {
+    name,
+    permissionMode: $("presetPerm").value,
+    spawnMode: presetSpawnVal,
+    ...(Number.isFinite(cap) ? { capacity: cap } : {}),
+    ...(settings ? { settingsJson: settings } : {}),
+  };
+  // a matching name is an edit; everything else the server validates
+  const next = [...presetsDraft.filter((q) => q.name !== name), preset];
+  if (await savePresets(next, `Preset ${name || "?"} saved`)) {
+    $("presetName").value = "";
+    $("presetCapacity").value = "";
+    $("presetSettings").value = "";
+    $("presetPerm").value = "default";
+    presetSpawnVal = "same-dir";
+    syncSegment("presetSpawn", "same-dir");
+  }
+};
+
 async function renderWorktrees() {
   const box = $("worktreeList");
   try {
@@ -1478,6 +1696,8 @@ async function openSettings() {
     $("setHookUrl").value = webhooksDraft[0]?.url || "";
     rootsDraft = [...cfg.roots];
     renderRootChips();
+    presetsDraft = Array.isArray(cfg.presets) ? [...cfg.presets] : [];
+    renderPresetRows();
     syncSegment("setHookEvents", setVals.hookEvents);
     syncSegment("setHidden", setVals.hidden);
   } catch {
@@ -1567,8 +1787,9 @@ $("launchBar").onclick = () => openSheet();
 $("scrim").onclick = closeSheet;
 $("launchBtn").onclick = launch;
 wireSegment("optSpawn", "spawnMode", syncBranchField);
-wireSegment("optPerm", "permissionMode");
+wireSegment("optPerm", "permissionMode", syncPermHint);
 $("optBranch").onchange = () => (state.opts.branch = $("optBranch").value);
+$("optPreset").onchange = () => applyPreset($("optPreset").value);
 
 /* ---------- URL-parameter launch (manifest shortcuts, scripts) ---------- */
 // Grammar: ?path=/abs/dir[&name=...] | ?mission=1 | ?relaunch=last

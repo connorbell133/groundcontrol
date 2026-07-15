@@ -743,6 +743,26 @@ function envRowsHTML(rows) {
   return `<div class="session-rows">${shown}${more}</div>`;
 }
 
+// the environment's identifiers, always visible on live cards — claude.ai's
+// picker addresses environments by these, so they are the card's identity,
+// not debug detail. The env id rides the pairing URL (?environment=env_…);
+// each row degrades to absence.
+function envIdOf(s) {
+  try {
+    return new URL(s.pairingUrl).searchParams.get("environment") || "";
+  } catch {
+    return "";
+  }
+}
+
+function envStatsHTML(s) {
+  const rows = [];
+  const env = s.pairingUrl ? envIdOf(s) : "";
+  if (env) rows.push(`<div class="env-stat"><span class="env-stat-k">env</span><span class="env-stat-v">${esc(env)}</span></div>`);
+  if (s.claudeSessionId) rows.push(`<div class="env-stat"><span class="env-stat-k">claude session</span><span class="env-stat-v">${esc(s.claudeSessionId)}</span></div>`);
+  return rows.length ? `<div class="env-stats">${rows.join("")}</div>` : "";
+}
+
 // same-folder claude sessions not owned by this environment — a collapsed,
 // muted group so they never read as the environment's own. Status parentheticals
 // are snapshot-at-render (folder statuses aren't in the face and don't tick);
@@ -791,10 +811,14 @@ function renderShell(card, s) {
       <span class="meta-chip activity" data-activity hidden></span>
       ${s.prLink && live ? `<a class="meta-chip pr" href="${esc(s.prLink.url)}" target="_blank" rel="noopener">PR #${esc(s.prLink.number)}</a>` : ""}
     </div>
+    ${live ? envStatsHTML(s) : ""}
     ${live ? envRowsHTML(s.environmentSessions) : ""}
     ${live ? folderGroupHTML(s.id, s.folderSessions) : ""}
     ${s.pairingUrl && s.state === "ready" ? `
-      <a class="card-cta" href="${esc(s.pairingUrl)}" target="_blank" rel="noopener">enter cockpit <span class="cta-glyph">→</span></a>
+      <a class="card-cta" href="${esc(s.pairingUrl)}" target="_blank" rel="noopener">
+        <span class="cta-label"><span class="cta-title">open in claude.ai</span><span class="cta-sub">start sessions in this environment</span></span>
+        <span class="cta-glyph">→</span>
+      </a>
       <details class="qr-details" data-qr="${s.id}">
         <summary class="qr-summary">
           <span class="qr-summary-label">
@@ -1017,7 +1041,7 @@ function renderSessions() {
     const live = s.state === "ready" || s.state === "starting";
     const envRows = live ? (s.environmentSessions || []).map((x) => x.name).sort().join(",") : "";
     const folderNames = live ? (s.folderSessions || []).map((x) => x.name).sort().join(",") : "";
-    const face = `${s.state}|${s.pairingUrl}|${s.exitCode ?? ""}|${s.debrief?.branchState ?? ""}|${envRows}|${folderNames}|${s.settingsSkipReason ?? ""}|${s.prLink?.url ?? ""}`;
+    const face = `${s.state}|${s.pairingUrl}|${s.exitCode ?? ""}|${s.debrief?.branchState ?? ""}|${envRows}|${folderNames}|${s.settingsSkipReason ?? ""}|${s.claudeSessionId ?? ""}|${s.prLink?.url ?? ""}`;
     if (card.dataset.face !== face) {
       if (!card._new) card.style.animation = "none"; // in-place rewrite — no entrance replay
       card.dataset.face = face;

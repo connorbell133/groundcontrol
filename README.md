@@ -23,10 +23,22 @@
 
 ---
 
-<p align="center">
-  <a href="assets/demo.mp4"><img src="assets/demo.gif" width="340" alt="Real demo, real time: browse to a repo, launch a worktree session, scan the QR, land in the Claude app"></a>
-</p>
-<p align="center"><sub>One take, real time, recorded on a phone. Ends where it should: in the Claude app, paired. (<a href="assets/demo.mp4">MP4</a>)</sub></p>
+<table align="center">
+<tr>
+<td align="center" width="33%">
+<img src="assets/browse.png" width="220" alt="Browse view — folder list with git branch chip in the launch bar"><br>
+<sub><strong>1. Browse</strong> — tap a folder, see its branch</sub>
+</td>
+<td align="center" width="33%">
+<img src="assets/launch.png" width="220" alt="Launch console — worktree toggle, base branch picker, permission modes"><br>
+<sub><strong>2. Launch</strong> — worktree, base branch, permission mode</sub>
+</td>
+<td align="center" width="33%">
+<img src="assets/sessions.png" width="220" alt="Session card — live status, pairing QR, kill switch"><br>
+<sub><strong>3. Scan</strong> — QR pairs you straight into the Claude app</sub>
+</td>
+</tr>
+</table>
 
 You know the moment. You're on the couch, you think of the fix, and the thought dies because starting a [Claude Code](https://claude.com/claude-code) session means: find the laptop, SSH in, `cd` three directories deep, run `claude remote-control`, and squint at a QR code rendered in terminal characters.
 
@@ -48,10 +60,9 @@ $ claude remote-control
 After: open the app, tap the folder, tap **Launch**, scan.
 
 <p align="center">
-  <img src="assets/browse.png" width="260" alt="Browse view — folder list with git branch chip in the launch bar">
-  <img src="assets/launch.png" width="260" alt="Launch console — worktree toggle, base branch picker, permission modes">
-  <img src="assets/sessions.png" width="260" alt="Session card — live status, pairing QR, kill switch">
+  <a href="assets/demo.mp4"><img src="assets/demo.gif" width="340" alt="Real demo, real time: browse to a repo, launch a worktree session, scan the QR, land in the Claude app"></a>
 </p>
+<p align="center"><sub>Not staged — one take, real time, recorded on a phone. Ends where it should: in the Claude app, paired. (<a href="assets/demo.mp4">MP4</a>)</sub></p>
 
 ## What it does
 

@@ -422,8 +422,8 @@ function syncBranchField() {
     : noBranches
       ? "no commits yet — worktrees need a branch"
       : worktree
-        ? "isolated worktree — this folder stays untouched"
-        : "runs directly in this folder";
+        ? "isolated worktree — claude.ai lists the environment by the session name"
+        : "runs directly in this folder — claude.ai lists the environment by the folder's name";
 
   $("branchLabel").textContent = worktree ? "Base branch" : "Branch";
   if (!git) {

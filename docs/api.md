@@ -133,9 +133,14 @@ change; renaming one is breaking.
 - `name` — must not collide with a live session; omit to auto-generate.
 - `spawnMode` — `same-dir` (default) or `worktree`. Worktree mode requires
   `branch`, cuts a private `gc/<name-slug>-<id>` branch off it under
-  `~/.groundcontrol/worktrees/`, and cleans up on exit (dirty worktrees are
-  kept, never force-deleted). The slug comes from the session name (jobs: the
-  prompt), so `git branch` answers "what was this run for" at a glance.
+  `~/.groundcontrol/worktrees/<repo>/<name-slug>-<id>/`, and cleans up on exit
+  (dirty worktrees are kept, never force-deleted). The slug comes from the
+  session name (jobs: the prompt), so `git branch` answers "what was this run
+  for" at a glance. The worktree directory carries the slug too because
+  claude.ai's environment picker labels environments by their folder basename
+  (verified on CLI 2.1.210; `--name` reaches only the pre-created session) —
+  worktree launches appear there under the session name, same-dir launches
+  under the launch folder's name.
 - `branch` — in `same-dir` mode this switches the checkout first; git refuses
   if that would clobber local changes.
 - `permissionMode` — passed to `claude`: `default`, `acceptEdits`, `plan`,

@@ -31,6 +31,8 @@ const state = {
   current: null, // BrowseResult
   sessions: [],
   lost: [],
+  landed: [],
+  orbit: null, // null = never fetched; [] = fetched, empty (or fetch failed → chip hidden)
   tab: "browse",
   opts: { spawnMode: "same-dir", permissionMode: "default" },
 };
@@ -71,6 +73,30 @@ function toast(msg, isError = false) {
 }
 
 const esc = (s) => String(s).replace(/[&<>"']/g, (c) => ({ "&": "&amp;", "<": "&lt;", ">": "&gt;", '"': "&quot;", "'": "&#39;" })[c]);
+
+/* ---------- double-tap confirm ----------
+   first tap arms the button with warning copy; a second tap within 4s runs
+   fn; untouched, the arm dissolves back to the original label. Shared by
+   YOLO launches, worktree cleans, and orbit branch sweeps. */
+function armConfirm(btn, copy, fn) {
+  if (btn.dataset.confirm === "1") {
+    btn.dataset.confirm = "";
+    btn.classList.remove("warn");
+    if (btn._armLabel != null) btn.innerHTML = btn._armLabel;
+    fn();
+    return;
+  }
+  btn.dataset.confirm = "1";
+  btn._armLabel = btn.innerHTML;
+  btn.classList.add("warn");
+  btn.innerHTML = copy;
+  setTimeout(() => {
+    if (btn.dataset.confirm !== "1") return;
+    btn.dataset.confirm = "";
+    btn.classList.remove("warn");
+    btn.innerHTML = btn._armLabel;
+  }, 4000);
+}
 
 function fmtDur(ms) {
   const s = Math.max(0, Math.floor(ms / 1000));
@@ -423,24 +449,18 @@ function wireSegment(id, key, onChange) {
   });
 }
 
-async function launch() {
+function launch() {
   const btn = $("launchBtn");
   // YOLO in a non-git folder has no VCS undo — require a deliberate second tap
-  if (state.opts.permissionMode === "bypassPermissions" && !state.current.isGit && btn.dataset.confirm !== "1") {
-    btn.dataset.confirm = "1";
-    btn.classList.add("warn");
-    btn.innerHTML = `⚠ no git undo here — tap again`;
-    setTimeout(() => {
-      if (btn.dataset.confirm === "1") {
-        btn.dataset.confirm = "";
-        btn.classList.remove("warn");
-        btn.innerHTML = `<span class="cta-glyph">▶</span> Launch session`;
-      }
-    }, 4000);
+  if (state.opts.permissionMode === "bypassPermissions" && !state.current.isGit) {
+    armConfirm(btn, `⚠ no git undo here — tap again`, doLaunch);
     return;
   }
-  btn.dataset.confirm = "";
-  btn.classList.remove("warn");
+  doLaunch();
+}
+
+async function doLaunch() {
+  const btn = $("launchBtn");
   btn.disabled = true;
   btn.innerHTML = `<span class="cta-glyph">◴</span> Launching…`;
   try {
@@ -499,13 +519,14 @@ function reconcile(id, tries = 6) {
 
 async function refreshSessions() {
   try {
-    const { sessions, lost } = await api("/api/v1/sessions");
+    const { sessions, lost, landed } = await api("/api/v1/sessions");
     state.sessions = sessions.map((s) =>
       killing.has(s.id) && s.state !== "exited" && s.state !== "error"
         ? { ...s, state: "exited", pairingUrl: null }
         : s
     );
     state.lost = lost || [];
+    state.landed = landed || [];
     lastSyncAt = Date.now();
     renderSessions();
   } catch {
@@ -513,8 +534,113 @@ async function refreshSessions() {
   }
 }
 
-// CONTRACT: card.innerHTML is rewritten ONLY here, and only when state/pairingUrl
-// change. Everything time-varying updates via data-* lookups in updateDynamic().
+/* ---------- attention triage ---------- */
+// ready + output younger than this reads "working"; past it, whoever spoke
+// last in the transcript decides between "your move" and "quiet"
+const QUIET_MS = 30000;
+// transcript fan-out cap: one fetch per ready session per cycle, first N only
+const SNIPPET_POLL_CAP = 5;
+let snippetCapWarned = false;
+// id → {lastRole, lastAssistantText}, derived from the newest transcript
+const tails = new Map();
+
+// tool-call stubs ("→ ToolName" lines) are working signals, not turn-ends
+function isToolStub(text) {
+  const lines = String(text || "").split("\n").map((l) => l.trim()).filter(Boolean);
+  return lines.length > 0 && lines.every((l) => l.startsWith("→ "));
+}
+
+// who spoke last (and what claude last said) in the newest transcript,
+// skipping tool-stub-only messages — drives the status verb + card snippet
+function deriveTail(transcripts) {
+  const t = transcripts[transcripts.length - 1];
+  if (!t) return null;
+  const msgs = (t.messages || []).filter((m) => m.role !== "assistant" || !isToolStub(m.text));
+  const last = msgs[msgs.length - 1];
+  if (!last) return null;
+  const lastAssistant = [...msgs].reverse().find((m) => m.role === "assistant");
+  return { lastRole: last.role, lastAssistantText: lastAssistant?.text || "" };
+}
+
+// the card face's one-word answer to "does anything need me?"
+function verbFor(s, now = Date.now()) {
+  if (s.state === "starting") return "igniting";
+  if (s.state === "error") return "scrubbed";
+  if (s.state === "exited") return s.exitCode === 0 ? "landed" : "failed";
+  const outAge = s.lastOutputAt ? now - Date.parse(s.lastOutputAt) : Infinity;
+  if (outAge < QUIET_MS) return "working";
+  return tails.get(s.id)?.lastRole === "assistant" ? "your move" : "quiet";
+}
+
+// ordering group ranks: 0 your-move · 1 starting · 2 working · 3 quiet ·
+// 4 ended (exited/error/landed/lost); recency breaks ties within a group
+function attentionRank(verb) {
+  if (verb === "your move") return 0;
+  if (verb === "igniting") return 1;
+  if (verb === "working") return 2;
+  if (verb === "quiet") return 3;
+  return 4;
+}
+
+/* ---------- debrief face (ended sessions) ---------- */
+const BRANCH_STATE_LABEL = { merged: "merged", "in-orbit": "in orbit", "worktree-kept": "worktree kept" };
+
+function diffStatLine(d) {
+  const parts = [`${d.filesChanged} file${d.filesChanged === 1 ? "" : "s"}`, `+${d.insertions} −${d.deletions}`];
+  if (d.uncommitted) parts.push(`${d.uncommitted} uncommitted`);
+  return parts.join(" · ");
+}
+
+// prompt block (one-tap copy) + diff stat + branch-state chip; each piece
+// renders only when its data exists — no placeholders on same-dir runs
+function debriefHTML(id, prompt, debrief) {
+  const promptBlock = prompt
+    ? `<div class="debrief-prompt">
+        <div class="debrief-prompt-text">${esc(prompt)}</div>
+        <button class="log-tool" data-copy-prompt="${id}">copy</button>
+      </div>`
+    : "";
+  const statBlock = debrief
+    ? `<div class="debrief-stat">
+        <span class="debrief-diff">${diffStatLine(debrief)}</span>
+        <span class="orbit-state ${esc(debrief.branchState)}">${esc(BRANCH_STATE_LABEL[debrief.branchState] || debrief.branchState)}</span>
+      </div>`
+    : "";
+  return promptBlock + statBlock;
+}
+
+// contextual cleanup for a live exited/error card. Landed journal entries
+// never get the worktree route (no worktreePath survives the restart) —
+// Settings owns kept worktrees there.
+function cleanupBtnHTML(s) {
+  const bs = s.debrief?.branchState;
+  if (bs === "in-orbit") return `<button class="btn" data-orbit-clean="${s.id}">Clean branch</button>`;
+  if (bs === "worktree-kept" && s.worktreePath) return `<button class="btn" data-wt-clean="${s.id}">Clean worktree</button>`;
+  return "";
+}
+
+// wtBranch is gc/<id> or gc/<slug>-<id> — recover the owning session id
+function idMatchesBranch(id, branch) {
+  return branch === `gc/${id}` || branch.endsWith(`-${id}`);
+}
+
+// a swept branch makes the captured "in orbit" chip history — flip it in
+// place (journal data won't; the exit entry is immutable)
+function patchSweptDebrief(branch) {
+  $("sessionList").querySelectorAll("[data-id]").forEach((card) => {
+    if (!idMatchesBranch(card.dataset.id, branch)) return;
+    const chip = card.querySelector(".orbit-state.in-orbit");
+    if (chip) {
+      chip.className = "orbit-state merged";
+      chip.textContent = "merged";
+    }
+    card.querySelector("[data-orbit-clean]")?.remove();
+  });
+}
+
+// CONTRACT: card.innerHTML is rewritten ONLY here, keyed on the card "face"
+// (state/pairingUrl/exitCode/debrief — all step changes, never time-varying).
+// Everything time-varying updates via data-* lookups in updateDynamic().
 function renderShell(card, s) {
   const logWasOpen = openLogs.has(s.id);
   const convoWasOpen = openConvos.has(s.id);
@@ -523,10 +649,11 @@ function renderShell(card, s) {
   card.innerHTML = `
     <div class="session-head">
       <span class="session-name">${esc(s.name)}</span>
-      <span class="state-pill ${s.state}">${s.state}</span>
+      <span class="state-pill ${s.state}" data-verb>${esc(verbFor(s))}</span>
     </div>
     <div class="session-path">${esc(s.folder)}</div>
     <div class="session-ticker" data-ticker></div>
+    ${s.state === "ready" ? `<div class="session-snippet" data-snippet hidden></div>` : ""}
     <div class="session-meta">
       <span class="meta-chip">${s.spawnMode}</span>
       ${s.branch ? `<span class="meta-chip branch">⎇ ${esc(s.branch)}</span>` : ""}
@@ -565,12 +692,16 @@ function renderShell(card, s) {
         <div class="seq-stage done"><span class="seq-mark">✓</span><span class="seq-label">request accepted</span></div>
         <div class="seq-stage failed"><span class="seq-mark">✕</span><span class="seq-label">ignition failed — launch scrubbed</span></div>
       </div>
+      ${debriefHTML(s.id, s.initialPrompt, s.debrief)}
       <div class="session-actions">
         <button class="btn" data-relaunch="${s.id}">Relaunch</button>
+        ${cleanupBtnHTML(s)}
         <button class="btn" data-remove="${s.id}">Dismiss</button>
       </div>` : `
+      ${debriefHTML(s.id, s.initialPrompt, s.debrief)}
       <div class="session-actions">
         <button class="btn" data-relaunch="${s.id}">Relaunch</button>
+        ${cleanupBtnHTML(s)}
         <button class="btn" data-remove="${s.id}">Dismiss</button>
       </div>`}
     <details class="session-log session-convo"><summary>conversation</summary><div class="convo" data-convo="${s.id}">…</div></details>
@@ -610,11 +741,49 @@ function renderLostShell(card, l) {
     </div>`;
 }
 
+// journal-derived debrief for an ended session the manager no longer lists.
+// Static by nature (the journal never mutates) — rendered once, keyed on id.
+function renderLandedShell(card, l) {
+  const failed = l.exitCode !== 0; // null exit code (unknown) reads failed, not landed
+  card.innerHTML = `
+    <div class="session-head">
+      <span class="session-name">${esc(l.name)}</span>
+      <span class="state-pill ${failed ? "error" : "exited"}">${failed ? "failed" : "landed"}</span>
+    </div>
+    <div class="session-path">${esc(l.folder)}</div>
+    <div class="session-meta">
+      <span class="meta-chip">${esc(l.spawnMode)}</span>
+      ${l.branch ? `<span class="meta-chip branch">⎇ ${esc(l.branch)}</span>` : ""}
+      <span class="meta-chip">${esc(l.permissionMode)}</span>
+      <span class="meta-chip age">ran ${fmtDur(Date.parse(l.exitedAt) - Date.parse(l.startedAt))}</span>
+    </div>
+    ${debriefHTML(l.id, l.initialPrompt, l.debrief)}
+    <div class="session-actions">
+      <button class="btn" data-relaunch="${l.id}">Relaunch</button>
+      ${l.debrief?.branchState === "in-orbit" ? `<button class="btn" data-orbit-clean="${l.id}">Clean branch</button>` : ""}
+    </div>`;
+}
+
 function updateDynamic(card, s) {
   const now = Date.now();
   const started = Date.parse(s.startedAt);
   const ticker = card.querySelector("[data-ticker]");
   if (ticker && ticker.textContent !== (s.lastLine || "")) ticker.textContent = s.lastLine || "";
+
+  const pill = card.querySelector("[data-verb]");
+  if (pill) {
+    const v = verbFor(s, now);
+    if (pill.textContent !== v) pill.textContent = v;
+    pill.classList.toggle("your-move", v === "your move");
+  }
+
+  // last-assistant snippet (ready cards): textContent only — user-derived text
+  const snip = card.querySelector("[data-snippet]");
+  if (snip) {
+    const text = tails.get(s.id)?.lastAssistantText || "";
+    if (snip.textContent !== text) snip.textContent = text;
+    snip.hidden = !text; // empty until the first transcript fetch — no placeholder
+  }
 
   const age = card.querySelector("[data-age]");
   if (age) {
@@ -641,13 +810,34 @@ function updateDynamic(card, s) {
   if (provision) provision.textContent = `t+${fmtDur(now - started)}`;
 }
 
+// re-slot cards only when the relative order actually changed; a re-inserted
+// node restarts the card-in entrance animation, so moved nodes get it killed
+// and only genuinely new cards (card._new) animate
+function applyOrder(list, ids) {
+  const current = [...list.children].map((c) => c.dataset.id);
+  const changed = ids.length !== current.length || ids.some((id, i) => id !== current[i]);
+  if (changed) {
+    for (const id of ids) {
+      const card = list.querySelector(`[data-id="${id}"]`);
+      if (!card) continue;
+      if (!card._new) card.style.animation = "none";
+      list.appendChild(card);
+    }
+  }
+  for (const card of list.children) card._new = false;
+}
+
 function renderSessions() {
   const live = state.sessions.filter((s) => s.state === "starting" || s.state === "ready");
   const badge = $("sessionCount");
   badge.hidden = live.length === 0;
   badge.textContent = live.length;
 
-  $("sessionsEmpty").style.display = state.sessions.length || state.lost.length ? "none" : "";
+  // journal debriefs for ids the manager no longer lists (dismissed exits,
+  // restarts); the server already excludes live ids — the filter is belt+braces
+  const landed = (state.landed || []).filter((l) => !state.sessions.some((s) => s.id === l.id));
+
+  $("sessionsEmpty").style.display = state.sessions.length || state.lost.length || landed.length ? "none" : "";
   const list = $("sessionList");
 
   for (const s of state.sessions) {
@@ -656,15 +846,33 @@ function renderSessions() {
       card = document.createElement("li");
       card.className = "session-card";
       card.dataset.id = s.id;
+      card._new = true;
       list.prepend(card);
     }
-    const stateChanged = card.dataset.state !== s.state || card.dataset.url !== String(s.pairingUrl);
-    if (stateChanged) {
+    // exitCode/debrief join the key: a kill flips the card to exited
+    // optimistically, before the server payload carries either — without
+    // them the later real exit would never rewrite in the debrief face
+    const face = `${s.state}|${s.pairingUrl}|${s.exitCode ?? ""}|${s.debrief?.branchState ?? ""}`;
+    if (card.dataset.face !== face) {
+      card.dataset.face = face;
       card.dataset.state = s.state;
       card.dataset.url = String(s.pairingUrl);
       renderShell(card, s);
     }
     updateDynamic(card, s);
+  }
+
+  for (const l of landed) {
+    let card = list.querySelector(`[data-id="${l.id}"]`);
+    if (!card) {
+      card = document.createElement("li");
+      card.className = "session-card landed";
+      card.dataset.id = l.id;
+      card.dataset.state = "landed";
+      card._new = true;
+      list.appendChild(card);
+      renderLandedShell(card, l);
+    }
   }
 
   for (const l of state.lost) {
@@ -674,6 +882,7 @@ function renderSessions() {
       card.className = "session-card lost";
       card.dataset.id = l.id;
       card.dataset.state = "lost";
+      card._new = true;
       list.appendChild(card);
       renderLostShell(card, l);
     }
@@ -682,14 +891,25 @@ function renderSessions() {
   // drop cards for sessions that vanished
   list.querySelectorAll("[data-id]").forEach((card) => {
     const id = card.dataset.id;
-    if (!state.sessions.some((s) => s.id === id) && !state.lost.some((l) => l.id === id)) {
+    if (!state.sessions.some((s) => s.id === id) && !state.lost.some((l) => l.id === id) && !landed.some((l) => l.id === id)) {
       openLogs.delete(id);
       openConvos.delete(id);
       convoKeys.delete(id);
       openQrs.delete(id);
+      tails.delete(id);
       card.remove();
     }
   });
+
+  // attention-first ordering over the combined list
+  const now = Date.now();
+  const order = [
+    ...state.sessions.map((s) => ({ id: s.id, rank: attentionRank(verbFor(s, now)), at: Date.parse(s.exitedAt || s.startedAt) || 0 })),
+    ...landed.map((l) => ({ id: l.id, rank: 4, at: Date.parse(l.exitedAt) || 0 })),
+    ...state.lost.map((l) => ({ id: l.id, rank: 4, at: Date.parse(l.at) || 0 })),
+  ];
+  order.sort((a, b) => a.rank - b.rank || b.at - a.at);
+  applyOrder(list, order.map((o) => o.id));
 }
 
 /* ---------- log tail ---------- */
@@ -737,18 +957,30 @@ function renderConvo(box, transcripts) {
 async function refreshConvo(id) {
   try {
     const { transcripts } = await api(`/api/v1/sessions/${id}/transcript`);
-    const box = document.querySelector(`.convo[data-convo="${id}"]`); // fresh lookup — survives rewrites
-    if (!box || !openConvos.has(id)) return;
     const key = JSON.stringify(transcripts);
-    if (convoKeys.get(id) === key) return;
+    if (convoKeys.get(id) === key) return; // unchanged payload — skip all repaints
     convoKeys.set(id, key);
-    renderConvo(box, transcripts);
+    tails.set(id, deriveTail(transcripts));
+    const box = document.querySelector(`.convo[data-convo="${id}"]`); // fresh lookup — survives rewrites
+    if (box && openConvos.has(id)) renderConvo(box, transcripts);
+    renderSessions(); // new tail can flip quiet↔your-move: verb, snippet, and order
   } catch {
     /* transient failure: keep the last good view */
   }
 }
 
+// transcripts feed two consumers on the same 2.5s cadence: open conversation
+// views, and the card-face snippet/verb of every visible ready session
 async function tailConvos() {
+  const ids = new Set();
+  if (state.tab === "sessions" && !document.hidden) {
+    const ready = state.sessions.filter((s) => s.state === "ready");
+    for (const s of ready.slice(0, SNIPPET_POLL_CAP)) ids.add(s.id);
+    if (ready.length > SNIPPET_POLL_CAP && !snippetCapWarned) {
+      snippetCapWarned = true;
+      console.warn(`snippet polling capped at the first ${SNIPPET_POLL_CAP} ready sessions`);
+    }
+  }
   for (const id of [...openConvos]) {
     const s = state.sessions.find((x) => x.id === id);
     if (!s) {
@@ -756,8 +988,9 @@ async function tailConvos() {
       continue;
     }
     if (s.state !== "starting" && s.state !== "ready") continue; // frozen but stays open
-    await refreshConvo(id);
+    ids.add(id);
   }
+  for (const id of ids) await refreshConvo(id);
 }
 
 async function tailLogs() {
@@ -816,6 +1049,72 @@ document.addEventListener("click", async (e) => {
   const relaunch = e.target.closest?.("[data-relaunch]");
   const kill = e.target.closest?.("[data-kill]");
   const remove = e.target.closest?.("[data-remove]");
+  const copyPrompt = e.target.closest?.("[data-copy-prompt]");
+  const orbitClean = e.target.closest?.("[data-orbit-clean]");
+  const wtClean = e.target.closest?.("[data-wt-clean]");
+
+  if (copyPrompt) {
+    const id = copyPrompt.dataset.copyPrompt;
+    const cfg = state.sessions.find((x) => x.id === id) || state.landed.find((l) => l.id === id);
+    if (!cfg?.initialPrompt) return;
+    try {
+      await navigator.clipboard.writeText(cfg.initialPrompt);
+      toast("Prompt copied");
+    } catch {
+      toast("Copy failed", true);
+    }
+    return;
+  }
+
+  if (orbitClean) {
+    const id = orbitClean.dataset.orbitClean;
+    // double-tap: the sweep is always a safe delete, and an unmerged branch
+    // will 409 — arming makes that round-trip a deliberate act
+    armConfirm(orbitClean, "Sweep branch?", async () => {
+      const cfg = state.sessions.find((x) => x.id === id) || state.landed.find((l) => l.id === id);
+      if (!cfg) return;
+      try {
+        if (!state.orbit) await loadOrbit(); // debrief cards can precede any orbit fetch
+        const entry = (state.orbit || []).find(
+          (o) => idMatchesBranch(id, o.branch) && (cfg.folder === o.repo || cfg.folder.startsWith(o.repo + "/"))
+        );
+        if (!entry) {
+          toast("branch not in orbit — already swept?", true);
+          loadOrbit();
+          return;
+        }
+        await api(`/api/v1/orbit?repo=${encodeURIComponent(entry.repo)}&branch=${encodeURIComponent(entry.branch)}`, { method: "DELETE" });
+        toast("Branch swept");
+        state.orbit = state.orbit.filter((o) => o !== entry);
+        renderOrbit();
+        patchSweptDebrief(entry.branch);
+        loadOrbit(); // re-sync with the server's view
+        refreshSessions();
+      } catch (err) {
+        toast(err.message, true); // 409 branch_not_merged / branch_held speak here
+      }
+    });
+    return;
+  }
+
+  if (wtClean) {
+    const id = wtClean.dataset.wtClean;
+    // kept worktrees are kept because they're dirty — discarding takes two taps
+    armConfirm(wtClean, "Discard changes?", async () => {
+      const s = state.sessions.find((x) => x.id === id);
+      if (!s?.worktreePath) return;
+      try {
+        await api(`/api/v1/worktrees?path=${encodeURIComponent(s.worktreePath)}`, { method: "DELETE" });
+        toast("Worktree cleaned");
+        wtClean.remove(); // the captured debrief won't change; the action is spent
+        loadOrbit();
+        refreshSessions();
+      } catch (err) {
+        toast(err.message, true);
+      }
+    });
+    return;
+  }
 
   if (copyBtn || shareBtn) {
     e.preventDefault(); // don't toggle the details
@@ -844,7 +1143,7 @@ document.addEventListener("click", async (e) => {
 
   if (relaunch) {
     const id = relaunch.dataset.relaunch;
-    const cfg = state.sessions.find((x) => x.id === id) || state.lost.find((l) => l.id === id);
+    const cfg = state.sessions.find((x) => x.id === id) || state.lost.find((l) => l.id === id) || state.landed.find((l) => l.id === id);
     if (!cfg) return;
     try {
       await api("/api/v1/sessions", {
@@ -893,6 +1192,78 @@ document.addEventListener("click", async (e) => {
   }
 });
 
+/* ---------- in-orbit chip (leftover gc/* branches) ---------- */
+// fetched on sessions-tab activation only, never on the poll; a fetch error
+// hides the chip entirely — same face as zero branches
+let orbitOpen = false;
+
+async function loadOrbit() {
+  try {
+    const { orbit } = await api("/api/v1/orbit");
+    state.orbit = orbit || [];
+  } catch {
+    state.orbit = [];
+  }
+  renderOrbit();
+}
+
+function renderOrbit() {
+  const wrap = $("orbit");
+  const list = $("orbitList");
+  const n = state.orbit?.length || 0;
+  wrap.hidden = n === 0;
+  if (!n) {
+    orbitOpen = false;
+    list.hidden = true;
+    return;
+  }
+  $("orbitChip").textContent = `${n} in orbit`;
+  $("orbitChip").setAttribute("aria-expanded", String(orbitOpen));
+  list.hidden = !orbitOpen;
+  list.innerHTML = "";
+  for (const o of state.orbit) {
+    const row = document.createElement("div");
+    row.className = "orbit-row";
+    const age = o.lastCommitAt ? `${fmtDur(Date.now() - Date.parse(o.lastCommitAt))} ago` : "";
+    row.innerHTML = `
+      <div class="orbit-info">
+        <span class="orbit-branch">⎇ ${esc(o.branch)}</span>
+        <span class="orbit-meta">${esc(o.repo.split("/").pop())}
+          · <span class="orbit-badge ${o.merged ? "merged" : "unmerged"}">${o.merged ? "merged" : "unmerged"}</span>
+          ${o.heldBy ? `· <span class="orbit-badge held">held by worktree</span>` : ""}
+          ${age ? `· ${age}` : ""}</span>
+      </div>
+      ${o.heldBy ? "" : `<button class="wt-clean-btn orbit-del">Sweep</button>`}`;
+    const btn = row.querySelector(".orbit-del");
+    if (btn) {
+      btn.onclick = () => {
+        const del = async () => {
+          try {
+            await api(`/api/v1/orbit?repo=${encodeURIComponent(o.repo)}&branch=${encodeURIComponent(o.branch)}`, { method: "DELETE" });
+            toast("Branch swept");
+            // optimistic: drop the row, decrement the count, hide at zero
+            state.orbit = state.orbit.filter((x) => x !== o);
+            renderOrbit();
+            patchSweptDebrief(o.branch);
+            loadOrbit();
+            refreshSessions();
+          } catch (err) {
+            toast(err.message, true); // 409/400 — the row stays
+          }
+        };
+        if (o.merged) del();
+        else armConfirm(btn, "Delete unmerged?", del);
+      };
+    }
+    list.appendChild(row);
+  }
+}
+
+$("orbitChip").onclick = () => {
+  orbitOpen = !orbitOpen;
+  renderOrbit();
+};
+
 /* ---------- tabs, health, boot ---------- */
 function switchTab(tab) {
   state.tab = tab;
@@ -901,7 +1272,11 @@ function switchTab(tab) {
   $("view-sessions").hidden = tab !== "sessions";
   $("view-settings").hidden = tab !== "settings";
   syncFab();
-  if (tab === "sessions") refreshSessions();
+  if (tab === "sessions") {
+    refreshSessions();
+    loadOrbit();
+    tailConvos(); // warm the verbs/snippets right away, not a poll-cycle later
+  }
   if (tab === "settings") openSettings();
 }
 
@@ -1027,21 +1402,18 @@ async function renderWorktrees() {
           <span class="wt-meta">${wt.branch ? `⎇ ${esc(wt.branch)} · ` : ""}${wt.dirty ? `<span class="wt-dirty">dirty</span> · ` : ""}${esc(wt.id)}</span>
         </div>
         <button class="wt-clean-btn">Clean</button>`;
-      row.querySelector(".wt-clean-btn").onclick = async (e) => {
-        const b = e.target;
-        if (b.dataset.confirm !== "1" && wt.dirty) {
-          b.dataset.confirm = "1";
-          b.textContent = "Discard changes?";
-          setTimeout(() => { b.dataset.confirm = ""; b.textContent = "Clean"; }, 4000);
-          return;
-        }
-        try {
-          await api(`/api/v1/worktrees?path=${encodeURIComponent(wt.path)}`, { method: "DELETE" });
-          toast("Worktree cleaned");
-          renderWorktrees();
-        } catch (err) {
-          toast(err.message, true);
-        }
+      row.querySelector(".wt-clean-btn").onclick = (e) => {
+        const clean = async () => {
+          try {
+            await api(`/api/v1/worktrees?path=${encodeURIComponent(wt.path)}`, { method: "DELETE" });
+            toast("Worktree cleaned");
+            renderWorktrees();
+          } catch (err) {
+            toast(err.message, true);
+          }
+        };
+        if (wt.dirty) armConfirm(e.target, "Discard changes?", clean);
+        else clean();
       };
       box.appendChild(row);
     }

@@ -19,7 +19,7 @@ import (
 )
 
 // release builds override this via -ldflags "-X main.version=..."
-var version = "0.4.0"
+var version = "0.5.0"
 
 //go:embed all:public
 var publicEmbed embed.FS
@@ -43,7 +43,16 @@ func main() {
 	a.configureBrowser(cfg.Roots, cfg.ShowHidden)
 	a.configureWebhooks(cfg.Webhooks)
 	a.configureJobs(cfg.Jobs)
-	a.sweepOrphanWorktrees()
+	// The sweep treats every on-disk worktree as a dead runner's leftover — true
+	// only for the sole holder of the runner lock. A second instance (a dev copy
+	// run from a checkout shares ~/.groundcontrol/worktrees) must not sweep the
+	// first one's live worktrees out from under its sessions.
+	if a.acquireRunnerLock() {
+		a.sweepOrphanWorktrees()
+	} else {
+		log.Printf("another groundcontrol instance is running — skipping the orphan-worktree sweep")
+		a.journal(map[string]any{"event": "worktree.sweep-skipped", "reason": "another runner holds the lock"})
+	}
 
 	mux := http.NewServeMux()
 

@@ -286,7 +286,7 @@ func (a *app) startJob(j *liveJob) {
 	root := ""
 	if j.SpawnMode == spawnWorktree {
 		root = gitRoot(j.Folder)
-		w, err := a.addWorktree(root, *j.Branch, j.ID)
+		w, err := a.addWorktree(root, *j.Branch, j.ID, j.Prompt)
 		if err != nil {
 			msg := err.Error()
 			a.finishJob(j, jobOutcome{state: jobStateFailed, result: &msg})

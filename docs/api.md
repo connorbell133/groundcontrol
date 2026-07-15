@@ -106,6 +106,7 @@ change; renaming one is breaking.
 | `GET /sessions/:id` | one session |
 | `GET /sessions/:id/qr` | pairing QR as SVG (409 `not_ready` until the pairing URL is scraped) |
 | `GET /sessions/:id/log` | plain-text runtime log tail (last ~400 chunks, ANSI stripped) |
+| `GET /sessions/:id/transcript` | the actual conversations — user prompts and assistant replies, parsed from the JSONL transcripts Claude Code writes for the session's launch directory |
 | `DELETE /sessions/:id` | kill (SIGTERM to the PTY; worktree cleaned on exit) |
 | `DELETE /sessions/:id/record` | dismiss an exited/error/lost session card |
 | `GET /journal/recent?limit=` | recent distinct launch configs (max 20), with staleness flag |
@@ -128,9 +129,10 @@ change; renaming one is breaking.
 - `folder` (required) — must be inside a configured root.
 - `name` — must not collide with a live session; omit to auto-generate.
 - `spawnMode` — `same-dir` (default) or `worktree`. Worktree mode requires
-  `branch`, cuts a private `gc/<id>` branch off it under
+  `branch`, cuts a private `gc/<name-slug>-<id>` branch off it under
   `~/.groundcontrol/worktrees/`, and cleans up on exit (dirty worktrees are
-  kept, never force-deleted).
+  kept, never force-deleted). The slug comes from the session name (jobs: the
+  prompt), so `git branch` answers "what was this run for" at a glance.
 - `branch` — in `same-dir` mode this switches the checkout first; git refuses
   if that would clobber local changes.
 - `permissionMode` — passed to `claude`: `default`, `acceptEdits`, `plan`, or

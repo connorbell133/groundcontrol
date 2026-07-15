@@ -1,5 +1,5 @@
 /* groundcontrol mobile UI */
-const CLIENT_VERSION = "0.4.0"; // keep in step with package.json — healthz mismatch triggers a reload
+const CLIENT_VERSION = "0.5.0"; // keep in step with main.go's version — healthz mismatch triggers a reload
 const $ = (id) => document.getElementById(id);
 // tokens travel by copy-paste, which loves to smuggle in zero-width and other
 // non-ASCII characters — those make `Bearer <token>` an invalid header value
@@ -338,6 +338,8 @@ async function launch() {
 const killing = new Set();
 // Ids whose runtime-log <details> is currently open — preserved across innerHTML rewrites.
 const openLogs = new Set();
+// Same trick for the conversation <details>.
+const openConvos = new Set();
 // Ids whose pairing-QR <details> is expanded — same trick, so a tap survives re-renders.
 const openQrs = new Set();
 let lastSyncAt = Date.now();
@@ -377,6 +379,7 @@ async function refreshSessions() {
 // change. Everything time-varying updates via data-* lookups in updateDynamic().
 function renderShell(card, s) {
   const logWasOpen = openLogs.has(s.id);
+  const convoWasOpen = openConvos.has(s.id);
   const qrWasOpen = openQrs.has(s.id);
   const shareBtn = navigator.share ? `<button class="log-tool" data-share-log="${s.id}">share</button>` : "";
   card.innerHTML = `
@@ -421,12 +424,17 @@ function renderShell(card, s) {
         <button class="btn" data-relaunch="${s.id}">Relaunch</button>
         <button class="btn" data-remove="${s.id}">Dismiss</button>
       </div>`}
+    <details class="session-log session-convo"><summary>conversation</summary><div class="convo" data-convo="${s.id}">…</div></details>
     <details class="session-log"><summary>runtime log
       <span class="log-tools"><button class="log-tool" data-copy-log="${s.id}">copy</button>${shareBtn}</span>
     </summary><pre data-log="${s.id}">…</pre></details>`;
   if (logWasOpen) {
-    const details = card.querySelector(".session-log");
+    const details = card.querySelector(".session-log:not(.session-convo)");
     if (details) details.open = true; // fires the toggle listener, which refills the log
+  }
+  if (convoWasOpen) {
+    const details = card.querySelector(".session-convo");
+    if (details) details.open = true;
   }
   if (qrWasOpen) {
     const qr = card.querySelector(".qr-details");
@@ -526,6 +534,8 @@ function renderSessions() {
     const id = card.dataset.id;
     if (!state.sessions.some((s) => s.id === id) && !state.lost.some((l) => l.id === id)) {
       openLogs.delete(id);
+      openConvos.delete(id);
+      convoKeys.delete(id);
       openQrs.delete(id);
       card.remove();
     }
@@ -539,6 +549,65 @@ function fillLog(pre, text) {
   const atBottom = pre.scrollTop + pre.clientHeight >= pre.scrollHeight - 4;
   pre.textContent = text;
   if (atBottom || wasPlaceholder) pre.scrollTop = pre.scrollHeight;
+}
+
+/* ---------- conversation view ---------- */
+// last rendered payload per session — a re-render only happens when the
+// transcript actually changed, so scroll position survives idle polls
+const convoKeys = new Map();
+
+function renderConvo(box, transcripts) {
+  const atBottom = box.scrollTop + box.clientHeight >= box.scrollHeight - 4;
+  const wasPlaceholder = box.textContent === "…";
+  box.innerHTML = "";
+  if (!transcripts.length) {
+    const empty = document.createElement("div");
+    empty.className = "convo-empty";
+    empty.textContent = "no conversation yet — send a prompt from the Claude app";
+    box.appendChild(empty);
+    return;
+  }
+  transcripts.forEach((t, i) => {
+    if (transcripts.length > 1) {
+      const div = document.createElement("div");
+      div.className = "convo-divider";
+      div.textContent = `conversation ${i + 1}`;
+      box.appendChild(div);
+    }
+    for (const m of t.messages) {
+      const el = document.createElement("div");
+      el.className = `convo-msg ${m.role === "user" ? "user" : "assistant"}`;
+      el.textContent = m.text;
+      box.appendChild(el);
+    }
+  });
+  if (atBottom || wasPlaceholder) box.scrollTop = box.scrollHeight;
+}
+
+async function refreshConvo(id) {
+  try {
+    const { transcripts } = await api(`/api/v1/sessions/${id}/transcript`);
+    const box = document.querySelector(`.convo[data-convo="${id}"]`); // fresh lookup — survives rewrites
+    if (!box || !openConvos.has(id)) return;
+    const key = JSON.stringify(transcripts);
+    if (convoKeys.get(id) === key) return;
+    convoKeys.set(id, key);
+    renderConvo(box, transcripts);
+  } catch {
+    /* transient failure: keep the last good view */
+  }
+}
+
+async function tailConvos() {
+  for (const id of [...openConvos]) {
+    const s = state.sessions.find((x) => x.id === id);
+    if (!s) {
+      openConvos.delete(id);
+      continue;
+    }
+    if (s.state !== "starting" && s.state !== "ready") continue; // frozen but stays open
+    await refreshConvo(id);
+  }
 }
 
 async function tailLogs() {
@@ -564,6 +633,18 @@ document.addEventListener("toggle", async (e) => {
   if (qrId) {
     if (e.target.open) openQrs.add(qrId);
     else openQrs.delete(qrId);
+    return;
+  }
+  const convoBox = e.target.querySelector?.(".convo[data-convo]");
+  if (convoBox) {
+    const id = convoBox.dataset.convo;
+    if (e.target.open) {
+      openConvos.add(id);
+      convoKeys.delete(id); // force a repaint even if the payload is unchanged
+      refreshConvo(id);
+    } else {
+      openConvos.delete(id);
+    }
     return;
   }
   const pre = e.target.querySelector?.("pre[data-log]");
@@ -935,6 +1016,7 @@ setInterval(health, 10000);
 setInterval(() => {
   if (state.tab === "sessions" || state.sessions.some((s) => s.state === "starting")) refreshSessions();
   tailLogs();
+  tailConvos();
 }, 2500);
 setInterval(secondTick, 1000);
 refreshSessions();

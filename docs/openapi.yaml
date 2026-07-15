@@ -1,7 +1,7 @@
 openapi: 3.1.0
 info:
   title: groundcontrol API
-  version: 0.4.0
+  version: 0.6.0
   description: |
     Launch and supervise Claude Code sessions from HTTP. Every action in the
     PWA is a route here; see docs/api.md for the human guide and cookbook.
@@ -85,12 +85,14 @@ components:
                 - not_ready
                 - ready_timeout
                 - launch_failed
+                - folder_in_use
                 - session_live
                 - job_live
                 - worktree_error
                 - branch_held
                 - branch_not_merged
                 - not_implemented
+                - payload_too_large
             message:
               type: string
 
@@ -125,10 +127,12 @@ components:
         settingsSkipReason:
           type: string
           description: >
-            Why a requested preset-settings injection didn't happen —
-            "preset no longer exists", "settings file already exists", or
-            "in use by another session". Present only when injection was
-            requested but skipped; absent means injected or never
+            Why a requested preset-settings injection didn't happen — one of
+            "preset no longer exists", "settings file already exists",
+            "in use by another session", "preset settings are not a JSON
+            object", "preset settings exceed 64 KB", "preset settings carry a
+            non-inert key", or "settings write failed". Present only when
+            injection was requested but skipped; absent means injected or never
             requested (the wire never claims success, only explains
             absence).
         capacityUsed:
@@ -362,13 +366,17 @@ components:
           type: string
           description: >
             Optional settings-file content as a string. At most 64 KB and
-            must parse as a JSON object; a top-level "hooks" key is rejected
-            (hooks run shell commands and are a separately gated feature).
-            An "env" key is allowed. Injected at launch as <launch
+            must parse as a JSON object. Only inert top-level keys are allowed
+            (an allowlist of display/model/UX toggles such as model, theme,
+            verbose); any key that can run commands, move credentials, or
+            change permissions — hooks, apiKeyHelper, statusLine, env,
+            permissions, sandbox, and the like — is rejected (invalid_config
+            at write time, or a "preset settings carry a non-inert key" skip
+            at launch). Injected at launch as <launch
             cwd>/.claude/settings.local.json (marker-scoped: a
-            "_groundcontrol" key brands the file, an existing unmarked file
-            refuses injection, and removal waits for the last same-folder
-            exit).
+            "_groundcontrol" key brands the file with the owning launch, an
+            existing unmarked file refuses injection, and removal waits for the
+            last same-folder exit).
 
     Job:
       type: object
@@ -708,7 +716,7 @@ paths:
             application/json:
               schema: { $ref: "#/components/schemas/Error" }
         "409":
-          description: "branch_held: checked out by a live session or a kept worktree — or branch_not_merged: git's safe delete found unmerged commits; merge the work first."
+          description: "branch_held: checked out by a live session or a kept worktree — or branch_not_merged: git's safe delete found unmerged commits; merge the work first. A transient git failure (timeout, index lock) is a 500 worktree_error, not this."
           content:
             application/json:
               schema: { $ref: "#/components/schemas/Error" }
@@ -763,7 +771,7 @@ paths:
         "401": { $ref: "#/components/responses/Unauthorized" }
         "403": { $ref: "#/components/responses/Forbidden" }
         "409":
-          description: "launch_failed: duplicate live name, unknown branch, dirty checkout, worktree failure — or, with ?wait=ready, the process died before pairing."
+          description: "launch_failed: duplicate live name, unknown branch, dirty checkout, worktree failure — or, with ?wait=ready, the process died before pairing. folder_in_use: a same-dir launch into a folder that already has a live environment (one live environment per folder; use worktree mode for a second)."
           content:
             application/json:
               schema: { $ref: "#/components/schemas/Error" }

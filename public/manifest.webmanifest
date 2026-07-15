@@ -16,8 +16,8 @@
   ],
   "shortcuts": [
     {
-      "name": "New mission",
-      "short_name": "Mission",
+      "name": "Search repos",
+      "short_name": "Search",
       "url": "/?mission=1",
       "icons": [{ "src": "/icons/icon-192.png", "sizes": "192x192", "type": "image/png" }]
     },

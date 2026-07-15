@@ -225,24 +225,17 @@ async function relaunchFromRecent(cfg) {
   }
 }
 
-/* ---------- mission input (thought-first browse) ---------- */
-// the currently rendered suggestions — Enter activates when exactly one is visible
+/* ---------- repo search (browse) ---------- */
+// the currently rendered matches — Enter activates when exactly one is visible
 let missionMatches = [];
 let missionTimer;
 
-// mission text → session name: lowercase, non-alphanumerics collapse to single
-// dashes, trimmed, capped at 40 chars (re-trimmed so the cap can't leave a dash)
-function slugMission(text) {
-  return String(text)
-    .toLowerCase()
-    .replace(/[^a-z0-9]+/g, "-")
-    .replace(/^-+|-+$/g, "")
-    .slice(0, 40)
-    .replace(/-+$/, "");
-}
+// shared/deep-linked text with no destination yet — rides into the next
+// launch sheet's prompt field, consumed once
+let pendingPrompt = null;
 
 // every typed token must land somewhere in folder basename, mission name, or
-// branch; newest-first journal order wins ties, one suggestion per folder
+// branch; newest-first journal order wins ties, one result per folder
 function missionSuggestions(query) {
   const tokens = query.toLowerCase().split(/\s+/).filter(Boolean);
   if (!tokens.length) return [];
@@ -287,25 +280,13 @@ function renderMissionChips() {
   $("missionInput").setAttribute("aria-expanded", String(open));
 }
 
-// like relaunchFromRecent, plus the typed thought riding in as prompt + name
+// a search hit is just a recent launch — reuse its relaunch path; the thought
+// belongs in the sheet's prompt field, not the search box
 async function launchFromMission(r) {
-  const text = $("missionInput").value.trim();
-  try {
-    await loadFolder(r.folder);
-    const mission = { prompt: text, name: slugMission(text) || undefined };
-    if (r.stale) {
-      toast(`branch ${r.branch} no longer exists — defaulting to in-folder`, true);
-      openSheet({ spawnMode: "same-dir", permissionMode: r.permissionMode, ...mission });
-    } else {
-      openSheet({ spawnMode: r.spawnMode, permissionMode: r.permissionMode, branch: r.branch ?? undefined, ...mission });
-    }
-    // leave a clean slate for the next visit to roots
-    $("missionInput").value = "";
-    missionMatches = [];
-    renderMissionChips();
-  } catch (e) {
-    toast(e.message, true);
-  }
+  $("missionInput").value = "";
+  missionMatches = [];
+  renderMissionChips();
+  await relaunchFromRecent(r);
 }
 
 $("missionInput").addEventListener("input", () => {
@@ -417,7 +398,10 @@ function openSheet(prefill) {
   if (git) loadBranches(folder);
 
   $("optName").value = prefill?.name || "";
-  $("optPrompt").value = prefill?.prompt || "";
+  // a share/deep-link stashed a prompt with no destination — it lands here once,
+  // and being the fresher intent it outranks a recent's stored prompt
+  $("optPrompt").value = pendingPrompt || prefill?.prompt || "";
+  pendingPrompt = null;
   $("sheet").hidden = false;
   $("scrim").hidden = false;
   requestAnimationFrame(() => {
@@ -1544,13 +1528,12 @@ const PARAM_TEXT_MAX = 4096;
 async function missionEntry(text) {
   switchTab("browse");
   if (state.path !== null) await loadFolder(null);
-  const input = document.getElementById("missionInput");
-  if (!input) {
-    if (text) toast("no destination — pick a folder");
-    return;
+  if (text) {
+    // shared text is a prompt, not a repo query — hold it for the next launch sheet
+    pendingPrompt = text;
+    toast("note saved — pick a repo and it rides along as the prompt");
   }
-  if (text) input.value = text;
-  input.focus();
+  document.getElementById("missionInput")?.focus();
 }
 
 async function consumeLaunchParams() {

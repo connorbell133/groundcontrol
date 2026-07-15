@@ -1,6 +1,7 @@
 package api
 
 import (
+	"context"
 	"encoding/json"
 	"encoding/xml"
 	"fmt"
@@ -1010,4 +1011,174 @@ func TestNotFoundAndParamErrors(t *testing.T) {
 	if rec.Code != 400 || errCode(t, rec) != "invalid_path" {
 		t.Errorf("browse outside roots = %d %s, want 400 invalid_path", rec.Code, rec.Body.String())
 	}
+}
+
+/* ---------- Claude state enrichment on the wire ---------- */
+
+// enrichmentKeys are the registry-sourced session fields; all four must be
+// absent (not null, not empty) when nothing was captured.
+var enrichmentKeys = []string{`"claudeSessionId"`, `"activity"`, `"extraSessions"`, `"prLink"`}
+
+func TestSessionEnrichmentWireShape(t *testing.T) {
+	t.Parallel()
+	uuid := "6f0a2c1e-aaaa-bbbb-cccc-1234567890ab"
+	activity := "busy"
+	s := sessions.Session{
+		ID:              "abc12345",
+		Name:            "n",
+		Folder:          "/f",
+		ClaudeSessionID: &uuid,
+		Activity:        &activity,
+		ExtraSessions: []sessions.ExtraSession{
+			{Name: "gc-x-1", Status: "idle"},
+			{Name: "manual"}, // unknown status serializes to no status key
+		},
+		PRLink: &sessions.PRLink{Number: 9, URL: "https://github.com/o/r/pull/9"},
+	}
+	data, err := json.Marshal(s)
+	if err != nil {
+		t.Fatal(err)
+	}
+	body := string(data)
+	for _, want := range []string{
+		`"claudeSessionId":"` + uuid + `"`,
+		`"activity":"busy"`,
+		`"extraSessions":[{"name":"gc-x-1","status":"idle"},{"name":"manual"}]`,
+		`"prLink":{"number":9,"url":"https://github.com/o/r/pull/9"}`,
+	} {
+		if !strings.Contains(body, want) {
+			t.Errorf("session JSON missing %s: %s", want, body)
+		}
+	}
+
+	// an unenriched session omits all four keys entirely
+	empty, err := json.Marshal(sessions.Session{ID: "abc12345"})
+	if err != nil {
+		t.Fatal(err)
+	}
+	for _, key := range enrichmentKeys {
+		if strings.Contains(string(empty), key) {
+			t.Errorf("unenriched session must omit %s: %s", key, empty)
+		}
+	}
+}
+
+func TestSessionsPayloadOmitsEnrichmentWhenAbsent(t *testing.T) {
+	testutil.FakeClaude(t)
+	root := testutil.ResolvedTempDir(t)
+	env := newTestEnv(t, config.Config{Roots: []string{root}})
+
+	created := createSession(t, env, fmt.Sprintf(`{"folder":%q}`, root))
+	for _, target := range []string{"/sessions", "/sessions/" + created.ID} {
+		rec := doReq(t, env.handler, "GET", target, "", nil)
+		if rec.Code != 200 {
+			t.Fatalf("GET %s = %d: %s", target, rec.Code, rec.Body.String())
+		}
+		for _, key := range enrichmentKeys {
+			if strings.Contains(rec.Body.String(), key) {
+				t.Errorf("GET %s leaked %s for an unenriched session: %s", target, key, rec.Body.String())
+			}
+		}
+	}
+}
+
+func TestLostAndLandedClaudeSessionID(t *testing.T) {
+	t.Parallel()
+	root := testutil.ResolvedTempDir(t)
+	env := newTestEnv(t, config.Config{Roots: []string{root}})
+
+	// a lost session's UUID lives on its standalone session.claude-id entry
+	env.journal.Append(map[string]any{"event": "session.start", "id": "lost1", "name": "l1", "folder": root})
+	env.journal.Append(map[string]any{"event": "session.claude-id", "id": "lost1", "claudeSessionId": "uuid-lost"})
+	env.journal.Append(map[string]any{"event": "session.start", "id": "lost2", "name": "l2", "folder": root})
+	// a landed session's UUID rides the flattened session.exit entry
+	env.journal.Append(map[string]any{"event": "session.start", "id": "done1", "name": "d1", "folder": root})
+	env.journal.Append(map[string]any{"event": "session.exit", "id": "done1", "code": 0, "claudeSessionId": "uuid-done"})
+	env.journal.Append(map[string]any{"event": "session.start", "id": "done2", "name": "d2", "folder": root})
+	env.journal.Append(map[string]any{"event": "session.exit", "id": "done2", "code": 0})
+
+	rec := doReq(t, env.handler, "GET", "/sessions", "", nil)
+	if rec.Code != 200 {
+		t.Fatalf("GET /sessions = %d: %s", rec.Code, rec.Body.String())
+	}
+	var list struct {
+		Lost   []sessions.LostSession   `json:"lost"`
+		Landed []sessions.LandedSession `json:"landed"`
+	}
+	if err := json.Unmarshal(rec.Body.Bytes(), &list); err != nil {
+		t.Fatal(err)
+	}
+
+	lost := map[string]sessions.LostSession{}
+	for _, l := range list.Lost {
+		lost[l.ID] = l
+	}
+	if got := lost["lost1"].ClaudeSessionID; got == nil || *got != "uuid-lost" {
+		t.Errorf("lost1 claudeSessionId = %v, want uuid-lost", got)
+	}
+	if got := lost["lost2"].ClaudeSessionID; got != nil {
+		t.Errorf("lost2 claudeSessionId = %q, want absent", *got)
+	}
+
+	landed := map[string]sessions.LandedSession{}
+	for _, l := range list.Landed {
+		landed[l.ID] = l
+	}
+	if got := landed["done1"].ClaudeSessionID; got == nil || *got != "uuid-done" {
+		t.Errorf("done1 claudeSessionId = %v, want uuid-done", got)
+	}
+	if got := landed["done2"].ClaudeSessionID; got != nil {
+		t.Errorf("done2 claudeSessionId = %q, want absent", *got)
+	}
+
+	// absent means absent on the wire, not null
+	body := rec.Body.String()
+	if strings.Count(body, `"claudeSessionId"`) != 2 {
+		t.Errorf("expected exactly two claudeSessionId keys (lost1, done1): %s", body)
+	}
+}
+
+func TestSessionsExtrasOverHTTP(t *testing.T) {
+	root := testutil.ResolvedTempDir(t)
+	// one same-folder registry row that no launch owns: it must surface as an
+	// extra on the launched session's card. startedAt predates any launch, so
+	// even the ps-less fallback can never mistake it for the primary.
+	agents := fmt.Sprintf(`[{"pid":999999,"cwd":%q,"sessionId":"conv-extra","name":"folder-mate","status":"busy","startedAt":1}]`, root)
+	testutil.FakeClaudeWith(t, testutil.FakeClaudeConfig{AgentsJSON: agents})
+	env := newTestEnv(t, config.Config{Roots: []string{root}})
+	ctx, cancel := context.WithCancel(context.Background())
+	t.Cleanup(cancel)
+	env.sessions.StartRegistryLoop(ctx)
+
+	created := createSession(t, env, fmt.Sprintf(`{"folder":%q}`, root))
+
+	deadline := time.Now().Add(15 * time.Second)
+	for time.Now().Before(deadline) {
+		rec := doReq(t, env.handler, "GET", "/sessions", "", nil)
+		if rec.Code != 200 {
+			t.Fatalf("GET /sessions = %d: %s", rec.Code, rec.Body.String())
+		}
+		var list struct {
+			Sessions []sessions.Session `json:"sessions"`
+		}
+		if err := json.Unmarshal(rec.Body.Bytes(), &list); err != nil {
+			t.Fatal(err)
+		}
+		for _, s := range list.Sessions {
+			if s.ID != created.ID {
+				continue
+			}
+			for _, e := range s.ExtraSessions {
+				if e.Name == "folder-mate" && e.Status == "busy" {
+					// the unowned row must never join as the primary
+					if s.ClaudeSessionID != nil {
+						t.Errorf("folder-mate row must not be captured as the session's own uuid: %v", *s.ClaudeSessionID)
+					}
+					return
+				}
+			}
+		}
+		time.Sleep(100 * time.Millisecond)
+	}
+	t.Fatal("folder-mate extra never appeared on GET /sessions")
 }

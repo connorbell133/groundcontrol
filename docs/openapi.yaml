@@ -116,7 +116,57 @@ components:
         exitCode: { type: [integer, "null"] }
         lastOutputAt: { type: [string, "null"], format: date-time }
         lastLine: { type: [string, "null"], description: "Last meaningful log line, ≤120 chars." }
+        claudeSessionId:
+          type: string
+          description: >
+            Claude Code's conversation UUID for the launch's primary session
+            (the id claude --resume wants), captured from the CLI's agents
+            registry. First capture wins; absent until captured. Journaled,
+            so lost and landed objects also carry it after a runner restart.
+        activity:
+          type: string
+          enum: [busy, idle]
+          description: >
+            Registry-sourced live activity. Absent when the registry hasn't
+            confirmed it recently, reports an unknown value, or the session
+            exited — never a stale value. Never journaled, never fanned out.
+        extraSessions:
+          type: array
+          items: { $ref: "#/components/schemas/ExtraSession" }
+          description: >
+            Other live Claude sessions running in the launch's directory
+            (phone-spawned siblings and unrelated same-folder sessions
+            alike). Absent when none.
+        prLink: { $ref: "#/components/schemas/PRLink" }
         debrief: { $ref: "#/components/schemas/Debrief" }
+
+    ExtraSession:
+      type: object
+      description: >
+        One additional live Claude session in the launch's directory — a
+        phone-spawned sibling behind the same remote-control server, or an
+        unrelated session (manual, IDE) in the same folder; "in this folder"
+        is the literal contract. Rows age out shortly after the registry
+        stops listing them.
+      required: [name]
+      properties:
+        name: { type: string, description: Registry-assigned session name. }
+        status:
+          type: string
+          enum: [busy, idle]
+          description: Omitted when the registry reports anything else.
+
+    PRLink:
+      type: object
+      description: >
+        The newest pr-link record from the session's transcript. Best-effort
+        enrichment of an undocumented transcript detail — absence is the
+        contract, and it never appears on landed objects (no journaled
+        source).
+      required: [number, url]
+      properties:
+        number: { type: integer }
+        url: { type: string }
 
     Debrief:
       type: object
@@ -161,6 +211,11 @@ components:
         startedAt: { type: string, format: date-time }
         exitedAt: { type: string, format: date-time }
         exitCode: { type: [integer, "null"] }
+        claudeSessionId:
+          type: string
+          description: >
+            Claude conversation UUID, read from the session.exit journal
+            entry; absent when it was never captured.
         debrief: { $ref: "#/components/schemas/Debrief" }
 
     CreateSession:
@@ -302,6 +357,12 @@ components:
           required: [id]
           properties:
             id: { type: string }
+            claudeSessionId:
+              type: string
+              description: >
+                Claude conversation UUID from the session.claude-id journal
+                entry — the resume handle for a session a crashed runner
+                forgot. Absent when it was never captured.
 
     KeptWorktree:
       type: object

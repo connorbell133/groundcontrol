@@ -185,15 +185,44 @@ exit. It appears as `debrief` on the session object (and in the
 
 The same five fields are written flat into the `session.exit` journal entry
 (`filesChanged`, `insertions`, `deletions`, `uncommitted`, `branchState`,
-alongside `id` and `code`), which is what makes debriefs survive restarts:
-`GET /sessions` returns a third list, `landed`, joining `session.start`
-entries with their `session.exit` entries — id, launch config
+alongside `id`, `code`, and the `claudeSessionId` when one was captured),
+which is what makes debriefs survive restarts: `GET /sessions` returns a
+third list, `landed`, joining `session.start` entries with their
+`session.exit` entries — id, launch config
 (`name`/`folder`/`branch`/`spawnMode`/`permissionMode`),
-`startedAt`/`exitedAt`, `exitCode`, and the `debrief` when one was captured.
-Newest exits first, capped at 20, scoped to a 7-day window and the configured
-roots (folders that vanished are dropped). Sessions the runner still lists
-under `sessions` — live, or exited but not yet dismissed via
-`DELETE /sessions/:id/record` — are excluded from `landed`.
+`startedAt`/`exitedAt`, `exitCode`, `claudeSessionId` when the journal has
+it, and the `debrief` when one was captured. Newest exits first, capped at
+20, scoped to a 7-day window and the configured roots (folders that vanished
+are dropped). Sessions the runner still lists under `sessions` — live, or
+exited but not yet dismissed via `DELETE /sessions/:id/record` — are
+excluded from `landed`.
+
+#### Claude state enrichment
+
+While sessions are live, a runner-owned poll of `claude agents --json` (the
+CLI's documented scripting surface, 2.1.145+) enriches the session objects.
+Every field degrades to absence — an unreachable registry, an older CLI, or
+an exited session simply renders nothing — and none of it ever drives a state
+transition: the PTY remains the sole exit authority.
+
+- `claudeSessionId` — Claude Code's conversation UUID for the launch's
+  primary session (the id `claude --resume` wants). Captured once, first
+  capture wins; journaled as a `session.claude-id` entry and flattened into
+  the `session.exit` entry, so both `lost` and `landed` objects expose
+  `claudeSessionId` after a runner restart when the journal has it.
+- `activity` — `"busy"` or `"idle"`, copied from the registry row. Absent
+  when the registry hasn't confirmed it recently, reports an unknown value,
+  or the session exited — never a stale value. Activity flips are never
+  journaled and never fan out to webhooks.
+- `extraSessions` — other live Claude sessions running in the launch's
+  directory, as `[{ "name": "...", "status": "busy" }]`. This covers both
+  sessions the phone spawned behind the same remote-control server *and*
+  unrelated sessions (a manual `claude` in the same folder, IDE sessions) —
+  "in this folder" is the literal contract. Rows age out shortly after the
+  registry stops listing them; `status` is omitted when unknown.
+- `prLink` — `{ "number": 9, "url": "https://github.com/..." }`, the newest
+  `pr-link` record from the session's transcript. Best-effort enrichment of
+  an undocumented transcript detail; absence is the contract.
 
 ### Jobs (headless agents)
 

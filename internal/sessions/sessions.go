@@ -133,6 +133,9 @@ type Manager struct {
 	sessions map[string]*liveSession
 	// names reserved by launches still between duplicate-check and insertion
 	pendingNames map[string]bool
+	// watchers tracks bridge-pointer goroutines so tests can drain them before
+	// restoring the package seams those goroutines read while alive
+	watchers sync.WaitGroup
 
 	lostMu       sync.Mutex
 	lostCache    []LostSession
@@ -502,7 +505,11 @@ func (m *Manager) Create(opts CreateOpts) (Session, error) {
 
 	go m.readLoop(s)
 	// primary pairing-URL source; short-lived, ends at first resolution or timeout
-	go m.watchBridgePointer(s, cmd.Process.Pid)
+	m.watchers.Add(1)
+	go func() {
+		defer m.watchers.Done()
+		m.watchBridgePointer(s, cmd.Process.Pid)
+	}()
 
 	return snap, nil
 }

@@ -25,7 +25,16 @@ func testManager(t *testing.T, roots []string) *Manager {
 	ws := workspace.New(t.TempDir(), jnl)
 	browser := browse.New()
 	browser.Configure(roots, false)
-	return NewManager(jnl, bus, ws, browser)
+	m := NewManager(jnl, bus, ws, browser)
+	t.Cleanup(func() {
+		// drain watcher goroutines before later-registered cleanups restore the
+		// package seams they read (cleanups run LIFO, so this runs first)
+		for _, s := range m.List() {
+			m.Kill(s.ID, "test-cleanup")
+		}
+		m.watchers.Wait()
+	})
+	return m
 }
 
 func TestLastMeaningfulLine(t *testing.T) {

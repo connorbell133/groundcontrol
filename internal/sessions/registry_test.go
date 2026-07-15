@@ -733,7 +733,13 @@ func TestRegistryLoopCaptureActivityAndJournal(t *testing.T) {
 	}
 	seenMu.Unlock()
 
-	// successful query with the row gone: activity clears, uuid stays, state holds
+	// successful query with the row gone: activity clears, uuid stays, state holds.
+	// Wait for the scrape-driven ready flip first — the registry harness resolves
+	// far faster than the PTY's first read, so asserting "state held" before ready
+	// exists would race the readLoop rather than test the guard.
+	waitFor(t, 10*time.Second, "ready via scrape before the row-loss check", func() bool {
+		return m.Get(created.ID).State == StateReady
+	})
 	h.set([]claudex.Agent{}, nil)
 	waitFor(t, 10*time.Second, "activity cleared after the row vanished", func() bool {
 		return m.Get(created.ID).Activity == nil

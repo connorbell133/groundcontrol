@@ -6,7 +6,6 @@
 :root {
   /* warm paper ground */
   --bg: #f2eee3;
-  --bg-2: #ece7d8;
   --surface: #e9e4d5;
   --surface-2: #e0dac7;
   --line: rgba(28, 26, 20, 0.12);
@@ -443,7 +442,6 @@ body {
 }
 .btn:active { transform: scale(0.97); }
 .btn:focus-visible { outline: 1.5px solid var(--accent); outline-offset: 2px; }
-.btn.primary { background: var(--accent); color: var(--accent-ink); border-color: transparent; box-shadow: 0 6px 16px color-mix(in srgb, var(--accent) 25%, transparent); }
 .btn.danger { color: var(--danger); border-color: color-mix(in srgb, var(--danger) 40%, transparent); }
 /* armed double-tap confirm state (armConfirm) */
 .btn.warn { color: var(--danger); border-color: color-mix(in srgb, var(--danger) 45%, transparent); background: color-mix(in srgb, var(--danger) 8%, transparent); }
@@ -732,7 +730,6 @@ body {
 /* ---------- safelight dark mode (manual opt-in; light is the baseline) ---------- */
 html[data-theme="dark"] {
     --bg: #17150f;
-    --bg-2: #1b1811;
     --surface: #221e14;
     --surface-2: #2b2618;
     --line: rgba(232, 226, 208, 0.10);
@@ -794,7 +791,6 @@ html[data-hand="left"] .select-wrap select { padding: 13px 14px 13px 38px; }
 html[data-hand="left"] .select-caret { right: auto; left: 14px; }
 
 /* ---------- settings ---------- */
-.topbar-right { display: flex; align-items: center; }
 .settings-group {
   font-family: var(--mono); font-size: 10px; font-weight: 700; letter-spacing: 0.2em;
   text-transform: uppercase; color: var(--accent);

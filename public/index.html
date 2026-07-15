@@ -44,6 +44,12 @@
       <span class="pathbar-tick" aria-hidden="true">┌</span>
       <nav class="crumbs" id="crumbs" aria-label="Folder path"></nav>
     </div>
+    <div class="mission" id="mission">
+      <input type="text" id="missionInput" class="mission-input" placeholder="what's the mission?"
+        autocomplete="off" autocapitalize="off" spellcheck="false" enterkeyhint="go"
+        role="combobox" aria-expanded="false" aria-controls="missionChips" aria-autocomplete="list" aria-label="Mission" />
+      <div class="mission-chips" id="missionChips" role="listbox" aria-label="Suggested repos" hidden></div>
+    </div>
     <div class="recents" id="recents" hidden>
       <span class="recents-kicker">Recent dispatches</span>
       <div class="recents-row" id="recentsRow"></div>

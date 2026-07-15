@@ -131,6 +131,19 @@ components:
             requested but skipped; absent means injected or never
             requested (the wire never claims success, only explains
             absence).
+        capacityUsed:
+          type: integer
+          description: >
+            The environment's live session count, scraped from the CLI's own
+            "Capacity: used/max" status line — preferred over registry-derived
+            counts when present. Absent until the line first appears and after
+            exit; never journaled.
+        capacityMax:
+          type: integer
+          description: >
+            Companion maximum from the same scrape; present exactly when
+            capacityUsed is. Can disagree with capacity if the CLI's default
+            drifts — the scrape wins on display surfaces.
         claudeSessionId:
           type: string
           description: >

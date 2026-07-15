@@ -289,6 +289,10 @@ transition: the PTY remains the sole exit authority.
 - `prLink` — `{ "number": 9, "url": "https://github.com/..." }`, the newest
   `pr-link` record from the session's transcript. Best-effort enrichment of
   an undocumented transcript detail; absence is the contract.
+- `capacityUsed` / `capacityMax` — the environment's live session count,
+  scraped from the CLI's own `Capacity: used/max` status line (PTY-sourced,
+  not registry). Absent until the line first appears, cleared at exit, never
+  journaled.
 
 ### Jobs (headless agents)
 

@@ -360,6 +360,7 @@ body {
 
 /* header session counter — "N of <capacity> sessions", live cards only.
    The environment's headline stat, so it reads at header weight, not as a footnote. */
+.session-usage:empty { display: none; }
 .session-usage {
   flex: none; font-family: var(--mono); font-size: 11px; font-weight: 700; letter-spacing: 0.05em;
   color: var(--text); white-space: nowrap;
@@ -570,30 +571,6 @@ body {
   color: var(--muted); background: var(--panel); border: 1px solid var(--line-strong);
   border-radius: 9px; padding: 11px; max-height: 220px; overflow: auto; white-space: pre-wrap; word-break: break-all;
 }
-.session-convo { margin-top: 15px; }
-.convo {
-  margin-top: 9px; display: flex; flex-direction: column; gap: 7px;
-  background: var(--panel); border: 1px solid var(--line-strong);
-  border-radius: 9px; padding: 11px; max-height: 320px; overflow: auto;
-}
-.convo-msg {
-  font-size: 12.5px; line-height: 1.5; white-space: pre-wrap; word-break: break-word;
-  border-radius: 10px; padding: 8px 10px; max-width: 92%;
-}
-.convo-msg.user {
-  align-self: flex-end; color: var(--accent-ink); background: var(--accent);
-  border-bottom-right-radius: 3px;
-}
-.convo-msg.assistant {
-  align-self: flex-start; color: var(--text); background: var(--card);
-  border: 1px solid var(--line-strong); border-bottom-left-radius: 3px;
-}
-.convo-divider {
-  align-self: center; font-family: var(--mono); font-size: 9.5px; letter-spacing: 0.12em;
-  text-transform: uppercase; color: var(--faint); padding: 3px 0;
-}
-.convo-empty { font-size: 12px; color: var(--faint); text-align: center; padding: 8px 0; }
-
 /* ---------- launch sheet ---------- */
 .scrim {
   position: fixed; inset: 0; z-index: 20;
@@ -845,6 +822,7 @@ html[data-hand="left"] .wt-row { flex-direction: row-reverse; }
 html[data-hand="left"] .wt-info { text-align: right; }
 html[data-hand="left"] .orbit-row { flex-direction: row-reverse; }
 html[data-hand="left"] .orbit-info { text-align: right; }
+html[data-hand="left"] .env-row { flex-direction: row-reverse; }
 html[data-hand="left"] .select-wrap select { padding: 13px 14px 13px 38px; }
 html[data-hand="left"] .select-caret { right: auto; left: 14px; }
 

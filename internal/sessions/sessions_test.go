@@ -177,6 +177,31 @@ func TestRecentLaunchesCapacityRoundTrip(t *testing.T) {
 	}
 }
 
+func TestScanCapacity(t *testing.T) {
+	t.Parallel()
+	cases := []struct {
+		name      string
+		text      string
+		wantOK    bool
+		used, max int
+	}{
+		{"no line", "·✔︎· Connected · repo · main", false, 0, 0},
+		{"plain line", "Capacity: 1/32 · New sessions will be created in the current directory", true, 1, 32},
+		{"redraw supersedes", "Capacity: 1/32 · x\nstuff\nCapacity: 4/32 · x", true, 4, 32},
+		{"split then joined", "Capaci" + "ty: 2/32", true, 2, 32},
+		{"malformed numbers ignored", "Capacity: /32", false, 0, 0},
+	}
+	for _, tc := range cases {
+		t.Run(tc.name, func(t *testing.T) {
+			t.Parallel()
+			used, max, ok := scanCapacity(tc.text)
+			if ok != tc.wantOK || used != tc.used || max != tc.max {
+				t.Errorf("scanCapacity(%q) = %d, %d, %v; want %d, %d, %v", tc.text, used, max, ok, tc.used, tc.max, tc.wantOK)
+			}
+		})
+	}
+}
+
 func TestBranchStateAfterRemove(t *testing.T) {
 	t.Parallel()
 	repo := testutil.InitRepo(t)

@@ -35,8 +35,8 @@ import (
 // Documented in docs/api.md; adding a code is fine, renaming one is a breaking change.
 // Codes in use: unauthorized, insufficient_scope, invalid_json, missing_param,
 // invalid_param, invalid_path, invalid_config, outside_roots, not_found, not_ready,
-// ready_timeout, launch_failed, session_live, job_live, worktree_error, not_implemented,
-// branch_held, branch_not_merged.
+// ready_timeout, launch_failed, folder_in_use, session_live, job_live, worktree_error,
+// not_implemented, branch_held, branch_not_merged, payload_too_large.
 
 // scope names one capability a token can grant; the wire format stays the
 // plain string ("read" etc.) in config files and error messages.
@@ -116,9 +116,19 @@ func nonNil[T any](s []T) []T {
 // decodeBody unmarshals the request body into dst and writes the 400 itself
 // on failure: malformed JSON (or a non-object body) is invalid_json, a field
 // of the wrong JSON type is invalid_param. Unknown fields are ignored.
+// maxBodyBytes caps any JSON request body. Generous for the largest legitimate
+// payload (a 64 KB preset settings blob plus surrounding config) while keeping
+// an authed caller from streaming an unbounded body into memory.
+const maxBodyBytes = 2 << 20 // 2 MiB
+
 func decodeBody(w http.ResponseWriter, r *http.Request, dst any) bool {
-	data, err := io.ReadAll(r.Body)
+	data, err := io.ReadAll(http.MaxBytesReader(w, r.Body, maxBodyBytes))
 	if err != nil {
+		var tooLarge *http.MaxBytesError
+		if errors.As(err, &tooLarge) {
+			apiErr(w, 413, "payload_too_large", fmt.Sprintf("request body exceeds %d bytes", maxBodyBytes))
+			return false
+		}
 		apiErr(w, 400, "invalid_json", "request body must be valid JSON")
 		return false
 	}
@@ -570,10 +580,14 @@ func (s *Server) Handler() http.Handler {
 			apiErr(w, 404, "not_found", err.Error())
 		case errors.Is(err, sessions.ErrOrbitHeld):
 			apiErr(w, 409, "branch_held", err.Error())
-		default:
+		case errors.Is(err, sessions.ErrOrbitNotMerged):
 			// git refused the safe delete: unmerged commits — there is no
 			// force path; merge the work or clean its worktree first
 			apiErr(w, 409, "branch_not_merged", err.Error())
+		default:
+			// a transient git failure (timeout, index lock, permissions) — not
+			// the user's merge state; surface it as a server-side error
+			apiErr(w, 500, "worktree_error", err.Error())
 		}
 	}))
 
@@ -700,7 +714,9 @@ func (s *Server) Handler() http.Handler {
 				if req.SpawnMode == "" {
 					req.SpawnMode = preset.SpawnMode
 				}
-				if req.Capacity == 0 {
+				if req.Capacity < 1 {
+					// < 1 (unset or negative) takes the preset's capacity, matching
+					// normalizeCapacity which treats anything below 1 as "not asked"
 					req.Capacity = preset.Capacity
 				}
 				settingsJSON = preset.SettingsJSON
@@ -724,6 +740,13 @@ func (s *Server) Handler() http.Handler {
 			Actor:              actorOf(r).name,
 		})
 		if err != nil {
+			// the one-live-environment-per-folder guard gets its own code so
+			// clients can distinguish it from a generic launch failure and flip
+			// the launch sheet to worktree mode
+			if errors.Is(err, sessions.ErrFolderInUse) {
+				apiErr(w, 409, "folder_in_use", err.Error())
+				return
+			}
 			apiErr(w, 409, "launch_failed", err.Error())
 			return
 		}

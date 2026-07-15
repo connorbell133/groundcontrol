@@ -3,6 +3,7 @@ package sessions
 import (
 	"errors"
 	"fmt"
+	"strings"
 	"time"
 
 	"github.com/connorbell133/groundcontrol/internal/gitx"
@@ -237,9 +238,10 @@ func (m *Manager) ListOrbit() []OrbitBranch {
 
 // Orbit sweep failures the API maps to distinct stable error codes.
 var (
-	ErrOrbitRepo     = errors.New("repo is not a git repository")
-	ErrOrbitNotFound = errors.New("no such gc/ branch")
-	ErrOrbitHeld     = errors.New("branch is held")
+	ErrOrbitRepo      = errors.New("repo is not a git repository")
+	ErrOrbitNotFound  = errors.New("no such gc/ branch")
+	ErrOrbitHeld      = errors.New("branch is held")
+	ErrOrbitNotMerged = errors.New("branch has unmerged commits")
 )
 
 // SweepOrbitBranch safe-deletes one gc/* branch. Never a force delete: git's
@@ -268,8 +270,17 @@ func (m *Manager) SweepOrbitBranch(repo, branch string) error {
 		// delete a branch out from under a checkout anyway
 		return fmt.Errorf("%w by worktree %s", ErrOrbitHeld, found.WorktreePath)
 	}
-	// "--" so a crafted branch name can never read as a flag
-	if err := gitx.Run(repo, 10*time.Second, "branch", "-d", "--", branch); err != nil {
+	// "--" so a crafted branch name can never read as a flag. Full stderr (not
+	// just the last line) so the "not fully merged" refusal is distinguishable
+	// from a transient failure (timeout, index lock) — the API maps them to
+	// different status codes.
+	if stderr, err := gitx.Stderr(repo, 10*time.Second, "branch", "-d", "--", branch); err != nil {
+		if strings.Contains(stderr, "not fully merged") {
+			return fmt.Errorf("%w: %s", ErrOrbitNotMerged, branch)
+		}
+		if stderr != "" {
+			return errors.New(stderr)
+		}
 		return err
 	}
 	m.journal.Append(map[string]any{"event": "orbit.swept", "repo": repo, "branch": branch})

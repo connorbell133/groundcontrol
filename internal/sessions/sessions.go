@@ -122,6 +122,12 @@ type Debrief struct {
 	BranchState string `json:"branchState"`
 }
 
+// ErrFolderInUse is returned by Create when a same-dir launch collides with an
+// environment already launching or live in the same folder. The API maps it to
+// the folder_in_use error code — distinct from a generic launch_failed so
+// clients can key on it (e.g. to flip the launch sheet to worktree mode).
+var ErrFolderInUse = errors.New("folder already has a live environment")
+
 // branchState values: what actually survived worktree cleanup
 const (
 	branchMerged       = "merged"        // branch gone, or its tip reachable from the default branch
@@ -474,7 +480,7 @@ func (m *Manager) Create(opts CreateOpts) (Session, error) {
 		}
 		m.mu.Unlock()
 		if folderBusy {
-			return Session{}, errors.New("an environment is already launching in this folder — one live environment per folder; use worktree mode for a second")
+			return Session{}, fmt.Errorf("%w: an environment is already launching in this folder — one live environment per folder; use worktree mode for a second", ErrFolderInUse)
 		}
 		defer func() {
 			m.mu.Lock()
@@ -482,7 +488,7 @@ func (m *Manager) Create(opts CreateOpts) (Session, error) {
 			m.mu.Unlock()
 		}()
 		if m.liveSameFolderExists(opts.Folder) {
-			return Session{}, errors.New("an environment is already live in this folder — open that one in claude.ai, kill it, or launch in worktree mode (claude.ai labels same-folder environments identically)")
+			return Session{}, fmt.Errorf("%w: an environment is already live in this folder — open that one in claude.ai, kill it, or launch in worktree mode (claude.ai labels same-folder environments identically)", ErrFolderInUse)
 		}
 	}
 	permissionMode := opts.PermissionMode
@@ -862,23 +868,23 @@ func (m *Manager) Remove(id string) (bool, error) {
 	s, ok := m.sessions[id]
 	if !ok {
 		m.mu.Unlock()
-		// lost-session headstones dismiss through the same endpoint
+		// not in the live map: a lost headstone, a landed (prior-runner) session,
+		// or an unknown id. Splice the headstone cache if present, then journal a
+		// dismissal for any id the journal knows so ListLanded/ListLost drop it —
+		// including across a restart. A genuinely unknown id is a 404.
 		m.lostMu.Lock()
-		removed := false
 		for i, l := range m.lostCache {
 			if l.ID == id {
 				m.lostCache = append(m.lostCache[:i], m.lostCache[i+1:]...)
-				removed = true
 				break
 			}
 		}
 		m.lostMu.Unlock()
-		if removed {
-			// journal so the headstone stays dismissed across a runner restart,
-			// when the lost-session cache is rebuilt from the journal
-			m.journalDismissal(id)
+		if !m.knownInJournal(id) {
+			return false, nil
 		}
-		return removed, nil
+		m.journalDismissal(id)
+		return true, nil
 	}
 	if s.State != StateExited && s.State != StateError {
 		m.mu.Unlock()
@@ -891,6 +897,18 @@ func (m *Manager) Remove(id string) (bool, error) {
 	// resurrects on the next poll
 	m.journalDismissal(id)
 	return true, nil
+}
+
+// knownInJournal reports whether the id has a session.start entry — i.e. it is
+// a real session (live, lost, or landed), not an unknown id. Used to keep
+// DELETE /sessions/{id}/record a 404 for ids the runner never launched.
+func (m *Manager) knownInJournal(id string) bool {
+	for _, e := range m.journal.Read() {
+		if jStr(e, "id") == id && jStr(e, "event") == evSessionStart {
+			return true
+		}
+	}
+	return false
 }
 
 // journalDismissal records a session.dismissed marker so the journal-derived

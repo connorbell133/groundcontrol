@@ -600,7 +600,8 @@ func TestSessionExitDebriefInOrbit(t *testing.T) {
 		t.Errorf("landed must exclude sessions the manager still lists: %+v", list.Landed)
 	}
 
-	// dismissing the record surfaces the journal-derived landed entry
+	// dismissing the record removes the card for good (R5): it disappears from
+	// the live list and does NOT reappear as a journal-derived landed card
 	if rec := doReq(t, env.handler, "DELETE", "/sessions/"+created.ID+"/record", "", nil); rec.Code != 200 {
 		t.Fatalf("dismiss = %d: %s", rec.Code, rec.Body.String())
 	}
@@ -608,18 +609,13 @@ func TestSessionExitDebriefInOrbit(t *testing.T) {
 	if err := json.Unmarshal(rec.Body.Bytes(), &list); err != nil {
 		t.Fatal(err)
 	}
-	if len(list.Landed) != 1 || list.Landed[0].ID != created.ID {
-		t.Fatalf("landed after dismissal = %+v", list.Landed)
+	for _, s := range list.Sessions {
+		if s.ID == created.ID {
+			t.Errorf("dismissed session still in the live list: %+v", s)
+		}
 	}
-	l := list.Landed[0]
-	if l.Debrief == nil || l.Debrief.BranchState != "in-orbit" || l.Debrief.FilesChanged != 1 || l.Debrief.Insertions != 2 {
-		t.Errorf("landed debrief = %+v", l.Debrief)
-	}
-	if l.Name != "orbit" || l.Folder != repo || l.SpawnMode != "worktree" || l.StartedAt == "" || l.ExitedAt == "" {
-		t.Errorf("landed entry = %+v", l)
-	}
-	if l.ExitCode == nil || *l.ExitCode != 1 {
-		t.Errorf("landed exitCode = %v, want 1 (signal-killed)", l.ExitCode)
+	if len(list.Landed) != 0 {
+		t.Errorf("dismissed session must not resurrect as a landed card: %+v", list.Landed)
 	}
 }
 

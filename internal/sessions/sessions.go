@@ -75,6 +75,10 @@ type Session struct {
 	ExitCode     *int    `json:"exitCode"`
 	LastOutputAt *string `json:"lastOutputAt"`
 	LastLine     *string `json:"lastLine"`
+	// why a requested settings injection didn't happen; absent whenever the
+	// file was injected or no preset settings were in play — the wire only
+	// ever explains absence, never claims success (R11)
+	SettingsSkipReason *string `json:"settingsSkipReason,omitempty"`
 	// registry-sourced enrichment: every field degrades to absence and none
 	// of them ever drives a state transition — the PTY stays the sole exit
 	// authority (R6)
@@ -130,6 +134,10 @@ type liveSession struct {
 	repoRoot   string
 	wtBranch   string
 	baseCommit string
+	// settings.local.json this launch is responsible for (set whenever a
+	// preset carried settings, even when injection skipped — the marker check
+	// at removal protects user files); empty means nothing to tear down
+	settingsPath string
 	// registry enrichment bookkeeping, all guarded by m.mu
 	extrasSeen             map[string]extraRecord // last sighting per extra row, for wall-clock aging
 	activitySeenAt         time.Time              // last successful registry confirm of Activity
@@ -356,6 +364,14 @@ type CreateOpts struct {
 	// Capacity is the requested --capacity; zero means "not asked" and
 	// normalizes to the CLI default.
 	Capacity int
+	// SettingsJSON is the resolved preset's settings payload; non-empty asks
+	// Create to inject it as <launch cwd>/.claude/settings.local.json before
+	// spawn (inject.go owns the mechanism).
+	SettingsJSON string
+	// SettingsSkipReason pre-decides the injection outcome — the API layer
+	// sets it when the named preset no longer exists, so the relaunch still
+	// proceeds and the reason still reaches the journal and the wire (R8).
+	SettingsSkipReason string
 }
 
 // --capacity bounds, matching the CLI (default probed on 2.1.210). Requests
@@ -470,6 +486,18 @@ func (m *Manager) Create(opts CreateOpts) (Session, error) {
 		}
 	}
 
+	// preset settings injection — before spawn, into the launch cwd (the
+	// worktree in worktree mode), so the pre-created session reads the file
+	// natively; a skip never blocks the launch
+	settingsInjected := false
+	settingsReplaced := false
+	settingsSkipReason := opts.SettingsSkipReason
+	settingsPath := ""
+	if settingsSkipReason == "" && opts.SettingsJSON != "" {
+		settingsPath = settingsFilePath(cwd)
+		settingsInjected, settingsReplaced, settingsSkipReason = m.injectSettings(settingsPath, cwd, opts.SettingsJSON)
+	}
+
 	// always --spawn same-dir: the runner already handled worktree creation itself
 	args := []string{"remote-control", "--name", name, "--spawn", string(workspace.SpawnSameDir), "--permission-mode", permissionMode}
 	if capacity != defaultCapacity {
@@ -482,6 +510,10 @@ func (m *Manager) Create(opts CreateOpts) (Session, error) {
 	cmd.Env = append(os.Environ(), "FORCE_COLOR=0", "NO_COLOR=1", "TERM=xterm-256color")
 	ptmx, err := pty.StartWithSize(cmd, &pty.Winsize{Rows: 40, Cols: 120})
 	if err != nil {
+		if settingsInjected {
+			// no session will ever tear this down — reclaim it here
+			removeMarkedSettings(settingsPath)
+		}
 		if worktreePath != "" {
 			m.ws.Remove(repoRootForCleanup, worktreePath, wtBranch, baseCommit)
 		}
@@ -506,13 +538,16 @@ func (m *Manager) Create(opts CreateOpts) (Session, error) {
 			ExitCode:       nil,
 			LastOutputAt:   nil,
 			LastLine:       nil,
+			// present only when injection was requested but skipped (R11)
+			SettingsSkipReason: util.StrPtr(settingsSkipReason),
 		},
-		ptmx:       ptmx,
-		cmd:        cmd,
-		cwd:        cwd,
-		repoRoot:   repoRootForCleanup,
-		wtBranch:   wtBranch,
-		baseCommit: baseCommit,
+		ptmx:         ptmx,
+		cmd:          cmd,
+		cwd:          cwd,
+		repoRoot:     repoRootForCleanup,
+		wtBranch:     wtBranch,
+		baseCommit:   baseCommit,
+		settingsPath: settingsPath,
 	}
 	m.mu.Lock()
 	m.sessions[id] = s
@@ -546,6 +581,16 @@ func (m *Manager) Create(opts CreateOpts) (Session, error) {
 	}
 	if opts.PresetName != "" {
 		entry["presetName"] = opts.PresetName
+	}
+	// injection outcome flattens into session.start — never a standalone
+	// event: it's a launch fact, and the startup sweep reads it back from here
+	if settingsInjected {
+		entry["settingsInjected"] = true
+		if settingsReplaced {
+			entry["settingsNote"] = noteReplacedStale
+		}
+	} else if settingsSkipReason != "" {
+		entry["settingsSkipReason"] = settingsSkipReason
 	}
 	if opts.Actor != "" {
 		entry["actor"] = opts.Actor
@@ -646,8 +691,17 @@ func (m *Manager) readLoop(s *liveSession) {
 		cleanupRoot = s.Folder
 	}
 	wtBranch, baseCommit := s.wtBranch, s.baseCommit
+	settingsPath, cwd := s.settingsPath, s.cwd
 	snap := s.Session
 	m.mu.Unlock()
+
+	if settingsPath != "" {
+		// before the debrief and worktree cleanup: the injected file must not
+		// count as the run's own uncommitted work or keep a worktree dirty.
+		// Removal defers to the last same-folder exit; the marker check keeps
+		// user files untouchable either way (inject.go).
+		m.removeSettingsIfLast(settingsPath, cwd)
+	}
 
 	var debrief *Debrief
 	if wtPath != "" {

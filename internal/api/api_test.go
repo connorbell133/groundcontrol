@@ -463,6 +463,64 @@ func TestPostSessionsPreCapacityRelaunch(t *testing.T) {
 	}
 }
 
+// A launch naming a preset that no longer exists must keep working (deleted
+// presets stay relaunchable): no 4xx, no injection, the reason on the wire.
+func TestPostSessionsUnknownPreset(t *testing.T) {
+	testutil.FakeClaude(t)
+	root := testutil.ResolvedTempDir(t)
+	env := newTestEnv(t, config.Config{Roots: []string{root}})
+
+	created := createSession(t, env, fmt.Sprintf(`{"folder":%q,"name":"ghost","presetName":"deleted-preset"}`, root))
+	if created.SettingsSkipReason == nil || *created.SettingsSkipReason != "preset no longer exists" {
+		t.Errorf("settingsSkipReason = %v, want \"preset no longer exists\"", created.SettingsSkipReason)
+	}
+	entry := startEntry(t, env, created.ID)
+	if entry["settingsSkipReason"] != "preset no longer exists" {
+		t.Errorf("journaled skip reason = %v", entry["settingsSkipReason"])
+	}
+	if entry["presetName"] != "deleted-preset" {
+		t.Errorf("presetName must journal even when unresolvable: %v", entry["presetName"])
+	}
+}
+
+// A resolved preset fills only the options the request left empty (request
+// wins) and supplies the settings JSON for injection.
+func TestPostSessionsPresetResolution(t *testing.T) {
+	testutil.FakeClaude(t)
+	root := testutil.ResolvedTempDir(t)
+	sub := filepath.Join(root, "other")
+	if err := os.MkdirAll(sub, 0o755); err != nil {
+		t.Fatal(err)
+	}
+	env := newTestEnv(t, config.Config{
+		Roots: []string{root},
+		Presets: []config.Preset{
+			{Name: "fast", PermissionMode: "acceptEdits", Capacity: 4, SettingsJSON: `{"env":{"GC_PRESET":"1"}}`},
+		},
+	})
+
+	// empty request fields take the preset's values; settings are injected
+	created := createSession(t, env, fmt.Sprintf(`{"folder":%q,"name":"from-preset","presetName":"fast"}`, root))
+	if created.PermissionMode != "acceptEdits" || created.Capacity != 4 {
+		t.Errorf("preset did not fill empty options: %+v", created)
+	}
+	if created.SettingsSkipReason != nil {
+		t.Errorf("preset launch skipped injection: %q", *created.SettingsSkipReason)
+	}
+	if _, err := os.Stat(filepath.Join(root, ".claude", "settings.local.json")); err != nil {
+		t.Errorf("preset settings not injected: %v", err)
+	}
+	if startEntry(t, env, created.ID)["settingsInjected"] != true {
+		t.Error("injection outcome missing from the session.start entry")
+	}
+
+	// explicit request fields win over the preset's
+	override := createSession(t, env, fmt.Sprintf(`{"folder":%q,"name":"override","presetName":"fast","permissionMode":"plan","capacity":9}`, sub))
+	if override.PermissionMode != "plan" || override.Capacity != 9 {
+		t.Errorf("request fields must win over the preset: %+v", override)
+	}
+}
+
 // createWorktreeSession launches a fake-claude worktree session off main and
 // waits for it to pair, returning the session and its worktree path.
 func createWorktreeSession(t *testing.T, env *testEnv, folder, name string) (sessions.Session, string) {

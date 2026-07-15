@@ -122,6 +122,15 @@ components:
         exitCode: { type: [integer, "null"] }
         lastOutputAt: { type: [string, "null"], format: date-time }
         lastLine: { type: [string, "null"], description: "Last meaningful log line, ≤120 chars." }
+        settingsSkipReason:
+          type: string
+          description: >
+            Why a requested preset-settings injection didn't happen —
+            "preset no longer exists", "settings file already exists", or
+            "in use by another session". Present only when injection was
+            requested but skipped; absent means injected or never
+            requested (the wire never claims success, only explains
+            absence).
         claudeSessionId:
           type: string
           description: >
@@ -266,8 +275,14 @@ components:
         presetName:
           type: string
           description: >
-            Launch preset this request came from; recorded in the journal so
-            recents and relaunch can re-resolve it.
+            Named preset to resolve: it fills only the options the request
+            left empty (an explicit request field always wins) and supplies
+            the settings JSON injected as <launch
+            cwd>/.claude/settings.local.json for the session's lifetime. A
+            name that no longer resolves is not an error — the launch
+            proceeds without injection and the session carries
+            settingsSkipReason "preset no longer exists". Recorded in the
+            journal so recents and relaunch can re-resolve it.
         callbackUrl: { type: string, description: "http(s) URL — every lifecycle event for this launch except session.start is POSTed to it." }
         timeoutMs: { type: integer, default: 60000, minimum: 1000, maximum: 300000, description: "Only meaningful with ?wait=ready." }
 
@@ -336,7 +351,11 @@ components:
             Optional settings-file content as a string. At most 64 KB and
             must parse as a JSON object; a top-level "hooks" key is rejected
             (hooks run shell commands and are a separately gated feature).
-            An "env" key is allowed.
+            An "env" key is allowed. Injected at launch as <launch
+            cwd>/.claude/settings.local.json (marker-scoped: a
+            "_groundcontrol" key brands the file, an existing unmarked file
+            refuses injection, and removal waits for the last same-folder
+            exit).
 
     Job:
       type: object

@@ -642,7 +642,15 @@ async function doLaunch() {
       // a reason, or disables both for a non-git folder — the sheet stays open.
       await refreshSessions();
       syncBranchField();
-      toast("An environment is already live here — switched to worktree", true);
+      // syncBranchField flips to worktree only for a git folder with commits;
+      // a non-git / no-commits folder has no worktree fallback, so tell the
+      // truth about which state the sheet landed in
+      toast(
+        state.opts.spawnMode === "worktree"
+          ? "An environment is already live here — switched to worktree"
+          : "An environment is already live here — kill it to launch here again",
+        true
+      );
     } else {
       toast(e.message, true);
     }

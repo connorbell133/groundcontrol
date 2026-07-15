@@ -58,6 +58,10 @@ func Stderr(dir string, timeout time.Duration, args ...string) (stderr string, e
 	ctx, cancel := context.WithTimeout(context.Background(), timeout)
 	defer cancel()
 	cmd := exec.CommandContext(ctx, "git", append([]string{"-C", dir}, args...)...)
+	// force the C locale so callers can classify failures by git's stable
+	// English message text (e.g. "not fully merged") regardless of the runner's
+	// locale
+	cmd.Env = append(os.Environ(), "LC_ALL=C")
 	var errBuf bytes.Buffer
 	cmd.Stderr = &errBuf
 	err = cmd.Run()

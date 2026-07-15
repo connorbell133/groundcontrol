@@ -1015,9 +1015,9 @@ func TestNotFoundAndParamErrors(t *testing.T) {
 
 /* ---------- Claude state enrichment on the wire ---------- */
 
-// enrichmentKeys are the registry-sourced session fields; all four must be
+// enrichmentKeys are the registry-sourced session fields; all five must be
 // absent (not null, not empty) when nothing was captured.
-var enrichmentKeys = []string{`"claudeSessionId"`, `"activity"`, `"extraSessions"`, `"prLink"`}
+var enrichmentKeys = []string{`"claudeSessionId"`, `"activity"`, `"environmentSessions"`, `"folderSessions"`, `"prLink"`}
 
 func TestSessionEnrichmentWireShape(t *testing.T) {
 	t.Parallel()
@@ -1029,8 +1029,10 @@ func TestSessionEnrichmentWireShape(t *testing.T) {
 		Folder:          "/f",
 		ClaudeSessionID: &uuid,
 		Activity:        &activity,
-		ExtraSessions: []sessions.ExtraSession{
+		EnvironmentSessions: []sessions.ExtraSession{
 			{Name: "gc-x-1", Status: "idle"},
+		},
+		FolderSessions: []sessions.ExtraSession{
 			{Name: "manual"}, // unknown status serializes to no status key
 		},
 		PRLink: &sessions.PRLink{Number: 9, URL: "https://github.com/o/r/pull/9"},
@@ -1043,7 +1045,8 @@ func TestSessionEnrichmentWireShape(t *testing.T) {
 	for _, want := range []string{
 		`"claudeSessionId":"` + uuid + `"`,
 		`"activity":"busy"`,
-		`"extraSessions":[{"name":"gc-x-1","status":"idle"},{"name":"manual"}]`,
+		`"environmentSessions":[{"name":"gc-x-1","status":"idle"}]`,
+		`"folderSessions":[{"name":"manual"}]`,
 		`"prLink":{"number":9,"url":"https://github.com/o/r/pull/9"}`,
 	} {
 		if !strings.Contains(body, want) {
@@ -1051,7 +1054,7 @@ func TestSessionEnrichmentWireShape(t *testing.T) {
 		}
 	}
 
-	// an unenriched session omits all four keys entirely
+	// an unenriched session omits all five keys entirely
 	empty, err := json.Marshal(sessions.Session{ID: "abc12345"})
 	if err != nil {
 		t.Fatal(err)
@@ -1140,8 +1143,8 @@ func TestLostAndLandedClaudeSessionID(t *testing.T) {
 
 func TestSessionsExtrasOverHTTP(t *testing.T) {
 	root := testutil.ResolvedTempDir(t)
-	// one same-folder registry row that no launch owns: it must surface as an
-	// extra on the launched session's card. startedAt predates any launch, so
+	// one same-folder registry row that no launch owns: it must surface as a
+	// folder row on the launched session. startedAt predates any launch, so
 	// even the ps-less fallback can never mistake it for the primary.
 	agents := fmt.Sprintf(`[{"pid":999999,"cwd":%q,"sessionId":"conv-extra","name":"folder-mate","status":"busy","startedAt":1}]`, root)
 	testutil.FakeClaudeWith(t, testutil.FakeClaudeConfig{AgentsJSON: agents})
@@ -1168,7 +1171,7 @@ func TestSessionsExtrasOverHTTP(t *testing.T) {
 			if s.ID != created.ID {
 				continue
 			}
-			for _, e := range s.ExtraSessions {
+			for _, e := range s.FolderSessions {
 				if e.Name == "folder-mate" && e.Status == "busy" {
 					// the unowned row must never join as the primary
 					if s.ClaudeSessionID != nil {

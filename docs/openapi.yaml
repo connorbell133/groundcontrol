@@ -130,24 +130,35 @@ components:
             Registry-sourced live activity. Absent when the registry hasn't
             confirmed it recently, reports an unknown value, or the session
             exited — never a stale value. Never journaled, never fanned out.
-        extraSessions:
+        environmentSessions:
           type: array
           items: { $ref: "#/components/schemas/ExtraSession" }
           description: >
-            Other live Claude sessions running in the launch's directory
-            (phone-spawned siblings and unrelated same-folder sessions
-            alike). Absent when none.
+            The environment's own live sessions — registry rows descended
+            from the spawned launcher, primary session first, then by name.
+            The primary row's status reads the same registry row as
+            activity. Rows clear on the first successful poll that no
+            longer lists them; the grace window applies only across failed
+            polls, and rows keep their last confident classification while
+            the process snapshot is unavailable. Absent when none.
+        folderSessions:
+          type: array
+          items: { $ref: "#/components/schemas/ExtraSession" }
+          description: >
+            Live Claude sessions in the launch's directory that do not
+            belong to the environment (manual, IDE), sorted by name — "in
+            this folder" is the literal contract. Rows age out shortly
+            after the registry stops listing them. Absent when none.
         prLink: { $ref: "#/components/schemas/PRLink" }
         debrief: { $ref: "#/components/schemas/Debrief" }
 
     ExtraSession:
       type: object
       description: >
-        One additional live Claude session in the launch's directory — a
-        phone-spawned sibling behind the same remote-control server, or an
-        unrelated session (manual, IDE) in the same folder; "in this folder"
-        is the literal contract. Rows age out shortly after the registry
-        stops listing them.
+        One live Claude session row, as listed under environmentSessions
+        (the environment's own sessions, descendants of the spawned
+        launcher) or folderSessions (unrelated same-folder sessions —
+        manual, IDE).
       required: [name]
       properties:
         name: { type: string, description: Registry-assigned session name. }

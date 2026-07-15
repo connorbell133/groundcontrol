@@ -214,12 +214,21 @@ transition: the PTY remains the sole exit authority.
   when the registry hasn't confirmed it recently, reports an unknown value,
   or the session exited — never a stale value. Activity flips are never
   journaled and never fan out to webhooks.
-- `extraSessions` — other live Claude sessions running in the launch's
-  directory, as `[{ "name": "...", "status": "busy" }]`. This covers both
-  sessions the phone spawned behind the same remote-control server *and*
-  unrelated sessions (a manual `claude` in the same folder, IDE sessions) —
-  "in this folder" is the literal contract. Rows age out shortly after the
-  registry stops listing them; `status` is omitted when unknown.
+- `environmentSessions` — the environment's own live sessions (registry rows
+  descended from the spawned launcher, including sessions claude.ai creates
+  on demand), as `[{ "name": "...", "status": "busy" }]`, primary session
+  first, then by name. The primary row's status reads the same registry row
+  as `activity`, so the two surfaces never disagree. Rows clear on the first
+  successful poll that no longer lists them; the wall-clock grace window
+  applies only across failed polls. When the process snapshot is unavailable,
+  rows keep their last confident classification instead of demoting to
+  `folderSessions`, and age out on the wall-clock window.
+- `folderSessions` — live Claude sessions in the launch's directory that do
+  *not* belong to the environment (a manual `claude` in the same folder, IDE
+  sessions), sorted by name — "in this folder" is the literal contract. Rows
+  age out shortly after the registry stops listing them. In both lists
+  `status` is omitted when unknown, and a list with no rows is absent, never
+  empty.
 - `prLink` — `{ "number": 9, "url": "https://github.com/..." }`, the newest
   `pr-link` record from the session's transcript. Best-effort enrichment of
   an undocumented transcript detail; absence is the contract.

@@ -605,9 +605,10 @@ function patchSweptDebrief(branch) {
   });
 }
 
-// live claude sessions sharing the launch folder — capped rows, no disclosure;
-// a status other than busy/idle is unknown and renders nothing, per the
-// unknown-means-absent rule the primary activity chip follows
+// live claude sessions around the launch — environment rows then same-folder
+// foreign rows, concatenated; capped, no disclosure. A status other than
+// busy/idle is unknown and renders nothing, per the unknown-means-absent rule
+// the primary activity chip follows
 function extrasHTML(extras) {
   if (!extras?.length) return "";
   const rows = extras
@@ -642,7 +643,7 @@ function renderShell(card, s) {
       <span class="meta-chip activity" data-activity hidden></span>
       ${s.prLink && (s.state === "ready" || s.state === "starting") ? `<a class="meta-chip pr" href="${esc(s.prLink.url)}" target="_blank" rel="noopener">PR #${esc(s.prLink.number)}</a>` : ""}
     </div>
-    ${s.state === "ready" ? extrasHTML(s.extraSessions) : ""}
+    ${s.state === "ready" ? extrasHTML([...(s.environmentSessions || []), ...(s.folderSessions || [])]) : ""}
     ${s.pairingUrl && s.state === "ready" ? `
       <a class="card-cta" href="${esc(s.pairingUrl)}" target="_blank" rel="noopener">enter cockpit <span class="cta-glyph">→</span></a>
       <details class="qr-details" data-qr="${s.id}">
@@ -843,7 +844,7 @@ function renderSessions() {
     // them the later real exit would never rewrite in the debrief face.
     // extras and prLink are step changes too — they rewrite exactly when
     // they change, never on a tick
-    const extras = (s.extraSessions || []).map((x) => `${x.name}:${x.status ?? ""}`).join(",");
+    const extras = [...(s.environmentSessions || []), ...(s.folderSessions || [])].map((x) => `${x.name}:${x.status ?? ""}`).join(",");
     const face = `${s.state}|${s.pairingUrl}|${s.exitCode ?? ""}|${s.debrief?.branchState ?? ""}|${extras}|${s.prLink?.url ?? ""}`;
     if (card.dataset.face !== face) {
       if (!card._new) card.style.animation = "none"; // in-place rewrite — no entrance replay

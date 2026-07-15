@@ -46,12 +46,14 @@ const (
 // evSessionClaudeID is journal-only: the registry poller appends it on first
 // UUID capture but never announces it — enrichment facts don't fan out (R8).
 const (
-	evSessionStart    = "session.start"
-	evSessionReady    = "session.ready"
-	evSessionKill     = "session.kill"
-	evSessionExit     = "session.exit"
-	evSessionFailed   = "session.failed"
-	evSessionClaudeID = "session.claude-id"
+	evSessionStart        = "session.start"
+	evSessionReady        = "session.ready"
+	evSessionKill         = "session.kill"
+	evSessionExit         = "session.exit"
+	evSessionFailed       = "session.failed"
+	evSessionClaudeID     = "session.claude-id"
+	evSessionInjectIntent = "session.inject-intent"
+	evSessionDismissed    = "session.dismissed"
 )
 
 type Session struct {
@@ -550,7 +552,12 @@ func (m *Manager) Create(opts CreateOpts) (Session, error) {
 	settingsPath := ""
 	if settingsSkipReason == "" && opts.SettingsJSON != "" {
 		settingsPath = settingsFilePath(cwd)
-		settingsInjected, settingsReplaced, settingsSkipReason = m.injectSettings(settingsPath, cwd, opts.SettingsJSON)
+		// journal the intent before writing the file so a crash between the
+		// write and the session.start entry still leaves a folder the boot
+		// sweep can find and reclaim (R12); a crash before the write leaves an
+		// intent with no file, which the marker-gated sweep no-ops on.
+		m.journal.Append(map[string]any{"event": evSessionInjectIntent, "id": id, "folder": opts.Folder})
+		settingsInjected, settingsReplaced, settingsSkipReason = m.injectSettings(settingsPath, cwd, opts.SettingsJSON, id)
 	}
 
 	// always --spawn same-dir: the runner already handled worktree creation itself

@@ -486,8 +486,8 @@ func (s *Server) Handler() http.Handler {
 						apiErr(w, 400, "invalid_config", fmt.Sprintf("preset %s: settings JSON must be a JSON object", p.Name))
 						return
 					}
-					if _, ok := settings["hooks"]; ok {
-						apiErr(w, 400, "invalid_config", fmt.Sprintf("preset %s: settings must not carry a hooks key — hooks run shell commands and are a separately gated feature", p.Name))
+					if bad := sessions.ForbiddenSettingsKey(settings); bad != "" {
+						apiErr(w, 400, "invalid_config", fmt.Sprintf("preset %s: settings key %q is not on the inert allowlist — keys that run commands, move credentials, or change permissions (hooks, apiKeyHelper, env, permissions, sandbox, …) are refused", p.Name, bad))
 						return
 					}
 				}

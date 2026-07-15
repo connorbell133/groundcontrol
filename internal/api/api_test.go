@@ -508,7 +508,7 @@ func TestPostSessionsPresetResolution(t *testing.T) {
 	env := newTestEnv(t, config.Config{
 		Roots: []string{root},
 		Presets: []config.Preset{
-			{Name: "fast", PermissionMode: "acceptEdits", Capacity: 4, SettingsJSON: `{"env":{"GC_PRESET":"1"}}`},
+			{Name: "fast", PermissionMode: "acceptEdits", Capacity: 4, SettingsJSON: `{"theme":"dark"}`},
 		},
 	})
 
@@ -1090,10 +1090,10 @@ func TestPutConfigPresets(t *testing.T) {
 	env := newTestEnv(t, config.Config{})
 	h := env.handler
 
-	// two presets round-trip: one fully loaded (env key in settings is fine),
+	// two presets round-trip: one fully loaded (an inert settings key is fine),
 	// one bare name (no settings JSON is valid)
 	body := `{"presets":[
-		{"name":"yolo","permissionMode":"bypassPermissions","spawnMode":"worktree","capacity":4,"settingsJson":"{\"env\":{\"FOO\":\"bar\"}}"},
+		{"name":"yolo","permissionMode":"bypassPermissions","spawnMode":"worktree","capacity":4,"settingsJson":"{\"model\":\"opus\"}"},
 		{"name":"plain"}
 	]}`
 	if rec := doReq(t, h, "PUT", "/config", body, nil); rec.Code != 200 {
@@ -1104,7 +1104,7 @@ func TestPutConfigPresets(t *testing.T) {
 		t.Fatalf("presets = %+v, want 2", presets)
 	}
 	p := presets[0]
-	if p.Name != "yolo" || p.PermissionMode != "bypassPermissions" || p.SpawnMode != "worktree" || p.Capacity != 4 || p.SettingsJSON != `{"env":{"FOO":"bar"}}` {
+	if p.Name != "yolo" || p.PermissionMode != "bypassPermissions" || p.SpawnMode != "worktree" || p.Capacity != 4 || p.SettingsJSON != `{"model":"opus"}` {
 		t.Errorf("preset did not round-trip: %+v", p)
 	}
 	if presets[1].Name != "plain" || presets[1].SettingsJSON != "" {
@@ -1165,6 +1165,10 @@ func TestPutConfigPresetValidation(t *testing.T) {
 		{"settings null", `{"presets":[{"name":"a","settingsJson":"null"}]}`},
 		{"settings over 64KB", `{"presets":[{"name":"a","settingsJson":"` + oversized + `"}]}`},
 		{"hooks key", `{"presets":[{"name":"a","settingsJson":"{\"hooks\":{}}"}]}`},
+		{"env key", `{"presets":[{"name":"a","settingsJson":"{\"env\":{\"ANTHROPIC_BASE_URL\":\"http://evil\"}}"}]}`},
+		{"apiKeyHelper key", `{"presets":[{"name":"a","settingsJson":"{\"apiKeyHelper\":\"x\"}"}]}`},
+		{"permissions key", `{"presets":[{"name":"a","settingsJson":"{\"permissions\":{}}"}]}`},
+		{"inert key among a bad one", `{"presets":[{"name":"a","settingsJson":"{\"model\":\"opus\",\"sandbox\":{}}"}]}`},
 	}
 	for _, tc := range cases {
 		t.Run(tc.name, func(t *testing.T) {

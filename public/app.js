@@ -403,12 +403,12 @@ function renderShell(card, s) {
       <span class="meta-chip activity" data-activity hidden></span>
     </div>
     ${s.pairingUrl && s.state === "ready" ? `
+      <a class="card-cta" href="${esc(s.pairingUrl)}" target="_blank" rel="noopener">enter cockpit <span class="cta-glyph">→</span></a>
       <details class="qr-details" data-qr="${s.id}">
         <summary class="qr-summary">
-          <img class="qr-thumb" alt="Pairing QR code" src="/api/v1/sessions/${s.id}/qr${tokenQS()}" />
           <span class="qr-summary-label">
-            <span class="qr-summary-title">Scan to pair</span>
-            <span class="qr-summary-sub">tap to expand</span>
+            <span class="qr-summary-title">pair another device</span>
+            <span class="qr-summary-sub">tap for qr code</span>
           </span>
           <span class="qr-chevron">›</span>
         </summary>
@@ -419,12 +419,23 @@ function renderShell(card, s) {
         </div>
       </details>
       <div class="session-actions">
-        <a class="btn primary" href="${esc(s.pairingUrl)}" target="_blank" rel="noopener">Open link</a>
         <button class="btn danger" data-kill="${s.id}">Kill</button>
       </div>` : s.state === "starting" ? `
-      <div class="provision"><span class="provision-dot"></span><span data-provision>Provisioning…</span></div>
+      <div class="launch-seq">
+        <div class="seq-stage done"><span class="seq-mark">✓</span><span class="seq-label">request accepted</span></div>
+        <div class="seq-stage active"><span class="seq-mark"><span class="provision-dot"></span></span><span class="seq-label">agent igniting</span><span class="seq-elapsed" data-provision></span></div>
+        <div class="seq-stage pending"><span class="seq-mark">·</span><span class="seq-label">telemetry acquired</span></div>
+      </div>
       <div class="session-actions">
         <button class="btn danger" data-kill="${s.id}">Kill</button>
+      </div>` : s.state === "error" ? `
+      <div class="launch-seq failed">
+        <div class="seq-stage done"><span class="seq-mark">✓</span><span class="seq-label">request accepted</span></div>
+        <div class="seq-stage failed"><span class="seq-mark">✕</span><span class="seq-label">ignition failed — launch scrubbed</span></div>
+      </div>
+      <div class="session-actions">
+        <button class="btn" data-relaunch="${s.id}">Relaunch</button>
+        <button class="btn" data-remove="${s.id}">Dismiss</button>
       </div>` : `
       <div class="session-actions">
         <button class="btn" data-relaunch="${s.id}">Relaunch</button>
@@ -493,8 +504,9 @@ function updateDynamic(card, s) {
     }
   }
 
+  // elapsed ticker on the active launch-sequence stage (starting cards only)
   const provision = card.querySelector("[data-provision]");
-  if (provision) provision.textContent = `Provisioning… ${fmtDur(now - started)}`;
+  if (provision) provision.textContent = `t+${fmtDur(now - started)}`;
 }
 
 function renderSessions() {

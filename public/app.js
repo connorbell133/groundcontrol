@@ -142,6 +142,7 @@ function renderBrowse() {
     list.appendChild(li);
   });
 
+  $("mission").hidden = !!state.path; // roots-level only, same guard as recents
   $("recents").hidden = !!state.path || !state.recentLoaded || !state.recent?.length;
   syncFab();
 }
@@ -162,12 +163,14 @@ function gitGlyph() {
 
 /* ---------- recents ---------- */
 async function loadRecents() {
-  const { recent } = await api("/api/v1/journal/recent?limit=6");
+  // limit=20 (server max): the full feed doubles as the mission input's
+  // suggestion pool — one fetch per arrival at roots covers both
+  const { recent } = await api("/api/v1/journal/recent?limit=20");
   state.recent = recent;
   state.recentLoaded = true;
   const row = $("recentsRow");
   row.innerHTML = "";
-  for (const r of recent) {
+  for (const r of recent.slice(0, 6)) {
     const card = document.createElement("button");
     card.className = "recent-card" + (r.stale ? " stale" : "");
     card.innerHTML = `
@@ -194,6 +197,105 @@ async function relaunchFromRecent(cfg) {
     toast(e.message, true);
   }
 }
+
+/* ---------- mission input (thought-first browse) ---------- */
+// the currently rendered suggestions — Enter activates when exactly one is visible
+let missionMatches = [];
+let missionTimer;
+
+// mission text → session name: lowercase, non-alphanumerics collapse to single
+// dashes, trimmed, capped at 40 chars (re-trimmed so the cap can't leave a dash)
+function slugMission(text) {
+  return String(text)
+    .toLowerCase()
+    .replace(/[^a-z0-9]+/g, "-")
+    .replace(/^-+|-+$/g, "")
+    .slice(0, 40)
+    .replace(/-+$/, "");
+}
+
+// every typed token must land somewhere in folder basename, mission name, or
+// branch; newest-first journal order wins ties, one suggestion per folder
+function missionSuggestions(query) {
+  const tokens = query.toLowerCase().split(/\s+/).filter(Boolean);
+  if (!tokens.length) return [];
+  const seen = new Set();
+  const out = [];
+  for (const r of state.recent || []) {
+    if (seen.has(r.folder)) continue;
+    const hay = [r.folder.split("/").pop(), r.name, r.branch].filter(Boolean).map((s) => s.toLowerCase());
+    if (tokens.every((t) => hay.some((h) => h.includes(t)))) {
+      seen.add(r.folder);
+      out.push(r);
+      if (out.length === 3) break;
+    }
+  }
+  return out;
+}
+
+function renderMissionChips() {
+  const box = $("missionChips");
+  box.innerHTML = "";
+  // two repos named "api" need their parent dir to tell them apart
+  const baseCounts = {};
+  for (const r of missionMatches) {
+    const b = r.folder.split("/").pop();
+    baseCounts[b] = (baseCounts[b] || 0) + 1;
+  }
+  for (const r of missionMatches) {
+    const base = r.folder.split("/").pop();
+    const parent = r.folder.split("/").slice(-2, -1)[0];
+    const chip = document.createElement("button");
+    chip.className = "mission-chip" + (r.stale ? " stale" : "");
+    chip.setAttribute("role", "option");
+    chip.innerHTML = `
+      <span class="chip-name">${esc(base)}</span>
+      ${baseCounts[base] > 1 && parent ? `<span class="chip-dir">— ${esc(parent)}/</span>` : ""}
+      ${r.stale ? `<span class="stale-chip">branch gone</span>` : r.branch ? `<span class="branch-chip">${esc(r.branch)}</span>` : ""}`;
+    chip.onclick = () => launchFromMission(r);
+    box.appendChild(chip);
+  }
+  const open = missionMatches.length > 0;
+  box.hidden = !open;
+  $("missionInput").setAttribute("aria-expanded", String(open));
+}
+
+// like relaunchFromRecent, plus the typed thought riding in as prompt + name
+async function launchFromMission(r) {
+  const text = $("missionInput").value.trim();
+  try {
+    await loadFolder(r.folder);
+    const mission = { prompt: text, name: slugMission(text) || undefined };
+    if (r.stale) {
+      toast(`branch ${r.branch} no longer exists — defaulting to in-folder`, true);
+      openSheet({ spawnMode: "same-dir", permissionMode: r.permissionMode, ...mission });
+    } else {
+      openSheet({ spawnMode: r.spawnMode, permissionMode: r.permissionMode, branch: r.branch ?? undefined, ...mission });
+    }
+    // leave a clean slate for the next visit to roots
+    $("missionInput").value = "";
+    missionMatches = [];
+    renderMissionChips();
+  } catch (e) {
+    toast(e.message, true);
+  }
+}
+
+$("missionInput").addEventListener("input", () => {
+  clearTimeout(missionTimer);
+  missionTimer = setTimeout(() => {
+    missionMatches = missionSuggestions($("missionInput").value);
+    renderMissionChips();
+  }, 150);
+});
+$("missionInput").addEventListener("keydown", (e) => {
+  if (e.key !== "Enter") return;
+  // flush the debounce so Enter acts on what's typed, not what was rendered
+  clearTimeout(missionTimer);
+  missionMatches = missionSuggestions($("missionInput").value);
+  renderMissionChips();
+  if (missionMatches.length === 1) launchFromMission(missionMatches[0]);
+});
 
 /* ---------- launch sheet ---------- */
 function syncBranchField() {

@@ -389,8 +389,25 @@ successful sweep writes an `orbit.swept {repo, branch}` journal entry.
 
 | method + path | what |
 |---|---|
-| `GET /config` | roots, showHidden, webhooks |
+| `GET /config` | roots, showHidden, webhooks, presets |
 | `PUT /config` | partial update of the same; persists to `config.json` |
+
+PUT is a partial update: only keys present in the body are touched. A payload
+carrying just `{"presets": [...]}` never disturbs roots or webhooks; an
+explicit empty array clears the list. Validation runs before anything is
+applied, so a rejected write leaves the config untouched.
+
+`presets` are named launch configurations. Each preset carries:
+
+- `name` (required) — unique and non-empty within the list.
+- `permissionMode` — empty, or one of `default`, `acceptEdits`, `plan`,
+  `auto`, `dontAsk`, `bypassPermissions`.
+- `spawnMode` — empty, or `same-dir` / `worktree`.
+- `capacity` — 0 (unset) or 1–256.
+- `settingsJson` — optional settings-file content as a string: at most 64 KB
+  and must parse as a JSON object. A top-level `hooks` key is rejected —
+  hooks run shell commands and are a separately gated feature. An `env` key
+  is allowed.
 
 A token that can reach `PUT /config` can widen `roots` — treat `authToken`
 and any `admin`-scoped token as root on the box. Give automations

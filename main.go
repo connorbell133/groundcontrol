@@ -62,6 +62,12 @@ func main() {
 		}{true, version, ready})
 	})
 
+	// unauthenticated by design, same as /healthz: it's a reference page, not
+	// a route that reads or changes state, and the Scalar CDN page has no way
+	// to send an auth header when it fetches the spec.
+	mux.HandleFunc("GET /docs", serveScalarDocs)
+	mux.HandleFunc("GET /openapi.yaml", serveOpenAPISpec)
+
 	api := a.createAPI()
 	mux.Handle("/api/v1/", http.StripPrefix("/api/v1", api)) // canonical, documented in docs/api.md
 	mux.Handle("/api/", http.StripPrefix("/api", api))       // deprecated alias for pinned clients — kept for one release

@@ -1,4 +1,7 @@
-package main
+// Package api serves the HTTP API: routing, auth (tokens + scopes), request
+// validation, and the JSON/SSE wire formats. It owns the live config — the
+// auth middleware reads it and PUT /config is its only mutator.
+package api
 
 import (
 	"context"
@@ -7,15 +10,25 @@ import (
 	"errors"
 	"fmt"
 	"io"
+	"log"
 	"net/http"
 	"os"
 	"reflect"
 	"regexp"
 	"strconv"
 	"strings"
+	"sync"
 	"time"
 
 	qrcode "github.com/skip2/go-qrcode"
+
+	"github.com/connorbell133/groundcontrol/internal/browse"
+	"github.com/connorbell133/groundcontrol/internal/config"
+	"github.com/connorbell133/groundcontrol/internal/events"
+	"github.com/connorbell133/groundcontrol/internal/jobs"
+	"github.com/connorbell133/groundcontrol/internal/sessions"
+	"github.com/connorbell133/groundcontrol/internal/util"
+	"github.com/connorbell133/groundcontrol/internal/workspace"
 )
 
 // Stable machine-readable codes — clients key off these, never off message text.
@@ -59,7 +72,7 @@ func scopeSet(scopes []scope) map[scope]bool {
 }
 
 func apiErr(w http.ResponseWriter, status int, code, message string) {
-	writeJSON(w, status, struct {
+	WriteJSON(w, status, struct {
 		Error struct {
 			Code    string `json:"code"`
 			Message string `json:"message"`
@@ -70,7 +83,9 @@ func apiErr(w http.ResponseWriter, status int, code, message string) {
 	}{code, message}})
 }
 
-func writeJSON(w http.ResponseWriter, status int, v any) {
+// WriteJSON marshals v and writes it with the given status; exported so main
+// can serve /healthz in the same wire format.
+func WriteJSON(w http.ResponseWriter, status int, v any) {
 	data, err := json.Marshal(v)
 	if err != nil {
 		http.Error(w, "Internal Server Error", http.StatusInternalServerError)
@@ -139,25 +154,6 @@ func jsonTypeName(t reflect.Type) string {
 	}
 }
 
-// block until the session pairs, dies, or the deadline passes — 300ms poll is
-// plenty against a multi-second provision and immune to event races
-func (a *app) waitForReady(id string, timeout time.Duration) string {
-	deadline := time.Now().Add(timeout)
-	for {
-		s := a.getSession(id)
-		if s == nil || s.State == stateExited || s.State == stateError {
-			return "dead"
-		}
-		if s.State == stateReady {
-			return "ready"
-		}
-		if !time.Now().Before(deadline) {
-			return "timeout"
-		}
-		time.Sleep(300 * time.Millisecond)
-	}
-}
-
 // known token, missing scope → 403 (vs 401 for no/unknown token)
 func need(s scope, h http.HandlerFunc) http.HandlerFunc {
 	return func(w http.ResponseWriter, r *http.Request) {
@@ -202,16 +198,59 @@ func tokenEqual(a, b string) bool {
 	return subtle.ConstantTimeCompare([]byte(a), []byte(b)) == 1
 }
 
+// Server wires the domain managers to HTTP. It also owns the live config:
+// the auth middleware snapshots it per request, and PUT /config mutates it
+// under configMu, re-applies the live parts, and persists.
+type Server struct {
+	configMu   sync.Mutex
+	cfg        config.Config
+	configPath string
+
+	browser  *browse.Browser
+	bus      *events.Bus
+	ws       *workspace.Manager
+	sessions *sessions.Manager
+	jobs     *jobs.Manager
+}
+
+func NewServer(configPath string, cfg config.Config, browser *browse.Browser, bus *events.Bus, ws *workspace.Manager, sm *sessions.Manager, jm *jobs.Manager) *Server {
+	return &Server{
+		cfg:        cfg,
+		configPath: configPath,
+		browser:    browser,
+		bus:        bus,
+		ws:         ws,
+		sessions:   sm,
+		jobs:       jm,
+	}
+}
+
+// applyAndPersistConfigLocked re-applies the live parts of the config, then
+// persists to disk; the caller (PUT /config) holds configMu across the
+// mutation and this call.
+func (s *Server) applyAndPersistConfigLocked() {
+	s.browser.Configure(s.cfg.Roots, s.cfg.ShowHidden)
+	s.bus.ConfigureWebhooks(s.cfg.Webhooks)
+	out, err := json.MarshalIndent(&s.cfg, "", "  ")
+	if err != nil {
+		log.Printf("failed to serialize config: %v", err)
+		return
+	}
+	if err := os.WriteFile(s.configPath, append(out, '\n'), 0o644); err != nil {
+		log.Printf("failed to write %s: %v", s.configPath, err)
+	}
+}
+
 // Every route requires a token when any is configured; the resolved actor
 // (name + scopes) travels on the request context and into the journal.
 // ?token= is accepted too because <img> tags (the QR) and EventSource can't send headers.
-func (a *app) authMiddleware(next http.Handler) http.Handler {
+func (s *Server) authMiddleware(next http.Handler) http.Handler {
 	return http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
-		a.configMu.Lock()
-		authToken := a.cfg.AuthToken
-		tokens := make([]TokenConfig, len(a.cfg.Tokens))
-		copy(tokens, a.cfg.Tokens)
-		a.configMu.Unlock()
+		s.configMu.Lock()
+		authToken := s.cfg.AuthToken
+		tokens := make([]config.TokenConfig, len(s.cfg.Tokens))
+		copy(tokens, s.cfg.Tokens)
+		s.configMu.Unlock()
 
 		var act apiActor
 		if authToken == "" && len(tokens) == 0 {
@@ -228,7 +267,7 @@ func (a *app) authMiddleware(next http.Handler) http.Handler {
 			case token != "" && authToken != "" && tokenEqual(token, authToken):
 				act = apiActor{name: "owner", scopes: scopeSet(allScopes)}
 			default:
-				var entry *TokenConfig
+				var entry *config.TokenConfig
 				if token != "" {
 					// compare against every entry — no early exit on match, so
 					// timing doesn't narrow down which entry (if any) it was
@@ -244,9 +283,9 @@ func (a *app) authMiddleware(next http.Handler) http.Handler {
 				}
 				// unknown scope strings are filtered out rather than rejected
 				scopes := map[scope]bool{}
-				for _, s := range entry.Scopes {
+				for _, sc := range entry.Scopes {
 					for _, known := range allScopes {
-						if scope(s) == known {
+						if scope(sc) == known {
 							scopes[known] = true
 						}
 					}
@@ -286,19 +325,20 @@ type createJobRequest struct {
 
 type putConfigRequest struct {
 	// pointers keep present-vs-absent apart — PUT /config is a partial update
-	Roots      *[]string        `json:"roots"`
-	ShowHidden *bool            `json:"showHidden"`
-	Webhooks   *[]WebhookConfig `json:"webhooks"`
+	Roots      *[]string               `json:"roots"`
+	ShowHidden *bool                   `json:"showHidden"`
+	Webhooks   *[]events.WebhookConfig `json:"webhooks"`
 }
 
-// One sub-handler, mounted at /api/v1 (canonical) and /api (deprecated alias for one release).
-func (a *app) createAPI() http.Handler {
+// Handler returns the API handler, mounted by main at /api/v1 (canonical) and
+// /api (deprecated alias for one release).
+func (s *Server) Handler() http.Handler {
 	mux := http.NewServeMux()
 
 	mux.HandleFunc("GET /roots", need(scopeRead, func(w http.ResponseWriter, r *http.Request) {
-		writeJSON(w, 200, struct {
-			Roots []FolderEntry `json:"roots"`
-		}{nonNil(a.listRoots())})
+		WriteJSON(w, 200, struct {
+			Roots []browse.FolderEntry `json:"roots"`
+		}{nonNil(s.browser.ListRoots())})
 	}))
 
 	mux.HandleFunc("GET /browse", need(scopeRead, func(w http.ResponseWriter, r *http.Request) {
@@ -307,12 +347,12 @@ func (a *app) createAPI() http.Handler {
 			apiErr(w, 400, "missing_param", "path required")
 			return
 		}
-		result, err := a.browse(path)
+		result, err := s.browser.Browse(path)
 		if err != nil {
 			apiErr(w, 400, "invalid_path", err.Error())
 			return
 		}
-		writeJSON(w, 200, result)
+		WriteJSON(w, 200, result)
 	}))
 
 	mux.HandleFunc("GET /branches", need(scopeRead, func(w http.ResponseWriter, r *http.Request) {
@@ -321,29 +361,29 @@ func (a *app) createAPI() http.Handler {
 			apiErr(w, 400, "missing_param", "path required")
 			return
 		}
-		list, err := a.branchList(path)
+		list, err := s.browser.BranchList(path)
 		if err != nil {
 			apiErr(w, 400, "invalid_path", err.Error())
 			return
 		}
-		writeJSON(w, 200, struct {
+		WriteJSON(w, 200, struct {
 			Branches []string `json:"branches"`
 		}{nonNil(list)})
 	}))
 
 	mux.HandleFunc("GET /config", need(scopeRead, func(w http.ResponseWriter, r *http.Request) {
-		a.configMu.Lock()
-		roots := append([]string(nil), a.cfg.Roots...)
-		showHidden := a.cfg.ShowHidden
-		webhooks := append([]WebhookConfig(nil), a.cfg.Webhooks...)
-		a.configMu.Unlock()
+		s.configMu.Lock()
+		roots := append([]string(nil), s.cfg.Roots...)
+		showHidden := s.cfg.ShowHidden
+		webhooks := append([]events.WebhookConfig(nil), s.cfg.Webhooks...)
+		s.configMu.Unlock()
 		if webhooks == nil {
-			webhooks = []WebhookConfig{}
+			webhooks = []events.WebhookConfig{}
 		}
-		writeJSON(w, 200, struct {
-			Roots      []string        `json:"roots"`
-			ShowHidden bool            `json:"showHidden"`
-			Webhooks   []WebhookConfig `json:"webhooks"`
+		WriteJSON(w, 200, struct {
+			Roots      []string               `json:"roots"`
+			ShowHidden bool                   `json:"showHidden"`
+			Webhooks   []events.WebhookConfig `json:"webhooks"`
 		}{nonNil(roots), showHidden, webhooks})
 	}))
 
@@ -389,27 +429,27 @@ func (a *app) createAPI() http.Handler {
 			}
 		}
 
-		a.configMu.Lock()
-		defer a.configMu.Unlock()
+		s.configMu.Lock()
+		defer s.configMu.Unlock()
 		if req.Roots != nil {
-			a.cfg.Roots = *req.Roots
+			s.cfg.Roots = *req.Roots
 		}
 		if req.ShowHidden != nil {
-			a.cfg.ShowHidden = *req.ShowHidden
+			s.cfg.ShowHidden = *req.ShowHidden
 		}
 		if req.Webhooks != nil {
-			a.cfg.Webhooks = *req.Webhooks
+			s.cfg.Webhooks = *req.Webhooks
 		}
-		a.applyAndPersistConfig()
-		writeJSON(w, 200, struct {
+		s.applyAndPersistConfigLocked()
+		WriteJSON(w, 200, struct {
 			OK bool `json:"ok"`
 		}{true})
 	}))
 
 	mux.HandleFunc("GET /worktrees", need(scopeRead, func(w http.ResponseWriter, r *http.Request) {
-		writeJSON(w, 200, struct {
-			Worktrees []KeptWorktree `json:"worktrees"`
-		}{nonNil(a.listKeptWorktrees())})
+		WriteJSON(w, 200, struct {
+			Worktrees []workspace.Kept `json:"worktrees"`
+		}{nonNil(s.ws.ListKept(s.sessions.LiveWorktreePaths()))})
 	}))
 
 	mux.HandleFunc("DELETE /worktrees", need(scopeAdmin, func(w http.ResponseWriter, r *http.Request) {
@@ -418,20 +458,20 @@ func (a *app) createAPI() http.Handler {
 			apiErr(w, 400, "missing_param", "path required")
 			return
 		}
-		if err := a.forceRemoveWorktree(path); err != nil {
+		if err := s.ws.ForceRemove(path); err != nil {
 			apiErr(w, 400, "worktree_error", err.Error())
 			return
 		}
-		writeJSON(w, 200, struct {
+		WriteJSON(w, 200, struct {
 			OK bool `json:"ok"`
 		}{true})
 	}))
 
 	mux.HandleFunc("GET /sessions", need(scopeRead, func(w http.ResponseWriter, r *http.Request) {
-		writeJSON(w, 200, struct {
-			Sessions []Session     `json:"sessions"`
-			Lost     []LostSession `json:"lost"`
-		}{nonNil(a.listSessions()), nonNil(a.listLostSessions())})
+		WriteJSON(w, 200, struct {
+			Sessions []sessions.Session     `json:"sessions"`
+			Lost     []sessions.LostSession `json:"lost"`
+		}{nonNil(s.sessions.List()), nonNil(s.sessions.ListLost())})
 	}))
 
 	mux.HandleFunc("GET /journal/recent", need(scopeRead, func(w http.ResponseWriter, r *http.Request) {
@@ -444,9 +484,9 @@ func (a *app) createAPI() http.Handler {
 			}
 			limit = min(20, max(1, n))
 		}
-		writeJSON(w, 200, struct {
-			Recent []RecentLaunch `json:"recent"`
-		}{nonNil(a.recentLaunches(limit))})
+		WriteJSON(w, 200, struct {
+			Recent []sessions.RecentLaunch `json:"recent"`
+		}{nonNil(s.sessions.RecentLaunches(limit))})
 	}))
 
 	// Live lifecycle stream (SSE): session.start/ready/exit/kill as they happen.
@@ -464,8 +504,8 @@ func (a *app) createAPI() http.Handler {
 
 		// buffered channel keeps the emit goroutine from ever blocking on a
 		// slow client; a full buffer drops frames (clients re-list on reconnect)
-		ch := make(chan LifecycleEvent, 64)
-		unsub := a.onEvent(func(e LifecycleEvent) {
+		ch := make(chan events.LifecycleEvent, 64)
+		unsub := s.bus.OnEvent(func(e events.LifecycleEvent) {
 			select {
 			case ch <- e:
 			default:
@@ -475,7 +515,7 @@ func (a *app) createAPI() http.Handler {
 
 		hello, _ := json.Marshal(struct {
 			At string `json:"at"`
-		}{nowISO()})
+		}{util.NowISO()})
 		fmt.Fprintf(w, "event: hello\ndata: %s\n\n", hello)
 		fl.Flush()
 
@@ -508,7 +548,7 @@ func (a *app) createAPI() http.Handler {
 			apiErr(w, 400, "missing_param", "folder required")
 			return
 		}
-		if !a.withinRoots(req.Folder) {
+		if !s.browser.WithinRoots(req.Folder) {
 			apiErr(w, 400, "outside_roots", "folder outside configured roots")
 			return
 		}
@@ -521,14 +561,14 @@ func (a *app) createAPI() http.Handler {
 			callbackURL = *req.CallbackURL
 		}
 
-		session, err := a.createSession(createSessionOpts{
-			folder:         req.Folder,
-			name:           req.Name,
-			spawnMode:      req.SpawnMode,
-			branch:         req.Branch,
-			permissionMode: req.PermissionMode,
-			callbackURL:    callbackURL,
-			actor:          actorOf(r).name,
+		session, err := s.sessions.Create(sessions.CreateOpts{
+			Folder:         req.Folder,
+			Name:           req.Name,
+			SpawnMode:      req.SpawnMode,
+			Branch:         req.Branch,
+			PermissionMode: req.PermissionMode,
+			CallbackURL:    callbackURL,
+			Actor:          actorOf(r).name,
 		})
 		if err != nil {
 			apiErr(w, 409, "launch_failed", err.Error())
@@ -536,7 +576,7 @@ func (a *app) createAPI() http.Handler {
 		}
 
 		if r.URL.Query().Get("wait") != "ready" {
-			writeJSON(w, 201, session)
+			WriteJSON(w, 201, session)
 			return
 		}
 
@@ -545,14 +585,14 @@ func (a *app) createAPI() http.Handler {
 		if req.TimeoutMs != nil {
 			timeoutMs = min(300000, max(1000, *req.TimeoutMs))
 		}
-		outcome := a.waitForReady(session.ID, time.Duration(timeoutMs*float64(time.Millisecond)))
+		outcome := s.sessions.WaitForReady(session.ID, time.Duration(timeoutMs*float64(time.Millisecond)))
 		latest := session
-		if s := a.getSession(session.ID); s != nil {
-			latest = *s
+		if snap := s.sessions.Get(session.ID); snap != nil {
+			latest = *snap
 		}
 		switch outcome {
 		case "ready":
-			writeJSON(w, 201, latest)
+			WriteJSON(w, 201, latest)
 		case "dead":
 			msg := fmt.Sprintf("session %s exited before pairing", session.ID)
 			if latest.ExitCode != nil {
@@ -583,7 +623,7 @@ func (a *app) createAPI() http.Handler {
 			apiErr(w, 400, "missing_param", "prompt required")
 			return
 		}
-		if !a.withinRoots(req.Folder) {
+		if !s.browser.WithinRoots(req.Folder) {
 			apiErr(w, 400, "outside_roots", "folder outside configured roots")
 			return
 		}
@@ -600,45 +640,45 @@ func (a *app) createAPI() http.Handler {
 			apiErr(w, 501, "not_implemented", "Docker isolation is not implemented yet — jobs run as the runner's user")
 			return
 		}
-		// absent → -1 so jobs.go applies its default; an explicit 0 clamps to the 1s floor
+		// absent → -1 so the jobs manager applies its default; an explicit 0 clamps to the 1s floor
 		timeoutMs := -1
 		if req.TimeoutMs != nil {
 			timeoutMs = int(*req.TimeoutMs)
 		}
-		job, err := a.createJob(createJobOpts{
-			folder:         req.Folder,
-			prompt:         req.Prompt,
-			spawnMode:      req.SpawnMode,
-			branch:         req.Branch,
-			permissionMode: req.PermissionMode,
-			timeoutMs:      timeoutMs,
-			callbackURL:    callbackURL,
-			actor:          actorOf(r).name,
+		job, err := s.jobs.Create(jobs.CreateOpts{
+			Folder:         req.Folder,
+			Prompt:         req.Prompt,
+			SpawnMode:      req.SpawnMode,
+			Branch:         req.Branch,
+			PermissionMode: req.PermissionMode,
+			TimeoutMs:      timeoutMs,
+			CallbackURL:    callbackURL,
+			Actor:          actorOf(r).name,
 		})
 		if err != nil {
 			apiErr(w, 409, "launch_failed", err.Error())
 			return
 		}
-		writeJSON(w, 202, job)
+		WriteJSON(w, 202, job)
 	}))
 
 	mux.HandleFunc("GET /jobs", need(scopeRead, func(w http.ResponseWriter, r *http.Request) {
-		writeJSON(w, 200, struct {
-			Jobs []Job `json:"jobs"`
-		}{nonNil(a.listJobs())})
+		WriteJSON(w, 200, struct {
+			Jobs []jobs.Job `json:"jobs"`
+		}{nonNil(s.jobs.List())})
 	}))
 
 	mux.HandleFunc("GET /jobs/{id}", need(scopeRead, func(w http.ResponseWriter, r *http.Request) {
-		job := a.getJob(r.PathValue("id"))
+		job := s.jobs.Get(r.PathValue("id"))
 		if job == nil {
 			apiErr(w, 404, "not_found", "no such job")
 			return
 		}
-		writeJSON(w, 200, job)
+		WriteJSON(w, 200, job)
 	}))
 
 	mux.HandleFunc("GET /jobs/{id}/log", need(scopeRead, func(w http.ResponseWriter, r *http.Request) {
-		log := a.getJobLog(r.PathValue("id"))
+		log := s.jobs.GetLog(r.PathValue("id"))
 		if log == nil {
 			apiErr(w, 404, "not_found", "no such job")
 			return
@@ -647,16 +687,16 @@ func (a *app) createAPI() http.Handler {
 	}))
 
 	mux.HandleFunc("DELETE /jobs/{id}", need(scopeLaunch, func(w http.ResponseWriter, r *http.Request) {
-		job := a.cancelJob(r.PathValue("id"), actorOf(r).name)
+		job := s.jobs.Cancel(r.PathValue("id"), actorOf(r).name)
 		if job == nil {
 			apiErr(w, 404, "not_found", "no such job")
 			return
 		}
-		writeJSON(w, 200, job)
+		WriteJSON(w, 200, job)
 	}))
 
 	mux.HandleFunc("DELETE /jobs/{id}/record", need(scopeLaunch, func(w http.ResponseWriter, r *http.Request) {
-		removed, err := a.removeJob(r.PathValue("id"))
+		removed, err := s.jobs.Remove(r.PathValue("id"))
 		if err != nil {
 			apiErr(w, 409, "job_live", err.Error())
 			return
@@ -665,22 +705,22 @@ func (a *app) createAPI() http.Handler {
 			apiErr(w, 404, "not_found", "no such job")
 			return
 		}
-		writeJSON(w, 200, struct {
+		WriteJSON(w, 200, struct {
 			OK bool `json:"ok"`
 		}{true})
 	}))
 
 	mux.HandleFunc("GET /sessions/{id}", need(scopeRead, func(w http.ResponseWriter, r *http.Request) {
-		session := a.getSession(r.PathValue("id"))
+		session := s.sessions.Get(r.PathValue("id"))
 		if session == nil {
 			apiErr(w, 404, "not_found", "no such session")
 			return
 		}
-		writeJSON(w, 200, session)
+		WriteJSON(w, 200, session)
 	}))
 
 	mux.HandleFunc("GET /sessions/{id}/qr", need(scopeRead, func(w http.ResponseWriter, r *http.Request) {
-		session := a.getSession(r.PathValue("id"))
+		session := s.sessions.Get(r.PathValue("id"))
 		if session == nil {
 			apiErr(w, 404, "not_found", "no such session")
 			return
@@ -701,7 +741,7 @@ func (a *app) createAPI() http.Handler {
 	}))
 
 	mux.HandleFunc("GET /sessions/{id}/log", need(scopeRead, func(w http.ResponseWriter, r *http.Request) {
-		log := a.getSessionLog(r.PathValue("id"))
+		log := s.sessions.GetLog(r.PathValue("id"))
 		if log == nil {
 			apiErr(w, 404, "not_found", "no such session")
 			return
@@ -712,27 +752,27 @@ func (a *app) createAPI() http.Handler {
 	// The actual conversations (user prompts + assistant replies), read from the
 	// JSONL transcripts Claude Code writes for the session's launch directory.
 	mux.HandleFunc("GET /sessions/{id}/transcript", need(scopeRead, func(w http.ResponseWriter, r *http.Request) {
-		transcripts, found := a.getSessionTranscripts(r.PathValue("id"))
+		transcripts, found := s.sessions.GetTranscripts(r.PathValue("id"))
 		if !found {
 			apiErr(w, 404, "not_found", "no such session")
 			return
 		}
-		writeJSON(w, 200, struct {
-			Transcripts []Transcript `json:"transcripts"`
+		WriteJSON(w, 200, struct {
+			Transcripts []sessions.Transcript `json:"transcripts"`
 		}{nonNil(transcripts)})
 	}))
 
 	mux.HandleFunc("DELETE /sessions/{id}", need(scopeLaunch, func(w http.ResponseWriter, r *http.Request) {
-		session := a.killSession(r.PathValue("id"), actorOf(r).name)
+		session := s.sessions.Kill(r.PathValue("id"), actorOf(r).name)
 		if session == nil {
 			apiErr(w, 404, "not_found", "no such session")
 			return
 		}
-		writeJSON(w, 200, session)
+		WriteJSON(w, 200, session)
 	}))
 
 	mux.HandleFunc("DELETE /sessions/{id}/record", need(scopeLaunch, func(w http.ResponseWriter, r *http.Request) {
-		removed, err := a.removeSession(r.PathValue("id"))
+		removed, err := s.sessions.Remove(r.PathValue("id"))
 		if err != nil {
 			apiErr(w, 409, "session_live", err.Error())
 			return
@@ -741,10 +781,10 @@ func (a *app) createAPI() http.Handler {
 			apiErr(w, 404, "not_found", "no such session")
 			return
 		}
-		writeJSON(w, 200, struct {
+		WriteJSON(w, 200, struct {
 			OK bool `json:"ok"`
 		}{true})
 	}))
 
-	return a.authMiddleware(mux)
+	return s.authMiddleware(mux)
 }

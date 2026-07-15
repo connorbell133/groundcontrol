@@ -2,7 +2,6 @@ package main
 
 import (
 	"context"
-	"embed"
 	"flag"
 	"fmt"
 	"io/fs"
@@ -12,17 +11,26 @@ import (
 	"net/http"
 	"os/signal"
 	"path"
+	"path/filepath"
 	"strconv"
 	"strings"
 	"syscall"
 	"time"
+
+	groundcontrol "github.com/connorbell133/groundcontrol"
+	"github.com/connorbell133/groundcontrol/internal/api"
+	"github.com/connorbell133/groundcontrol/internal/browse"
+	"github.com/connorbell133/groundcontrol/internal/config"
+	"github.com/connorbell133/groundcontrol/internal/events"
+	"github.com/connorbell133/groundcontrol/internal/jobs"
+	"github.com/connorbell133/groundcontrol/internal/journal"
+	"github.com/connorbell133/groundcontrol/internal/sessions"
+	"github.com/connorbell133/groundcontrol/internal/util"
+	"github.com/connorbell133/groundcontrol/internal/workspace"
 )
 
 // release builds override this via -ldflags "-X main.version=..."
 var version = "0.5.0"
-
-//go:embed all:public
-var publicEmbed embed.FS
 
 func main() {
 	configPath := flag.String("config", "config.json", "path to the config file")
@@ -34,24 +42,33 @@ func main() {
 		return
 	}
 
-	cfg, err := loadConfig(*configPath)
+	cfg, err := config.Load(*configPath)
 	if err != nil {
 		log.Fatal(err)
 	}
 
-	a := newApp(*configPath, cfg)
-	a.configureBrowser(cfg.Roots, cfg.ShowHidden)
-	a.configureWebhooks(cfg.Webhooks)
-	a.configureJobs(cfg.Jobs)
+	// one journal, one bus, one manager per domain — wired here, nowhere else
+	jnl := journal.New(filepath.Join(util.MustCwd(), "data"))
+	bus := events.NewBus(jnl)
+	browser := browse.New()
+	ws := workspace.New(filepath.Join(util.MustHome(), ".groundcontrol", "worktrees"), jnl)
+	sessionMgr := sessions.NewManager(jnl, bus, ws, browser)
+	jobMgr := jobs.NewManager(jnl, bus, ws)
+
+	browser.Configure(cfg.Roots, cfg.ShowHidden)
+	bus.ConfigureWebhooks(cfg.Webhooks)
+	if cfg.Jobs != nil {
+		jobMgr.Configure(cfg.Jobs.Concurrency, cfg.Jobs.TimeoutMs)
+	}
 	// The sweep treats every on-disk worktree as a dead runner's leftover — true
 	// only for the sole holder of the runner lock. A second instance (a dev copy
 	// run from a checkout shares ~/.groundcontrol/worktrees) must not sweep the
 	// first one's live worktrees out from under its sessions.
-	if a.acquireRunnerLock() {
-		a.sweepOrphanWorktrees()
+	if ws.AcquireRunnerLock() {
+		ws.SweepOrphans()
 	} else {
 		log.Printf("another groundcontrol instance is running — skipping the orphan-worktree sweep")
-		a.journal(map[string]any{"event": "worktree.sweep-skipped", "reason": "another runner holds the lock"})
+		jnl.Append(map[string]any{"event": "worktree.sweep-skipped", "reason": "another runner holds the lock"})
 	}
 
 	mux := http.NewServeMux()
@@ -59,12 +76,12 @@ func main() {
 	// unauthenticated by design (uptime probes)
 	mux.HandleFunc("GET /healthz", func(w http.ResponseWriter, r *http.Request) {
 		ready := 0
-		for _, s := range a.listSessions() {
-			if s.State == stateReady {
+		for _, s := range sessionMgr.List() {
+			if s.State == sessions.StateReady {
 				ready++
 			}
 		}
-		writeJSON(w, 200, struct {
+		api.WriteJSON(w, 200, struct {
 			OK       bool   `json:"ok"`
 			Version  string `json:"version"`
 			Sessions int    `json:"sessions"`
@@ -74,15 +91,15 @@ func main() {
 	// unauthenticated by design, same as /healthz: it's a reference page, not
 	// a route that reads or changes state, and the Scalar CDN page has no way
 	// to send an auth header when it fetches the spec.
-	mux.HandleFunc("GET /docs", serveScalarDocs)
-	mux.HandleFunc("GET /openapi.yaml", serveOpenAPISpec)
+	mux.HandleFunc("GET /docs", api.ServeScalarDocs)
+	mux.HandleFunc("GET /openapi.yaml", api.ServeOpenAPISpec)
 
-	api := a.createAPI()
-	mux.Handle("/api/v1/", http.StripPrefix("/api/v1", api)) // canonical, documented in docs/api.md
-	mux.Handle("/api/", http.StripPrefix("/api", api))       // deprecated alias for pinned clients — kept for one release
+	srvAPI := api.NewServer(*configPath, cfg, browser, bus, ws, sessionMgr, jobMgr).Handler()
+	mux.Handle("/api/v1/", http.StripPrefix("/api/v1", srvAPI)) // canonical, documented in docs/api.md
+	mux.Handle("/api/", http.StripPrefix("/api", srvAPI))       // deprecated alias for pinned clients — kept for one release
 
 	mime.AddExtensionType(".webmanifest", "application/manifest+json")
-	pub, err := fs.Sub(publicEmbed, "public")
+	pub, err := fs.Sub(groundcontrol.PublicFS, "public")
 	if err != nil {
 		log.Fatalf("failed to open embedded public dir: %v", err)
 	}
@@ -153,14 +170,14 @@ func main() {
 	// Kill live work explicitly: sessions hold PTYs and worktrees whose
 	// cleanup runs on their exit path, so we drive them to exit rather than
 	// abandoning them to die with the process.
-	for _, s := range a.listSessions() {
-		if s.State == "starting" || s.State == "ready" {
-			a.killSession(s.ID, "shutdown")
+	for _, s := range sessionMgr.List() {
+		if s.State == sessions.StateStarting || s.State == sessions.StateReady {
+			sessionMgr.Kill(s.ID, "shutdown")
 		}
 	}
-	for _, j := range a.listJobs() {
-		if j.State == "queued" || j.State == "running" {
-			a.cancelJob(j.ID, "shutdown")
+	for _, j := range jobMgr.List() {
+		if j.State == jobs.StateQueued || j.State == jobs.StateRunning {
+			jobMgr.Cancel(j.ID, "shutdown")
 		}
 	}
 
@@ -169,13 +186,13 @@ func main() {
 	deadline := time.Now().Add(10 * time.Second)
 	for {
 		live := 0
-		for _, s := range a.listSessions() {
-			if s.State != "exited" && s.State != "error" {
+		for _, s := range sessionMgr.List() {
+			if s.State != sessions.StateExited && s.State != sessions.StateError {
 				live++
 			}
 		}
-		for _, j := range a.listJobs() {
-			if j.State == "queued" || j.State == "running" {
+		for _, j := range jobMgr.List() {
+			if j.State == jobs.StateQueued || j.State == jobs.StateRunning {
 				live++
 			}
 		}

@@ -1,4 +1,8 @@
-package main
+// Package jobs runs headless jobs: `claude -p` with JSON output — no PTY, no
+// pairing, no human. A different resource from sessions on purpose: different
+// lifecycle, different defaults (fresh worktree — an autonomous run should not
+// dirty a checkout you might be standing in).
+package jobs
 
 import (
 	"crypto/sha256"
@@ -15,27 +19,28 @@ import (
 	"sync"
 	"syscall"
 	"time"
+
+	"github.com/connorbell133/groundcontrol/internal/events"
+	"github.com/connorbell133/groundcontrol/internal/gitx"
+	"github.com/connorbell133/groundcontrol/internal/journal"
+	"github.com/connorbell133/groundcontrol/internal/util"
+	"github.com/connorbell133/groundcontrol/internal/workspace"
 )
 
-// Headless jobs: `claude -p` with JSON output — no PTY, no pairing, no human.
-// A different resource from sessions on purpose: different lifecycle,
-// different defaults (fresh worktree — an autonomous run should not dirty a
-// checkout you might be standing in).
-
-// jobState keeps string underneath: JSON marshals identically, and the untyped
-// literals other files compare against still compile
-type jobState string
+// State keeps string underneath: JSON marshals identically, and the untyped
+// literals other packages compare against still compile.
+type State string
 
 const (
-	jobStateQueued    jobState = "queued"
-	jobStateRunning   jobState = "running"
-	jobStateSucceeded jobState = "succeeded"
-	jobStateFailed    jobState = "failed"
-	jobStateTimeout   jobState = "timeout"
-	jobStateCanceled  jobState = "canceled"
+	StateQueued    State = "queued"
+	StateRunning   State = "running"
+	StateSucceeded State = "succeeded"
+	StateFailed    State = "failed"
+	StateTimeout   State = "timeout"
+	StateCanceled  State = "canceled"
 )
 
-// job lifecycle event names; evJobFailed is a derived match token (announceJob
+// job lifecycle event names; evJobFailed is a derived match token (announce
 // adds it alongside a failed/timeout exit), never an emitted event itself
 const (
 	evJobQueued = "job.queued"
@@ -46,24 +51,24 @@ const (
 )
 
 type Job struct {
-	ID             string    `json:"id"`
-	Folder         string    `json:"folder"`
-	Prompt         string    `json:"prompt"`
-	SpawnMode      spawnMode `json:"spawnMode"`
-	Branch         *string   `json:"branch"`
-	PermissionMode string    `json:"permissionMode"`
-	TimeoutMs      int       `json:"timeoutMs"`
-	CallbackURL    *string   `json:"callbackUrl"`
-	State          jobState  `json:"state"`
-	CreatedAt      string    `json:"createdAt"`
-	StartedAt      *string   `json:"startedAt"`
-	FinishedAt     *string   `json:"finishedAt"`
-	ExitCode       *int      `json:"exitCode"`
-	Result         *string   `json:"result"` // claude's final text (or the launch error)
-	CostUsd        *float64  `json:"costUsd"`
-	DurationMs     *int      `json:"durationMs"`
-	NumTurns       *int      `json:"numTurns"`
-	WorktreePath   *string   `json:"worktreePath"`
+	ID             string              `json:"id"`
+	Folder         string              `json:"folder"`
+	Prompt         string              `json:"prompt"`
+	SpawnMode      workspace.SpawnMode `json:"spawnMode"`
+	Branch         *string             `json:"branch"`
+	PermissionMode string              `json:"permissionMode"`
+	TimeoutMs      int                 `json:"timeoutMs"`
+	CallbackURL    *string             `json:"callbackUrl"`
+	State          State               `json:"state"`
+	CreatedAt      string              `json:"createdAt"`
+	StartedAt      *string             `json:"startedAt"`
+	FinishedAt     *string             `json:"finishedAt"`
+	ExitCode       *int                `json:"exitCode"`
+	Result         *string             `json:"result"` // claude's final text (or the launch error)
+	CostUsd        *float64            `json:"costUsd"`
+	DurationMs     *int                `json:"durationMs"`
+	NumTurns       *int                `json:"numTurns"`
+	WorktreePath   *string             `json:"worktreePath"`
 }
 
 type liveJob struct {
@@ -76,31 +81,48 @@ type liveJob struct {
 	actor           string
 }
 
-type JobsConfig struct {
-	Concurrency int `json:"concurrency,omitempty"`
-	TimeoutMs   int `json:"timeoutMs,omitempty"`
+// Manager owns the job table and the bounded-concurrency queue.
+type Manager struct {
+	mu       sync.Mutex
+	jobs     map[string]*liveJob
+	queue    []string
+	running  int
+	defaults struct{ concurrency, timeoutMs int }
+
+	journal *journal.Journal
+	bus     *events.Bus
+	ws      *workspace.Manager
 }
 
-func (a *app) configureJobs(cfg *JobsConfig) {
-	if cfg == nil {
-		return
+func NewManager(j *journal.Journal, bus *events.Bus, ws *workspace.Manager) *Manager {
+	m := &Manager{
+		jobs:    map[string]*liveJob{},
+		journal: j,
+		bus:     bus,
+		ws:      ws,
 	}
-	a.jobsMu.Lock()
-	defer a.jobsMu.Unlock()
-	if cfg.Concurrency != 0 {
-		a.jobDefaults.concurrency = max(1, cfg.Concurrency)
+	m.defaults = struct{ concurrency, timeoutMs int }{concurrency: 2, timeoutMs: 15 * 60 * 1000}
+	return m
+}
+
+// Configure overrides the queue defaults; zero values keep the current setting.
+func (m *Manager) Configure(concurrency, timeoutMs int) {
+	m.mu.Lock()
+	defer m.mu.Unlock()
+	if concurrency != 0 {
+		m.defaults.concurrency = max(1, concurrency)
 	}
-	if cfg.TimeoutMs != 0 {
-		a.jobDefaults.timeoutMs = max(1000, cfg.TimeoutMs)
+	if timeoutMs != 0 {
+		m.defaults.timeoutMs = max(1000, timeoutMs)
 	}
 }
 
-func (a *app) announceJob(event string, j Job) {
+func (m *Manager) announce(event string, j Job) {
 	where := filepath.Base(j.Folder)
 	if j.Branch != nil && *j.Branch != "" {
 		where += " @ " + *j.Branch
 	}
-	failed := j.State == jobStateFailed || j.State == jobStateTimeout
+	failed := j.State == StateFailed || j.State == StateTimeout
 	var title string
 	if event == evJobStart {
 		title = "job started: " + where
@@ -114,54 +136,46 @@ func (a *app) announceJob(event string, j Job) {
 	var message string
 	switch {
 	case event == evJobStart:
-		message = firstRunes(j.Prompt, 120)
-	case j.State == jobStateSucceeded:
-		message = firstRunes(result, 200)
+		message = util.FirstRunes(j.Prompt, 120)
+	case j.State == StateSucceeded:
+		message = util.FirstRunes(result, 200)
 		if j.CostUsd != nil {
 			message += fmt.Sprintf(" ($%.4f)", *j.CostUsd)
 		}
 	default:
-		message = firstRunes(result, 200)
+		message = util.FirstRunes(result, 200)
 	}
 	var alsoMatch []string
 	if failed {
 		alsoMatch = []string{evJobFailed}
 	}
-	a.emit(event, map[string]any{"job": j}, emitOpts{title: title, message: message, alsoMatch: alsoMatch})
+	m.bus.Emit(event, map[string]any{"job": j}, events.EmitOpts{Title: title, Message: message, AlsoMatch: alsoMatch})
 	if j.CallbackURL != nil && event == evJobExit {
-		a.deliverWebhook(*j.CallbackURL, LifecycleEvent{Event: event, At: nowISO(), Title: title, Message: message, Data: map[string]any{"job": j}})
+		m.bus.DeliverWebhook(*j.CallbackURL, events.LifecycleEvent{Event: event, At: util.NowISO(), Title: title, Message: message, Data: map[string]any{"job": j}})
 	}
 }
 
 // the journal doubles as a UI surface — a hash plus a preview, never full prompts
 func promptDigest(prompt string) (promptHash, promptPreview string) {
 	sum := sha256.Sum256([]byte(prompt))
-	return hex.EncodeToString(sum[:])[:12], firstRunes(prompt, 80)
+	return hex.EncodeToString(sum[:])[:12], util.FirstRunes(prompt, 80)
 }
 
-func firstRunes(s string, n int) string {
-	r := []rune(s)
-	if len(r) <= n {
-		return s
-	}
-	return string(r[:n])
-}
-
-func (a *app) listJobs() []Job {
-	a.jobsMu.Lock()
-	out := make([]Job, 0, len(a.jobs))
-	for _, j := range a.jobs {
+func (m *Manager) List() []Job {
+	m.mu.Lock()
+	out := make([]Job, 0, len(m.jobs))
+	for _, j := range m.jobs {
 		out = append(out, j.Job)
 	}
-	a.jobsMu.Unlock()
+	m.mu.Unlock()
 	sort.Slice(out, func(x, y int) bool { return out[x].CreatedAt > out[y].CreatedAt })
 	return out
 }
 
-func (a *app) getJob(id string) *Job {
-	a.jobsMu.Lock()
-	defer a.jobsMu.Unlock()
-	j, ok := a.jobs[id]
+func (m *Manager) Get(id string) *Job {
+	m.mu.Lock()
+	defer m.mu.Unlock()
+	j, ok := m.jobs[id]
 	if !ok {
 		return nil
 	}
@@ -169,10 +183,10 @@ func (a *app) getJob(id string) *Job {
 	return &snap
 }
 
-func (a *app) getJobLog(id string) *string {
-	a.jobsMu.Lock()
-	defer a.jobsMu.Unlock()
-	j, ok := a.jobs[id]
+func (m *Manager) GetLog(id string) *string {
+	m.mu.Lock()
+	defer m.mu.Unlock()
+	j, ok := m.jobs[id]
 	if !ok {
 		return nil
 	}
@@ -180,27 +194,27 @@ func (a *app) getJobLog(id string) *string {
 	return &joined
 }
 
-type createJobOpts struct {
-	folder, prompt, spawnMode, branch, permissionMode, callbackURL, actor string
-	timeoutMs                                                             int // <0 = absent, use default
+type CreateOpts struct {
+	Folder, Prompt, SpawnMode, Branch, PermissionMode, CallbackURL, Actor string
+	TimeoutMs                                                             int // <0 = absent, use default
 }
 
-func (a *app) createJob(opts createJobOpts) (Job, error) {
-	root := gitRoot(opts.folder)
+func (m *Manager) Create(opts CreateOpts) (Job, error) {
+	root := gitx.Root(opts.Folder)
 	// jobs default to a fresh worktree wherever git makes one possible;
 	// opts carries the raw request string — everything past here is typed
-	mode := spawnSameDir
-	if opts.spawnMode != string(spawnSameDir) && (opts.spawnMode == string(spawnWorktree) || root != "") {
-		mode = spawnWorktree
+	mode := workspace.SpawnSameDir
+	if opts.SpawnMode != string(workspace.SpawnSameDir) && (opts.SpawnMode == string(workspace.SpawnWorktree) || root != "") {
+		mode = workspace.SpawnWorktree
 	}
 	var branch *string
-	if mode == spawnWorktree {
+	if mode == workspace.SpawnWorktree {
 		if root == "" {
 			return Job{}, errors.New("worktree mode requires a folder inside a git repository")
 		}
-		b := opts.branch
+		b := opts.Branch
 		if b == "" {
-			b = currentBranch(root)
+			b = gitx.CurrentBranch(root)
 		}
 		if b == "" {
 			return Job{}, errors.New("no branch given and the repository is detached — pass branch explicitly")
@@ -208,99 +222,99 @@ func (a *app) createJob(opts createJobOpts) (Job, error) {
 		branch = &b
 	}
 
-	permissionMode := opts.permissionMode
+	permissionMode := opts.PermissionMode
 	if permissionMode == "" {
 		permissionMode = "acceptEdits"
 	}
-	a.jobsMu.Lock()
-	timeoutMs := opts.timeoutMs
+	m.mu.Lock()
+	timeoutMs := opts.TimeoutMs
 	if timeoutMs < 0 { // absent — an explicit 0 clamps to the 1s floor, like the TS
-		timeoutMs = a.jobDefaults.timeoutMs
+		timeoutMs = m.defaults.timeoutMs
 	}
 	timeoutMs = min(2*60*60*1000, max(1000, timeoutMs))
 
 	j := &liveJob{
 		Job: Job{
-			ID:             randomID(8),
-			Folder:         opts.folder,
-			Prompt:         opts.prompt,
+			ID:             util.RandomID(8),
+			Folder:         opts.Folder,
+			Prompt:         opts.Prompt,
 			SpawnMode:      mode,
 			Branch:         branch,
 			PermissionMode: permissionMode,
 			TimeoutMs:      timeoutMs,
-			CallbackURL:    strPtr(opts.callbackURL),
-			State:          jobStateQueued,
-			CreatedAt:      nowISO(),
+			CallbackURL:    util.StrPtr(opts.CallbackURL),
+			State:          StateQueued,
+			CreatedAt:      util.NowISO(),
 		},
-		actor: opts.actor,
+		actor: opts.Actor,
 	}
-	a.jobs[j.ID] = j
-	a.jobQueue = append(a.jobQueue, j.ID)
-	a.jobsMu.Unlock()
+	m.jobs[j.ID] = j
+	m.queue = append(m.queue, j.ID)
+	m.mu.Unlock()
 
 	promptHash, promptPreview := promptDigest(j.Prompt)
 	entry := map[string]any{"event": evJobQueued, "id": j.ID, "folder": j.Folder, "spawnMode": mode, "branch": branch, "promptHash": promptHash, "promptPreview": promptPreview}
-	if opts.actor != "" {
-		entry["actor"] = opts.actor
+	if opts.Actor != "" {
+		entry["actor"] = opts.Actor
 	}
-	a.journal(entry)
-	a.startNext()
+	m.journal.Append(entry)
+	m.startNext()
 
-	a.jobsMu.Lock()
+	m.mu.Lock()
 	snap := j.Job
-	a.jobsMu.Unlock()
+	m.mu.Unlock()
 	return snap, nil
 }
 
-// caller holds jobsMu; returns the jobs whose queue slot was just claimed —
+// caller holds mu; returns the jobs whose queue slot was just claimed —
 // the caller launches them after releasing the lock
-func (a *app) startNextLocked() []*liveJob {
+func (m *Manager) startNextLocked() []*liveJob {
 	var toStart []*liveJob
-	for a.jobsRunning < a.jobDefaults.concurrency && len(a.jobQueue) > 0 {
-		id := a.jobQueue[0]
-		a.jobQueue = a.jobQueue[1:]
-		j, ok := a.jobs[id]
-		if !ok || j.State != jobStateQueued {
+	for m.running < m.defaults.concurrency && len(m.queue) > 0 {
+		id := m.queue[0]
+		m.queue = m.queue[1:]
+		j, ok := m.jobs[id]
+		if !ok || j.State != StateQueued {
 			continue // canceled while queued
 		}
-		a.jobsRunning++
-		j.State = jobStateRunning
-		j.StartedAt = strPtr(nowISO())
+		m.running++
+		j.State = StateRunning
+		j.StartedAt = util.StrPtr(util.NowISO())
 		toStart = append(toStart, j)
 	}
 	return toStart
 }
 
-func (a *app) startNext() {
-	a.jobsMu.Lock()
-	toStart := a.startNextLocked()
-	a.jobsMu.Unlock()
+func (m *Manager) startNext() {
+	m.mu.Lock()
+	toStart := m.startNextLocked()
+	m.mu.Unlock()
 	for _, j := range toStart {
-		go a.startJob(j)
+		go m.startJob(j)
 	}
 }
 
-func (a *app) startJob(j *liveJob) {
+func (m *Manager) startJob(j *liveJob) {
 	cwd := j.Folder
-	var wt *worktreeInfo
+	var wt *workspace.Info
 	root := ""
-	if j.SpawnMode == spawnWorktree {
-		root = gitRoot(j.Folder)
-		w, err := a.addWorktree(root, *j.Branch, j.ID, j.Prompt)
+	if j.SpawnMode == workspace.SpawnWorktree {
+		root = gitx.Root(j.Folder)
+		w, err := m.ws.Add(root, *j.Branch, j.ID, j.Prompt)
 		if err != nil {
 			msg := err.Error()
-			a.finishJob(j, jobOutcome{state: jobStateFailed, result: &msg})
+			m.finishJob(j, jobOutcome{state: StateFailed, result: &msg})
 			return
 		}
 		wt = &w
-		a.jobsMu.Lock()
-		j.WorktreePath = strPtr(w.wtPath)
-		a.jobsMu.Unlock()
-		sub := w.wtPath
+		m.mu.Lock()
+		j.WorktreePath = util.StrPtr(w.Path)
+		m.mu.Unlock()
+		sub := w.Path
 		if rel, err := filepath.Rel(root, j.Folder); err == nil && rel != "" && rel != "." {
-			sub = filepath.Join(w.wtPath, rel)
+			sub = filepath.Join(w.Path, rel)
 		}
-		cwd = w.wtPath
+		cwd = w.Path
 		if _, err := os.Stat(sub); err == nil {
 			cwd = sub
 		}
@@ -311,11 +325,11 @@ func (a *app) startJob(j *liveJob) {
 	if j.actor != "" {
 		entry["actor"] = j.actor
 	}
-	a.journal(entry)
-	a.jobsMu.Lock()
+	m.journal.Append(entry)
+	m.mu.Lock()
 	snap := j.Job
-	a.jobsMu.Unlock()
-	a.announceJob(evJobStart, snap)
+	m.mu.Unlock()
+	m.announce(evJobStart, snap)
 
 	args := []string{"-p", j.Prompt, "--output-format", "json"}
 	if j.PermissionMode != "default" {
@@ -343,31 +357,31 @@ func (a *app) startJob(j *liveJob) {
 		// spawn failure (claude not on PATH, cwd vanished) — no exit follows
 		ec := 1
 		msg := startErr.Error()
-		a.finishJob(j, jobOutcome{state: jobStateFailed, exitCode: &ec, result: &msg, wt: wt, root: root})
+		m.finishJob(j, jobOutcome{state: StateFailed, exitCode: &ec, result: &msg, wt: wt, root: root})
 		return
 	}
 
-	a.jobsMu.Lock()
+	m.mu.Lock()
 	j.proc = cmd
 	j.timer = time.AfterFunc(time.Duration(j.TimeoutMs)*time.Millisecond, func() {
-		a.jobsMu.Lock()
+		m.mu.Lock()
 		j.timedOut = true
-		a.jobsMu.Unlock()
-		a.killTree(j, syscall.SIGKILL)
+		m.mu.Unlock()
+		m.killTree(j, syscall.SIGKILL)
 	})
 	canceledEarly := j.cancelRequested
-	a.jobsMu.Unlock()
+	m.mu.Unlock()
 	if canceledEarly {
 		// cancel landed while the worktree/spawn was still in flight — deliver the
 		// signals it had no process to hit, or the run would execute to completion
 		// while reporting "canceled"
-		a.killTree(j, syscall.SIGTERM)
+		m.killTree(j, syscall.SIGTERM)
 		time.AfterFunc(5*time.Second, func() {
-			a.jobsMu.Lock()
+			m.mu.Lock()
 			finished := j.FinishedAt != nil
-			a.jobsMu.Unlock()
+			m.mu.Unlock()
 			if !finished {
-				a.killTree(j, syscall.SIGKILL)
+				m.killTree(j, syscall.SIGKILL)
 			}
 		})
 	}
@@ -383,7 +397,7 @@ func (a *app) startJob(j *liveJob) {
 			if n > 0 {
 				s := string(b[:n])
 				buf.WriteString(s)
-				a.pushJobLog(j, s)
+				m.pushLog(j, s)
 			}
 			if err != nil {
 				return
@@ -409,32 +423,32 @@ func (a *app) startJob(j *liveJob) {
 		parsed = nil // killed mid-run or non-JSON failure — raw output stays in the log
 	}
 
-	a.jobsMu.Lock()
+	m.mu.Lock()
 	canceled := j.cancelRequested
 	timedOut := j.timedOut
-	a.jobsMu.Unlock()
+	m.mu.Unlock()
 
 	isError := false
 	if v, ok := parsed["is_error"].(bool); ok {
 		isError = v
 	}
-	state := jobStateFailed
+	state := StateFailed
 	switch {
 	case canceled:
-		state = jobStateCanceled
+		state = StateCanceled
 	case timedOut:
-		state = jobStateTimeout
+		state = StateTimeout
 	case exitCode == 0 && !isError:
-		state = jobStateSucceeded
+		state = StateSucceeded
 	}
 
 	var result *string
 	if v, ok := parsed["result"].(string); ok {
 		result = &v
-	} else if state == jobStateTimeout {
+	} else if state == StateTimeout {
 		msg := fmt.Sprintf("timed out after %dms", j.TimeoutMs)
 		result = &msg
-	} else if state == jobStateCanceled {
+	} else if state == StateCanceled {
 		msg := "canceled"
 		result = &msg
 	} else {
@@ -456,7 +470,7 @@ func (a *app) startJob(j *liveJob) {
 		n := int(v)
 		numTurns = &n
 	}
-	a.finishJob(j, jobOutcome{
+	m.finishJob(j, jobOutcome{
 		state:      state,
 		exitCode:   &exitCode,
 		result:     result,
@@ -468,9 +482,9 @@ func (a *app) startJob(j *liveJob) {
 	})
 }
 
-func (a *app) pushJobLog(j *liveJob, text string) {
-	a.jobsMu.Lock()
-	defer a.jobsMu.Unlock()
+func (m *Manager) pushLog(j *liveJob, text string) {
+	m.mu.Lock()
+	defer m.mu.Unlock()
 	j.log = append(j.log, text)
 	if len(j.log) > 400 {
 		j.log = j.log[len(j.log)-400:]
@@ -478,10 +492,10 @@ func (a *app) pushJobLog(j *liveJob, text string) {
 }
 
 // signal the whole process group (the Setpgid spawn made the job its leader)
-func (a *app) killTree(j *liveJob, sig syscall.Signal) {
-	a.jobsMu.Lock()
+func (m *Manager) killTree(j *liveJob, sig syscall.Signal) {
+	m.mu.Lock()
 	proc := j.proc
-	a.jobsMu.Unlock()
+	m.mu.Unlock()
 	if proc == nil || proc.Process == nil {
 		return
 	}
@@ -491,24 +505,24 @@ func (a *app) killTree(j *liveJob, sig syscall.Signal) {
 }
 
 type jobOutcome struct {
-	state      jobState
+	state      State
 	result     *string
 	exitCode   *int
 	costUsd    *float64
 	durationMs *int
 	numTurns   *int
-	wt         *worktreeInfo
+	wt         *workspace.Info
 	root       string
 }
 
-func (a *app) finishJob(j *liveJob, outcome jobOutcome) {
-	a.jobsMu.Lock()
+func (m *Manager) finishJob(j *liveJob, outcome jobOutcome) {
+	m.mu.Lock()
 	if j.FinishedAt != nil { // error + close can both fire — first outcome wins
-		a.jobsMu.Unlock()
+		m.mu.Unlock()
 		return
 	}
 	j.State = outcome.state
-	j.FinishedAt = strPtr(nowISO())
+	j.FinishedAt = util.StrPtr(util.NowISO())
 	if outcome.exitCode != nil {
 		j.ExitCode = outcome.exitCode
 	}
@@ -522,31 +536,31 @@ func (a *app) finishJob(j *liveJob, outcome jobOutcome) {
 	}
 	j.proc = nil
 	if outcome.wt != nil && outcome.root != "" {
-		a.removeWorktree(outcome.root, outcome.wt.wtPath, outcome.wt.wtBranch, outcome.wt.baseCommit)
+		m.ws.Remove(outcome.root, outcome.wt.Path, outcome.wt.Branch, outcome.wt.BaseCommit)
 	}
-	a.journal(map[string]any{"event": evJobExit, "id": j.ID, "state": j.State, "exitCode": j.ExitCode, "costUsd": j.CostUsd, "durationMs": j.DurationMs})
+	m.journal.Append(map[string]any{"event": evJobExit, "id": j.ID, "state": j.State, "exitCode": j.ExitCode, "costUsd": j.CostUsd, "durationMs": j.DurationMs})
 	snap := j.Job
-	a.jobsRunning = max(0, a.jobsRunning-1)
-	toStart := a.startNextLocked()
-	a.jobsMu.Unlock()
-	a.announceJob(evJobExit, snap)
+	m.running = max(0, m.running-1)
+	toStart := m.startNextLocked()
+	m.mu.Unlock()
+	m.announce(evJobExit, snap)
 	for _, next := range toStart {
-		go a.startJob(next)
+		go m.startJob(next)
 	}
 }
 
-func (a *app) cancelJob(id, actor string) *Job {
-	a.jobsMu.Lock()
-	j, ok := a.jobs[id]
+func (m *Manager) Cancel(id, actor string) *Job {
+	m.mu.Lock()
+	j, ok := m.jobs[id]
 	if !ok {
-		a.jobsMu.Unlock()
+		m.mu.Unlock()
 		return nil
 	}
 	switch j.State {
-	case jobStateQueued:
-		for i, qid := range a.jobQueue {
+	case StateQueued:
+		for i, qid := range m.queue {
 			if qid == id {
-				a.jobQueue = append(a.jobQueue[:i], a.jobQueue[i+1:]...)
+				m.queue = append(m.queue[:i], m.queue[i+1:]...)
 				break
 			}
 		}
@@ -555,48 +569,48 @@ func (a *app) cancelJob(id, actor string) *Job {
 		if actor != "" {
 			entry["actor"] = actor
 		}
-		a.journal(entry)
+		m.journal.Append(entry)
 		// finish() decrements the running counter it never claimed — compensate
-		a.jobsRunning++
-		a.jobsMu.Unlock()
+		m.running++
+		m.mu.Unlock()
 		msg := "canceled while queued"
-		a.finishJob(j, jobOutcome{state: jobStateCanceled, result: &msg})
-	case jobStateRunning:
+		m.finishJob(j, jobOutcome{state: StateCanceled, result: &msg})
+	case StateRunning:
 		j.cancelRequested = true
 		entry := map[string]any{"event": evJobCancel, "id": id}
 		if actor != "" {
 			entry["actor"] = actor
 		}
-		a.journal(entry)
-		a.jobsMu.Unlock()
-		a.killTree(j, syscall.SIGTERM)
+		m.journal.Append(entry)
+		m.mu.Unlock()
+		m.killTree(j, syscall.SIGTERM)
 		time.AfterFunc(5*time.Second, func() {
-			a.jobsMu.Lock()
+			m.mu.Lock()
 			finished := j.FinishedAt != nil
-			a.jobsMu.Unlock()
+			m.mu.Unlock()
 			if !finished {
-				a.killTree(j, syscall.SIGKILL)
+				m.killTree(j, syscall.SIGKILL)
 			}
 		})
 	default:
-		a.jobsMu.Unlock()
+		m.mu.Unlock()
 	}
-	a.jobsMu.Lock()
+	m.mu.Lock()
 	snap := j.Job
-	a.jobsMu.Unlock()
+	m.mu.Unlock()
 	return &snap // terminal states: cancel is a no-op, not an error
 }
 
-func (a *app) removeJob(id string) (bool, error) {
-	a.jobsMu.Lock()
-	defer a.jobsMu.Unlock()
-	j, ok := a.jobs[id]
+func (m *Manager) Remove(id string) (bool, error) {
+	m.mu.Lock()
+	defer m.mu.Unlock()
+	j, ok := m.jobs[id]
 	if !ok {
 		return false, nil
 	}
-	if j.State == jobStateQueued || j.State == jobStateRunning {
+	if j.State == StateQueued || j.State == StateRunning {
 		return false, errors.New("job is still live; cancel it first")
 	}
-	delete(a.jobs, id)
+	delete(m.jobs, id)
 	return true, nil
 }

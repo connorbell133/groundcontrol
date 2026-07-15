@@ -105,7 +105,11 @@ function crumbParts(path) {
     acc += "/" + seg;
     parts.push({ label: seg, path: acc });
   }
-  return parts.slice(-4); // keep the tail readable on phones
+  if (parts.length <= 4) return parts;
+  // keep the tail readable on phones, but never drop the way back to roots:
+  // pin the root crumb and collapse hidden ancestors into a tappable ellipsis
+  const hiddenParent = parts[parts.length - 4];
+  return [parts[0], { label: "…", path: hiddenParent.path }, ...parts.slice(-3)];
 }
 
 function renderBrowse() {

@@ -104,7 +104,7 @@ curl -fsSL https://raw.githubusercontent.com/connorbell133/groundcontrol/main/in
 Or by hand:
 
 ```bash
-go install github.com/connorbell133/groundcontrol@latest
+go install github.com/connorbell133/groundcontrol/cmd/groundcontrol@latest
 ```
 
 or build from a clone:
@@ -112,7 +112,7 @@ or build from a clone:
 ```bash
 git clone https://github.com/connorbell133/groundcontrol.git
 cd groundcontrol
-go build -o groundcontrol .
+go build -o groundcontrol ./cmd/groundcontrol
 ```
 
 Copy [`config.example.json`](config.example.json) to `config.json` in the directory you'll run from, then edit it: set `roots` to the folders you want browsable, and give `authToken` a value (`openssl rand -hex 16` makes a good one). Then:
@@ -192,11 +192,11 @@ Everything the app does is a bearer-token HTTP API at `/api/v1` — the PWA is j
 ## Development
 
 ```bash
-go run .             # build and run from source
+go run ./cmd/groundcontrol   # build and run from source
 go vet ./...         # static checks
 ```
 
-`public/` is embedded into the binary with `go:embed`, so frontend edits need a rebuild — stop and re-run `go run .` to see them.
+`public/` is embedded into the binary with `go:embed`, so frontend edits need a rebuild — stop and re-run `go run ./cmd/groundcontrol` to see them.
 
 Wire up the repo's pre-commit hook with `git config core.hooksPath .githooks`; it refuses to commit:
 

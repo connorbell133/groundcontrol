@@ -1,16 +1,99 @@
-package main
+package api
 
 import (
 	"encoding/json"
 	"encoding/xml"
 	"fmt"
 	"io"
+	"net/http"
 	"net/http/httptest"
 	"os"
 	"path/filepath"
 	"strings"
 	"testing"
+
+	"github.com/connorbell133/groundcontrol/internal/browse"
+	"github.com/connorbell133/groundcontrol/internal/config"
+	"github.com/connorbell133/groundcontrol/internal/events"
+	"github.com/connorbell133/groundcontrol/internal/jobs"
+	"github.com/connorbell133/groundcontrol/internal/journal"
+	"github.com/connorbell133/groundcontrol/internal/sessions"
+	"github.com/connorbell133/groundcontrol/internal/testutil"
+	"github.com/connorbell133/groundcontrol/internal/workspace"
 )
+
+// testEnv is the full wiring main() builds, on temp dirs, plus the handles the
+// tests poke at directly.
+type testEnv struct {
+	handler    http.Handler
+	configPath string
+	journal    *journal.Journal
+	browser    *browse.Browser
+	sessions   *sessions.Manager
+	jobs       *jobs.Manager
+}
+
+// newTestEnv builds an isolated instance wired the way main() wires it.
+func newTestEnv(t *testing.T, cfg config.Config) *testEnv {
+	t.Helper()
+	if cfg.Roots == nil {
+		cfg.Roots = []string{testutil.ResolvedTempDir(t)}
+	}
+	jnl := journal.New(t.TempDir())
+	bus := events.NewBus(jnl)
+	browser := browse.New()
+	ws := workspace.New(t.TempDir(), jnl)
+	sessionMgr := sessions.NewManager(jnl, bus, ws, browser)
+	jobMgr := jobs.NewManager(jnl, bus, ws)
+	browser.Configure(cfg.Roots, cfg.ShowHidden)
+	bus.ConfigureWebhooks(cfg.Webhooks)
+	if cfg.Jobs != nil {
+		jobMgr.Configure(cfg.Jobs.Concurrency, cfg.Jobs.TimeoutMs)
+	}
+	configPath := filepath.Join(t.TempDir(), "config.json")
+	srv := NewServer(configPath, cfg, browser, bus, ws, sessionMgr, jobMgr)
+	return &testEnv{
+		handler:    srv.Handler(),
+		configPath: configPath,
+		journal:    jnl,
+		browser:    browser,
+		sessions:   sessionMgr,
+		jobs:       jobMgr,
+	}
+}
+
+func doReq(t *testing.T, h http.Handler, method, target, body string, header map[string]string) *httptest.ResponseRecorder {
+	t.Helper()
+	var r io.Reader
+	if body != "" {
+		r = strings.NewReader(body)
+	}
+	req := httptest.NewRequest(method, target, r)
+	for k, v := range header {
+		req.Header.Set(k, v)
+	}
+	rec := httptest.NewRecorder()
+	h.ServeHTTP(rec, req)
+	return rec
+}
+
+// errCode decodes the standard error envelope and asserts its shape.
+func errCode(t *testing.T, rec *httptest.ResponseRecorder) string {
+	t.Helper()
+	var e struct {
+		Error struct {
+			Code    string `json:"code"`
+			Message string `json:"message"`
+		} `json:"error"`
+	}
+	if err := json.Unmarshal(rec.Body.Bytes(), &e); err != nil {
+		t.Fatalf("error body is not JSON: %v (%s)", err, rec.Body.String())
+	}
+	if e.Error.Code == "" || e.Error.Message == "" {
+		t.Fatalf("error body missing code or message: %s", rec.Body.String())
+	}
+	return e.Error.Code
+}
 
 func TestScopeSet(t *testing.T) {
 	t.Parallel()
@@ -60,8 +143,8 @@ func TestQRSVG(t *testing.T) {
 
 func TestAuthAnonymous(t *testing.T) {
 	t.Parallel()
-	a := testApp(t, Config{})
-	h := a.createAPI()
+	env := newTestEnv(t, config.Config{})
+	h := env.handler
 
 	// no tokens configured: anonymous gets every scope
 	if rec := doReq(t, h, "GET", "/sessions", "", nil); rec.Code != 200 {
@@ -77,8 +160,8 @@ func TestAuthAnonymous(t *testing.T) {
 
 func TestAuthToken(t *testing.T) {
 	t.Parallel()
-	a := testApp(t, Config{AuthToken: "sekret"})
-	h := a.createAPI()
+	env := newTestEnv(t, config.Config{AuthToken: "sekret"})
+	h := env.handler
 
 	cases := []struct {
 		name   string
@@ -107,14 +190,14 @@ func TestAuthToken(t *testing.T) {
 
 func TestScopedTokens(t *testing.T) {
 	t.Parallel()
-	a := testApp(t, Config{
+	env := newTestEnv(t, config.Config{
 		AuthToken: "owner-token",
-		Tokens: []TokenConfig{
+		Tokens: []config.TokenConfig{
 			{Name: "reader", Token: "tok-read", Scopes: []string{"read", "bogus-scope"}}, // unknown scope filtered
 			{Name: "runner", Token: "tok-launch", Scopes: []string{"read", "launch"}},
 		},
 	})
-	h := a.createAPI()
+	h := env.handler
 	read := map[string]string{"Authorization": "Bearer tok-read"}
 	launch := map[string]string{"Authorization": "Bearer tok-launch"}
 	owner := map[string]string{"Authorization": "Bearer owner-token"}
@@ -152,9 +235,9 @@ func TestScopedTokens(t *testing.T) {
 
 func TestPostSessionsValidation(t *testing.T) {
 	t.Parallel()
-	root := resolvedTempDir(t)
-	a := testApp(t, Config{Roots: []string{root}})
-	h := a.createAPI()
+	root := testutil.ResolvedTempDir(t)
+	env := newTestEnv(t, config.Config{Roots: []string{root}})
+	h := env.handler
 
 	cases := []struct {
 		name     string
@@ -170,7 +253,7 @@ func TestPostSessionsValidation(t *testing.T) {
 		{"folder outside roots", `{"folder":"/definitely/not/in/roots"}`, 400, "outside_roots"},
 		{"bad callbackUrl", fmt.Sprintf(`{"folder":%q,"callbackUrl":"not-a-url"}`, root), 400, "invalid_param"},
 		{"empty callbackUrl still validated", fmt.Sprintf(`{"folder":%q,"callbackUrl":""}`, root), 400, "invalid_param"},
-		// fails inside createSession before any spawn: worktree mode needs a branch
+		// fails inside Create before any spawn: worktree mode needs a branch
 		{"worktree without branch", fmt.Sprintf(`{"folder":%q,"spawnMode":"worktree"}`, root), 409, "launch_failed"},
 	}
 	for _, tc := range cases {
@@ -184,16 +267,16 @@ func TestPostSessionsValidation(t *testing.T) {
 			}
 		})
 	}
-	if sessions := a.listSessions(); len(sessions) != 0 {
-		t.Errorf("validation failures must not create sessions: %+v", sessions)
+	if list := env.sessions.List(); len(list) != 0 {
+		t.Errorf("validation failures must not create sessions: %+v", list)
 	}
 }
 
 func TestPostJobsValidation(t *testing.T) {
 	t.Parallel()
-	root := resolvedTempDir(t)
-	a := testApp(t, Config{Roots: []string{root}})
-	h := a.createAPI()
+	root := testutil.ResolvedTempDir(t)
+	env := newTestEnv(t, config.Config{Roots: []string{root}})
+	h := env.handler
 
 	cases := []struct {
 		name     string
@@ -209,7 +292,7 @@ func TestPostJobsValidation(t *testing.T) {
 		{"isolation true", fmt.Sprintf(`{"folder":%q,"prompt":"x","isolation":true}`, root), 501, "not_implemented"},
 		{"docker true", fmt.Sprintf(`{"folder":%q,"prompt":"x","docker":true}`, root), 501, "not_implemented"},
 		{"isolation non-bool", fmt.Sprintf(`{"folder":%q,"prompt":"x","isolation":"yes"}`, root), 400, "invalid_param"},
-		// fails inside createJob before any spawn: worktree mode needs a repo
+		// fails inside Create before any spawn: worktree mode needs a repo
 		{"worktree in non-repo", fmt.Sprintf(`{"folder":%q,"prompt":"x","spawnMode":"worktree"}`, root), 409, "launch_failed"},
 	}
 	for _, tc := range cases {
@@ -223,15 +306,15 @@ func TestPostJobsValidation(t *testing.T) {
 			}
 		})
 	}
-	if jobs := a.listJobs(); len(jobs) != 0 {
-		t.Errorf("validation failures must not create jobs: %+v", jobs)
+	if list := env.jobs.List(); len(list) != 0 {
+		t.Errorf("validation failures must not create jobs: %+v", list)
 	}
 }
 
 func TestPutConfigValidation(t *testing.T) {
 	t.Parallel()
-	a := testApp(t, Config{})
-	h := a.createAPI()
+	env := newTestEnv(t, config.Config{})
+	h := env.handler
 
 	cases := []struct {
 		name    string
@@ -265,10 +348,10 @@ func TestPutConfigValidation(t *testing.T) {
 
 func TestPutConfigPersists(t *testing.T) {
 	t.Parallel()
-	oldRoot := resolvedTempDir(t)
-	newRoot := resolvedTempDir(t)
-	a := testApp(t, Config{Roots: []string{oldRoot}})
-	h := a.createAPI()
+	oldRoot := testutil.ResolvedTempDir(t)
+	newRoot := testutil.ResolvedTempDir(t)
+	env := newTestEnv(t, config.Config{Roots: []string{oldRoot}})
+	h := env.handler
 
 	body := fmt.Sprintf(`{"roots":[%q],"showHidden":true,"webhooks":[{"url":"http://example.com/hook","events":["job.*"]}]}`, newRoot)
 	if rec := doReq(t, h, "PUT", "/config", body, nil); rec.Code != 200 {
@@ -276,11 +359,11 @@ func TestPutConfigPersists(t *testing.T) {
 	}
 
 	// persisted to disk
-	raw, err := os.ReadFile(a.configPath)
+	raw, err := os.ReadFile(env.configPath)
 	if err != nil {
 		t.Fatalf("config file not written: %v", err)
 	}
-	var onDisk Config
+	var onDisk config.Config
 	if err := json.Unmarshal(raw, &onDisk); err != nil {
 		t.Fatalf("config file not JSON: %v", err)
 	}
@@ -291,9 +374,9 @@ func TestPutConfigPersists(t *testing.T) {
 	// reflected by GET /config
 	rec := doReq(t, h, "GET", "/config", "", nil)
 	var got struct {
-		Roots      []string        `json:"roots"`
-		ShowHidden bool            `json:"showHidden"`
-		Webhooks   []WebhookConfig `json:"webhooks"`
+		Roots      []string               `json:"roots"`
+		ShowHidden bool                   `json:"showHidden"`
+		Webhooks   []events.WebhookConfig `json:"webhooks"`
 	}
 	if err := json.Unmarshal(rec.Body.Bytes(), &got); err != nil {
 		t.Fatal(err)
@@ -306,16 +389,16 @@ func TestPutConfigPersists(t *testing.T) {
 	}
 
 	// the browser was reconfigured live
-	if !a.withinRoots(newRoot) || a.withinRoots(oldRoot) {
+	if !env.browser.WithinRoots(newRoot) || env.browser.WithinRoots(oldRoot) {
 		t.Error("PUT /config did not re-apply the roots to the browser")
 	}
 }
 
 func TestJournalRecentEndpoint(t *testing.T) {
 	t.Parallel()
-	root := resolvedTempDir(t)
-	a := testApp(t, Config{Roots: []string{root}})
-	h := a.createAPI()
+	root := testutil.ResolvedTempDir(t)
+	env := newTestEnv(t, config.Config{Roots: []string{root}})
+	h := env.handler
 
 	folders := make([]string, 7)
 	for i := range folders {
@@ -323,18 +406,18 @@ func TestJournalRecentEndpoint(t *testing.T) {
 		if err := os.MkdirAll(folders[i], 0o755); err != nil {
 			t.Fatal(err)
 		}
-		a.journal(map[string]any{"event": evSessionStart, "id": fmt.Sprintf("s%d", i), "name": fmt.Sprintf("n%d", i), "folder": folders[i]})
+		env.journal.Append(map[string]any{"event": "session.start", "id": fmt.Sprintf("s%d", i), "name": fmt.Sprintf("n%d", i), "folder": folders[i]})
 	}
 	// duplicate launch config: deduped, newest occurrence wins
-	a.journal(map[string]any{"event": evSessionStart, "id": "s3b", "name": "n3b", "folder": folders[3]})
+	env.journal.Append(map[string]any{"event": "session.start", "id": "s3b", "name": "n3b", "folder": folders[3]})
 
-	decode := func(rec *httptest.ResponseRecorder) []RecentLaunch {
+	decode := func(rec *httptest.ResponseRecorder) []sessions.RecentLaunch {
 		t.Helper()
 		if rec.Code != 200 {
 			t.Fatalf("status = %d: %s", rec.Code, rec.Body.String())
 		}
 		var out struct {
-			Recent []RecentLaunch `json:"recent"`
+			Recent []sessions.RecentLaunch `json:"recent"`
 		}
 		if err := json.Unmarshal(rec.Body.Bytes(), &out); err != nil {
 			t.Fatal(err)
@@ -349,7 +432,7 @@ func TestJournalRecentEndpoint(t *testing.T) {
 	if recent[0].Folder != folders[3] {
 		t.Errorf("newest first: recent[0].Folder = %q, want %q", recent[0].Folder, folders[3])
 	}
-	if recent[0].SpawnMode != string(spawnSameDir) || recent[0].PermissionMode != "default" {
+	if recent[0].SpawnMode != string(workspace.SpawnSameDir) || recent[0].PermissionMode != "default" {
 		t.Errorf("defaults not applied: %+v", recent[0])
 	}
 
@@ -376,9 +459,9 @@ func TestJournalRecentEndpoint(t *testing.T) {
 
 func TestEmptyListsMarshalAsArrays(t *testing.T) {
 	t.Parallel()
-	root := resolvedTempDir(t)
-	a := testApp(t, Config{Roots: []string{root}})
-	h := a.createAPI()
+	root := testutil.ResolvedTempDir(t)
+	env := newTestEnv(t, config.Config{Roots: []string{root}})
+	h := env.handler
 
 	cases := []struct {
 		target string
@@ -412,8 +495,8 @@ func TestEmptyListsMarshalAsArrays(t *testing.T) {
 
 func TestNotFoundAndParamErrors(t *testing.T) {
 	t.Parallel()
-	a := testApp(t, Config{})
-	h := a.createAPI()
+	env := newTestEnv(t, config.Config{})
+	h := env.handler
 
 	notFound := []struct{ method, target string }{
 		{"GET", "/sessions/nope"},

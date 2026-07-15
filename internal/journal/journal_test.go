@@ -1,20 +1,19 @@
-package main
+package journal
 
 import (
 	"fmt"
 	"os"
-	"path/filepath"
 	"strings"
 	"testing"
 )
 
 func TestJournalRoundTrip(t *testing.T) {
 	t.Parallel()
-	a := testApp(t, Config{})
-	a.journal(map[string]any{"event": "first", "n": float64(1)})
-	a.journal(map[string]any{"event": "second"})
+	j := New(t.TempDir())
+	j.Append(map[string]any{"event": "first", "n": float64(1)})
+	j.Append(map[string]any{"event": "second"})
 
-	got := a.readJournal()
+	got := j.Read()
 	if len(got) != 2 {
 		t.Fatalf("expected 2 entries, got %d", len(got))
 	}
@@ -33,7 +32,7 @@ func TestJournalRoundTrip(t *testing.T) {
 
 func TestJournalSkipsGarbageLines(t *testing.T) {
 	t.Parallel()
-	a := testApp(t, Config{})
+	j := New(t.TempDir())
 	content := strings.Join([]string{
 		`{"event":"a"}`,
 		`{"torn":`, // crash mid-write
@@ -44,10 +43,10 @@ func TestJournalSkipsGarbageLines(t *testing.T) {
 		`   `,
 		`{"event":"b"}`,
 	}, "\n") + "\n"
-	if err := os.WriteFile(a.journalPath(), []byte(content), 0o644); err != nil {
+	if err := os.WriteFile(j.path(), []byte(content), 0o644); err != nil {
 		t.Fatal(err)
 	}
-	got := a.readJournal()
+	got := j.Read()
 	if len(got) != 2 || got[0]["event"] != "a" || got[1]["event"] != "b" {
 		t.Errorf("expected the two object lines to survive, got %v", got)
 	}
@@ -55,15 +54,15 @@ func TestJournalSkipsGarbageLines(t *testing.T) {
 
 func TestJournalReadCap(t *testing.T) {
 	t.Parallel()
-	a := testApp(t, Config{})
+	j := New(t.TempDir())
 	var b strings.Builder
 	for i := 0; i < 2100; i++ {
 		fmt.Fprintf(&b, "{\"i\":%d}\n", i)
 	}
-	if err := os.WriteFile(a.journalPath(), []byte(b.String()), 0o644); err != nil {
+	if err := os.WriteFile(j.path(), []byte(b.String()), 0o644); err != nil {
 		t.Fatal(err)
 	}
-	got := a.readJournal()
+	got := j.Read()
 	if len(got) != 2000 {
 		t.Fatalf("expected the 2000-entry cap, got %d", len(got))
 	}
@@ -74,29 +73,29 @@ func TestJournalReadCap(t *testing.T) {
 
 func TestJournalLegacyMigration(t *testing.T) {
 	t.Parallel()
-	a := testApp(t, Config{})
+	j := New(t.TempDir())
 	legacy := `[{"event":"a"},"stray string",{"event":"b"}]`
-	if err := os.WriteFile(a.legacyJournalPath(), []byte(legacy), 0o644); err != nil {
+	if err := os.WriteFile(j.legacyPath(), []byte(legacy), 0o644); err != nil {
 		t.Fatal(err)
 	}
 
-	got := a.readJournal()
+	got := j.Read()
 	if len(got) != 2 || got[0]["event"] != "a" || got[1]["event"] != "b" {
 		t.Fatalf("migrated entries wrong: %v", got)
 	}
-	if _, err := os.Stat(a.journalPath()); err != nil {
+	if _, err := os.Stat(j.path()); err != nil {
 		t.Errorf("journal.jsonl not created: %v", err)
 	}
-	if _, err := os.Stat(a.legacyJournalPath() + ".bak"); err != nil {
+	if _, err := os.Stat(j.legacyPath() + ".bak"); err != nil {
 		t.Errorf("legacy file not renamed to .bak: %v", err)
 	}
-	if _, err := os.Stat(a.legacyJournalPath()); !os.IsNotExist(err) {
+	if _, err := os.Stat(j.legacyPath()); !os.IsNotExist(err) {
 		t.Errorf("legacy journal.json should be gone, stat err = %v", err)
 	}
 
 	// appends keep working after migration
-	a.journal(map[string]any{"event": "c"})
-	got = a.readJournal()
+	j.Append(map[string]any{"event": "c"})
+	got = j.Read()
 	if len(got) != 3 || got[2]["event"] != "c" {
 		t.Errorf("append after migration failed: %v", got)
 	}
@@ -104,18 +103,18 @@ func TestJournalLegacyMigration(t *testing.T) {
 
 func TestJournalMigrationSkippedWhenJSONLExists(t *testing.T) {
 	t.Parallel()
-	a := testApp(t, Config{})
-	if err := os.WriteFile(a.journalPath(), []byte(`{"event":"new"}`+"\n"), 0o644); err != nil {
+	j := New(t.TempDir())
+	if err := os.WriteFile(j.path(), []byte(`{"event":"new"}`+"\n"), 0o644); err != nil {
 		t.Fatal(err)
 	}
-	if err := os.WriteFile(a.legacyJournalPath(), []byte(`[{"event":"old"}]`), 0o644); err != nil {
+	if err := os.WriteFile(j.legacyPath(), []byte(`[{"event":"old"}]`), 0o644); err != nil {
 		t.Fatal(err)
 	}
-	got := a.readJournal()
+	got := j.Read()
 	if len(got) != 1 || got[0]["event"] != "new" {
 		t.Errorf("existing JSONL must win over the legacy file: %v", got)
 	}
-	if _, err := os.Stat(filepath.Join(a.dataDir, "journal.json")); err != nil {
+	if _, err := os.Stat(j.legacyPath()); err != nil {
 		t.Errorf("legacy file should be left untouched: %v", err)
 	}
 }

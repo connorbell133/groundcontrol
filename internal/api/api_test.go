@@ -268,6 +268,8 @@ func TestPostSessionsValidation(t *testing.T) {
 		{"folder outside roots", `{"folder":"/definitely/not/in/roots"}`, 400, "outside_roots"},
 		{"bad callbackUrl", fmt.Sprintf(`{"folder":%q,"callbackUrl":"not-a-url"}`, root), 400, "invalid_param"},
 		{"empty callbackUrl still validated", fmt.Sprintf(`{"folder":%q,"callbackUrl":""}`, root), 400, "invalid_param"},
+		{"unknown permissionMode", fmt.Sprintf(`{"folder":%q,"permissionMode":"yolo"}`, root), 400, "invalid_param"},
+		{"wrong-typed capacity", fmt.Sprintf(`{"folder":%q,"capacity":"lots"}`, root), 400, "invalid_param"},
 		// fails inside Create before any spawn: worktree mode needs a branch
 		{"worktree without branch", fmt.Sprintf(`{"folder":%q,"spawnMode":"worktree"}`, root), 409, "launch_failed"},
 	}
@@ -335,6 +337,130 @@ func waitForExitEntry(t *testing.T, env *testEnv, id string) map[string]any {
 	}
 	t.Fatalf("no session.exit journal entry for %s", id)
 	return nil
+}
+
+// startEntry finds the session.start journal entry for id — Create writes it
+// synchronously, so no polling is needed.
+func startEntry(t *testing.T, env *testEnv, id string) map[string]any {
+	t.Helper()
+	for _, e := range env.journal.Read() {
+		if e["event"] == "session.start" && e["id"] == id {
+			return e
+		}
+	}
+	t.Fatalf("no session.start journal entry for %s", id)
+	return nil
+}
+
+func TestPostSessionsPermissionModes(t *testing.T) {
+	testutil.FakeClaude(t)
+	root := testutil.ResolvedTempDir(t)
+	env := newTestEnv(t, config.Config{Roots: []string{root}})
+
+	for _, mode := range []string{"default", "acceptEdits", "plan", "auto", "dontAsk", "bypassPermissions"} {
+		created := createSession(t, env, fmt.Sprintf(`{"folder":%q,"name":"pm-%s","permissionMode":%q}`, root, mode, mode))
+		if created.PermissionMode != mode {
+			t.Errorf("%s: session permissionMode = %q", mode, created.PermissionMode)
+		}
+		// the journal entry records the mode that reached the spawn args
+		if got := startEntry(t, env, created.ID)["permissionMode"]; got != mode {
+			t.Errorf("%s: journaled permissionMode = %v", mode, got)
+		}
+	}
+}
+
+func TestPostSessionsCapacity(t *testing.T) {
+	testutil.FakeClaude(t)
+	root := testutil.ResolvedTempDir(t)
+	env := newTestEnv(t, config.Config{Roots: []string{root}})
+
+	cases := []struct {
+		name string
+		body string
+		want int  // capacity on the wire
+		flag bool // --capacity spawned — the journal entry mirrors the args
+	}{
+		{"absent defaults", fmt.Sprintf(`{"folder":%q,"name":"cap-absent"}`, root), 32, false},
+		{"zero defaults", fmt.Sprintf(`{"folder":%q,"name":"cap-zero","capacity":0}`, root), 32, false},
+		{"explicit default omits the flag", fmt.Sprintf(`{"folder":%q,"name":"cap-default","capacity":32}`, root), 32, false},
+		{"non-default passes through", fmt.Sprintf(`{"folder":%q,"name":"cap-four","capacity":4}`, root), 4, true},
+		{"oversized clamps", fmt.Sprintf(`{"folder":%q,"name":"cap-big","capacity":500}`, root), 256, true},
+	}
+	for _, tc := range cases {
+		t.Run(tc.name, func(t *testing.T) {
+			created := createSession(t, env, tc.body)
+			if created.Capacity != tc.want {
+				t.Errorf("session capacity = %d, want %d", created.Capacity, tc.want)
+			}
+			got, journaled := startEntry(t, env, created.ID)["capacity"]
+			if journaled != tc.flag {
+				t.Errorf("capacity journaled = %v, want %v", journaled, tc.flag)
+			}
+			if tc.flag && got != float64(tc.want) {
+				t.Errorf("journaled capacity = %v, want %d", got, tc.want)
+			}
+		})
+	}
+
+	// a default launch shows the resolved capacity on GET /sessions too
+	rec := doReq(t, env.handler, "GET", "/sessions", "", nil)
+	if rec.Code != 200 {
+		t.Fatalf("GET /sessions = %d", rec.Code)
+	}
+	var listed struct {
+		Sessions []sessions.Session `json:"sessions"`
+	}
+	if err := json.Unmarshal(rec.Body.Bytes(), &listed); err != nil {
+		t.Fatalf("sessions body not JSON: %v", err)
+	}
+	found := false
+	for _, s := range listed.Sessions {
+		if s.Name == "cap-absent" {
+			found = true
+			if s.Capacity != 32 {
+				t.Errorf("listed capacity = %d, want 32", s.Capacity)
+			}
+		}
+	}
+	if !found {
+		t.Error("cap-absent session missing from GET /sessions")
+	}
+}
+
+// A recent journaled before capacity existed replays cleanly: the recents
+// view defaults capacity to 32, and re-POSTing it spawns no --capacity.
+func TestPostSessionsPreCapacityRelaunch(t *testing.T) {
+	testutil.FakeClaude(t)
+	root := testutil.ResolvedTempDir(t)
+	env := newTestEnv(t, config.Config{Roots: []string{root}})
+
+	// a pre-capacity session.start entry: no capacity or presetName keys at all
+	env.journal.Append(map[string]any{"event": "session.start", "id": "old1", "name": "old", "folder": root, "permissionMode": "acceptEdits"})
+
+	rec := doReq(t, env.handler, "GET", "/journal/recent", "", nil)
+	if rec.Code != 200 {
+		t.Fatalf("GET /journal/recent = %d", rec.Code)
+	}
+	var recents struct {
+		Recent []sessions.RecentLaunch `json:"recent"`
+	}
+	if err := json.Unmarshal(rec.Body.Bytes(), &recents); err != nil {
+		t.Fatalf("recent body not JSON: %v", err)
+	}
+	if len(recents.Recent) != 1 || recents.Recent[0].Capacity != 32 || recents.Recent[0].PresetName != "" {
+		t.Fatalf("pre-capacity recent did not default cleanly: %+v", recents.Recent)
+	}
+
+	// relaunch exactly what the recent carries
+	r0 := recents.Recent[0]
+	created := createSession(t, env, fmt.Sprintf(`{"folder":%q,"name":"relaunch","spawnMode":%q,"permissionMode":%q,"capacity":%d}`,
+		r0.Folder, r0.SpawnMode, r0.PermissionMode, r0.Capacity))
+	if created.Capacity != 32 {
+		t.Errorf("relaunch capacity = %d, want 32", created.Capacity)
+	}
+	if _, ok := startEntry(t, env, created.ID)["capacity"]; ok {
+		t.Error("default-capacity relaunch journaled a capacity (would spawn --capacity)")
+	}
 }
 
 // createWorktreeSession launches a fake-claude worktree session off main and

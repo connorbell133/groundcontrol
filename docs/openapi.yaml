@@ -96,7 +96,7 @@ components:
 
     Session:
       type: object
-      required: [id, name, folder, spawnMode, branch, worktreePath, permissionMode, state, pairingUrl, callbackUrl, startedAt, exitedAt, exitCode, lastOutputAt, lastLine]
+      required: [id, name, folder, spawnMode, branch, worktreePath, permissionMode, capacity, state, pairingUrl, callbackUrl, startedAt, exitedAt, exitCode, lastOutputAt, lastLine]
       properties:
         id: { type: string, description: 8-char launch id }
         name: { type: string }
@@ -104,7 +104,13 @@ components:
         spawnMode: { type: string, enum: [same-dir, worktree] }
         branch: { type: [string, "null"] }
         worktreePath: { type: [string, "null"] }
-        permissionMode: { type: string, description: "claude permission mode: default, acceptEdits, plan, bypassPermissions" }
+        permissionMode: { type: string, description: "claude permission mode: default, acceptEdits, plan, auto, dontAsk, bypassPermissions" }
+        capacity:
+          type: integer
+          description: >
+            Resolved --capacity: how many sessions claude.ai can create in
+            this environment. Always present — 32 (the CLI default) when the
+            launch didn't ask.
         state:
           type: string
           enum: [starting, ready, exited, error]
@@ -241,7 +247,27 @@ components:
           description: >
             Required in worktree mode (base for the private gc/<id> branch).
             In same-dir mode, switches the checkout first; refused if dirty.
-        permissionMode: { type: string, default: default }
+        permissionMode:
+          type: string
+          enum: [default, acceptEdits, plan, auto, dontAsk, bypassPermissions]
+          default: default
+          description: >
+            Unknown values are a 400 invalid_param. dontAsk and
+            bypassPermissions skip Claude Code's confirmation prompts
+            entirely — a launch-scoped token grants that power.
+        capacity:
+          type: integer
+          default: 32
+          description: >
+            Max sessions claude.ai can create in this environment
+            (--capacity). Normalized, never rejected: absent or < 1 falls
+            back to 32 (the CLI default), values above 256 clamp to 256.
+            Passed to claude only when it differs from the default.
+        presetName:
+          type: string
+          description: >
+            Launch preset this request came from; recorded in the journal so
+            recents and relaunch can re-resolve it.
         callbackUrl: { type: string, description: "http(s) URL — every lifecycle event for this launch except session.start is POSTed to it." }
         timeoutMs: { type: integer, default: 60000, minimum: 1000, maximum: 300000, description: "Only meaningful with ?wait=ready." }
 
@@ -351,13 +377,15 @@ components:
 
     RecentLaunch:
       type: object
-      required: [folder, name, branch, spawnMode, permissionMode, at, stale]
+      required: [folder, name, branch, spawnMode, permissionMode, capacity, at, stale]
       properties:
         folder: { type: string }
         name: { type: string }
         branch: { type: [string, "null"] }
         spawnMode: { type: string }
         permissionMode: { type: string }
+        capacity: { type: integer, description: "Defaults to 32 for entries journaled before capacity existed." }
+        presetName: { type: string, description: Absent when the launch didn't come from a preset. }
         at: { type: string, format: date-time }
         stale: { type: boolean, description: The launch's branch no longer exists. }
 

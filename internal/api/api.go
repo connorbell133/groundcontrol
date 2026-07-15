@@ -305,10 +305,24 @@ type createSessionRequest struct {
 	SpawnMode      string `json:"spawnMode"`
 	Branch         string `json:"branch"`
 	PermissionMode string `json:"permissionMode"`
+	Capacity       int    `json:"capacity"`   // 0/absent → CLI default; normalized in Create, never rejected
+	PresetName     string `json:"presetName"` // journaled launch fact, so recents/relaunch can re-resolve it
 	// pointers so "sent but empty/zero" still fails validation while "absent"
 	// falls back cleanly
 	CallbackURL *string  `json:"callbackUrl"`
 	TimeoutMs   *float64 `json:"timeoutMs"` // only meaningful with ?wait=ready
+}
+
+// permissionModes is the CLI's six documented modes (2.1.210). Empty means
+// "let Create default it"; anything else fails fast here as invalid_param
+// instead of reaching claude.
+var permissionModes = map[string]bool{
+	"default":           true,
+	"acceptEdits":       true,
+	"plan":              true,
+	"auto":              true,
+	"dontAsk":           true,
+	"bypassPermissions": true,
 }
 
 type createJobRequest struct {
@@ -598,6 +612,10 @@ func (s *Server) Handler() http.Handler {
 			apiErr(w, 400, "outside_roots", "folder outside configured roots")
 			return
 		}
+		if req.PermissionMode != "" && !permissionModes[req.PermissionMode] {
+			apiErr(w, 400, "invalid_param", "permissionMode must be one of default, acceptEdits, plan, auto, dontAsk, bypassPermissions")
+			return
+		}
 		var callbackURL string
 		if req.CallbackURL != nil {
 			if !httpURL.MatchString(*req.CallbackURL) {
@@ -613,6 +631,8 @@ func (s *Server) Handler() http.Handler {
 			SpawnMode:      req.SpawnMode,
 			Branch:         req.Branch,
 			PermissionMode: req.PermissionMode,
+			Capacity:       req.Capacity,
+			PresetName:     req.PresetName,
 			CallbackURL:    callbackURL,
 			Actor:          actorOf(r).name,
 		})

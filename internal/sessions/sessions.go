@@ -62,14 +62,19 @@ type Session struct {
 	Branch         *string             `json:"branch"`
 	WorktreePath   *string             `json:"worktreePath"`
 	PermissionMode string              `json:"permissionMode"`
-	State          State               `json:"state"`
-	PairingURL     *string             `json:"pairingUrl"`
-	CallbackURL    *string             `json:"callbackUrl"`
-	StartedAt      string              `json:"startedAt"`
-	ExitedAt       *string             `json:"exitedAt"`
-	ExitCode       *int                `json:"exitCode"`
-	LastOutputAt   *string             `json:"lastOutputAt"`
-	LastLine       *string             `json:"lastLine"`
+	// resolved --capacity: how many sessions claude.ai can create in this
+	// environment. Always populated from the normalized launch opts (the CLI
+	// default 32 when the launch didn't ask), so the card's "N of capacity"
+	// reads the live wire, never the journal.
+	Capacity     int     `json:"capacity"`
+	State        State   `json:"state"`
+	PairingURL   *string `json:"pairingUrl"`
+	CallbackURL  *string `json:"callbackUrl"`
+	StartedAt    string  `json:"startedAt"`
+	ExitedAt     *string `json:"exitedAt"`
+	ExitCode     *int    `json:"exitCode"`
+	LastOutputAt *string `json:"lastOutputAt"`
+	LastLine     *string `json:"lastLine"`
 	// registry-sourced enrichment: every field degrades to absence and none
 	// of them ever drives a state transition — the PTY stays the sole exit
 	// authority (R6)
@@ -345,6 +350,31 @@ func (m *Manager) WaitForReady(id string, timeout time.Duration) string {
 
 type CreateOpts struct {
 	Folder, Name, SpawnMode, Branch, PermissionMode, CallbackURL, Actor string
+	// PresetName is the launch preset (if any) these opts came from — a
+	// durable launch fact journaled for recents/relaunch, never interpreted here.
+	PresetName string
+	// Capacity is the requested --capacity; zero means "not asked" and
+	// normalizes to the CLI default.
+	Capacity int
+}
+
+// --capacity bounds, matching the CLI (default probed on 2.1.210). Requests
+// normalize instead of rejecting — absent or < 1 falls back to the default,
+// oversized clamps to 256 — so a pre-capacity recent replayed through
+// POST /sessions keeps launching.
+const (
+	defaultCapacity = 32
+	maxCapacity     = 256
+)
+
+func normalizeCapacity(n int) int {
+	switch {
+	case n < 1:
+		return defaultCapacity
+	case n > maxCapacity:
+		return maxCapacity
+	}
+	return n
 }
 
 func (m *Manager) Create(opts CreateOpts) (Session, error) {
@@ -386,6 +416,7 @@ func (m *Manager) Create(opts CreateOpts) (Session, error) {
 	if permissionMode == "" {
 		permissionMode = "default"
 	}
+	capacity := normalizeCapacity(opts.Capacity)
 	id := util.RandomID(8)
 
 	worktreePath := ""
@@ -441,6 +472,10 @@ func (m *Manager) Create(opts CreateOpts) (Session, error) {
 
 	// always --spawn same-dir: the runner already handled worktree creation itself
 	args := []string{"remote-control", "--name", name, "--spawn", string(workspace.SpawnSameDir), "--permission-mode", permissionMode}
+	if capacity != defaultCapacity {
+		// omitted at the default so launches keep working on CLIs that predate --capacity
+		args = append(args, "--capacity", strconv.Itoa(capacity))
+	}
 	// real PTY: the CLI prints its pairing URL and stays alive as it would in a terminal
 	cmd := exec.Command("claude", args...)
 	cmd.Dir = cwd
@@ -462,6 +497,7 @@ func (m *Manager) Create(opts CreateOpts) (Session, error) {
 			Branch:         util.StrPtr(branch),
 			WorktreePath:   util.StrPtr(worktreePath),
 			PermissionMode: permissionMode,
+			Capacity:       capacity,
 			State:          StateStarting,
 			PairingURL:     nil,
 			CallbackURL:    util.StrPtr(opts.CallbackURL),
@@ -502,6 +538,14 @@ func (m *Manager) Create(opts CreateOpts) (Session, error) {
 		"spawnMode":      mode,
 		"branch":         util.StrPtr(branch),
 		"permissionMode": permissionMode,
+	}
+	if capacity != defaultCapacity {
+		// journaled exactly when the flag is spawned, so entry presence mirrors
+		// the args and a defaulted (or pre-capacity) entry reads back as 32
+		entry["capacity"] = capacity
+	}
+	if opts.PresetName != "" {
+		entry["presetName"] = opts.PresetName
 	}
 	if opts.Actor != "" {
 		entry["actor"] = opts.Actor

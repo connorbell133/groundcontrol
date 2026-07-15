@@ -358,11 +358,43 @@ body {
   background: color-mix(in srgb, var(--accent) 10%, transparent);
 }
 
-/* extra claude sessions sharing the launch folder (ready cards) */
-.session-extras { margin-top: 12px; font-family: var(--mono); font-size: 11.5px; color: var(--muted); }
-.extras-label { font-size: 10px; letter-spacing: 0.04em; color: var(--faint); margin-bottom: 3px; }
-.extra-row { padding: 2px 0; overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
-.extra-more { padding: 2px 0; color: var(--faint); }
+/* header session counter — "N of <capacity> sessions", live cards only */
+.session-usage {
+  flex: none; font-family: var(--mono); font-size: 10px; letter-spacing: 0.04em;
+  color: var(--faint); white-space: nowrap;
+}
+
+/* settings-injection skip reason — a launch fact, one muted line under the header */
+.skip-reason {
+  margin-top: 7px; font-family: var(--mono); font-size: 10.5px; color: var(--faint);
+  overflow: hidden; text-overflow: ellipsis; white-space: nowrap;
+}
+
+/* environment session rows — the sessions claude.ai created inside this
+   environment, first-class on the card; the status chip ticks via
+   data-session-status and hides when empty */
+.session-rows { margin-top: 12px; display: flex; flex-direction: column; }
+.env-row { display: flex; align-items: center; gap: 8px; padding: 3px 0; min-width: 0; }
+.env-name {
+  flex: 1; min-width: 0; font-family: var(--mono); font-size: 11.5px; color: var(--muted);
+  overflow: hidden; text-overflow: ellipsis; white-space: nowrap;
+}
+.meta-chip.session-status { flex: none; text-transform: none; padding: 2px 7px; }
+.meta-chip.session-status:empty { display: none; }
+.env-more { padding: 3px 0; font-family: var(--mono); font-size: 10.5px; color: var(--faint); }
+
+/* same-folder foreign sessions — collapsed and visibly quieter than env rows */
+.folder-details { margin-top: 10px; font-family: var(--mono); color: var(--faint); }
+.folder-summary {
+  list-style: none; cursor: pointer;
+  font-size: 10px; letter-spacing: 0.04em;
+}
+.folder-summary::-webkit-details-marker { display: none; }
+.folder-summary::before { content: "\203A "; display: inline-block; transition: transform 0.12s var(--ease); }
+.folder-details[open] .folder-summary::before { transform: rotate(90deg); }
+.folder-body { margin-top: 2px; padding-left: 12px; }
+.folder-row { padding: 2px 0; font-size: 10.5px; overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
+.folder-more { padding: 2px 0; font-size: 10.5px; }
 
 /* staged launch sequence (starting cards) — three checkpoints, sweep on the active one */
 .launch-seq {
@@ -710,7 +742,8 @@ body {
 .meta-chip.age { color: var(--faint); text-transform: none; }
 .meta-chip.age:empty { display: none; }
 .meta-chip.activity { text-transform: none; }
-.meta-chip.activity.hot {
+.meta-chip.activity.hot,
+.meta-chip.session-status.hot {
   color: var(--stamp); border-color: color-mix(in srgb, var(--stamp) 35%, transparent);
   background: var(--stamp-soft);
 }

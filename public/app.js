@@ -474,6 +474,8 @@ const openLogs = new Set();
 const openConvos = new Set();
 // Ids whose pairing-QR <details> is expanded — same trick, so a tap survives re-renders.
 const openQrs = new Set();
+// Ids whose "also in this folder" <details> is expanded — same trick.
+const openFolders = new Set();
 let lastSyncAt = Date.now();
 
 // After a kill, poll a few times so the card lands on the real terminal
@@ -605,34 +607,59 @@ function patchSweptDebrief(branch) {
   });
 }
 
-// live claude sessions around the launch — environment rows then same-folder
-// foreign rows, concatenated; capped, no disclosure. A status other than
-// busy/idle is unknown and renders nothing, per the unknown-means-absent rule
-// the primary activity chip follows
-function extrasHTML(extras) {
-  if (!extras?.length) return "";
-  const rows = extras
-    .slice(0, 3)
-    .map((x) => `<div class="extra-row">${esc(x.name)}${x.status === "busy" || x.status === "idle" ? ` (${x.status})` : ""}</div>`)
+// first-class rows for the sessions claude.ai created inside this environment,
+// wire order (primary first). Status chips render empty here and are filled by
+// updateDynamic via data-session-status — statuses are time-varying and must
+// not live in the shell. Capped at 8 rows so a 32-capacity environment doesn't
+// blow the card up.
+function envRowsHTML(rows) {
+  if (!rows?.length) return "";
+  const shown = rows
+    .slice(0, 8)
+    .map((x) => `<div class="env-row"><span class="env-name">${esc(x.name)}</span><span class="meta-chip session-status" data-session-status="${esc(x.name)}"></span></div>`)
     .join("");
-  const more = extras.length > 3 ? `<div class="extra-more">and ${extras.length - 3} more in this folder</div>` : "";
-  return `<div class="session-extras"><div class="extras-label">also running in this folder:</div>${rows}${more}</div>`;
+  const more = rows.length > 8 ? `<div class="env-more">+${rows.length - 8} more</div>` : "";
+  return `<div class="session-rows">${shown}${more}</div>`;
+}
+
+// same-folder claude sessions not owned by this environment — a collapsed,
+// muted group so they never read as the environment's own. Status parentheticals
+// are snapshot-at-render (folder statuses aren't in the face and don't tick);
+// a status other than busy/idle is unknown and renders nothing. Open state
+// survives poll-tick rewrites via the openFolders set.
+function folderGroupHTML(id, rows) {
+  if (!rows?.length) return "";
+  const shown = rows
+    .slice(0, 3)
+    .map((x) => `<div class="folder-row">${esc(x.name)}${x.status === "busy" || x.status === "idle" ? ` (${x.status})` : ""}</div>`)
+    .join("");
+  const more = rows.length > 3 ? `<div class="folder-more">and ${rows.length - 3} more</div>` : "";
+  return `<details class="folder-details" data-folder="${id}">
+    <summary class="folder-summary">also in this folder: ${rows.length}</summary>
+    <div class="folder-body">${shown}${more}</div>
+  </details>`;
 }
 
 // CONTRACT: card.innerHTML is rewritten ONLY here, keyed on the card "face"
-// (state/pairingUrl/exitCode/debrief/extras/prLink — all step changes, never
-// time-varying). Everything time-varying updates via data-* lookups in updateDynamic().
+// (state/pairingUrl/exitCode/branchState/env-row identities/folder names/
+// settingsSkipReason/prLink — all step changes, never time-varying). Everything
+// time-varying — including per-row busy/idle — updates via data-* lookups in
+// updateDynamic().
 function renderShell(card, s) {
   const logWasOpen = openLogs.has(s.id);
   const convoWasOpen = openConvos.has(s.id);
   const qrWasOpen = openQrs.has(s.id);
+  const folderWasOpen = openFolders.has(s.id);
+  const live = s.state === "ready" || s.state === "starting";
   const shareBtn = navigator.share ? `<button class="log-tool" data-share-log="${s.id}">share</button>` : "";
   card.innerHTML = `
     <div class="session-head">
       <span class="session-name">${esc(s.name)}</span>
+      ${live && s.environmentSessions ? `<span class="session-usage">${s.environmentSessions.length} of ${esc(s.capacity)} sessions</span>` : ""}
       <span class="state-pill ${s.state}" data-verb>${esc(verbFor(s))}</span>
     </div>
     <div class="session-path">${esc(s.folder)}</div>
+    ${s.settingsSkipReason ? `<div class="skip-reason">settings not injected: ${esc(s.settingsSkipReason)}</div>` : ""}
     <div class="session-ticker" data-ticker></div>
     ${s.state === "ready" ? `<div class="session-snippet" data-snippet hidden></div>` : ""}
     <div class="session-meta">
@@ -641,9 +668,10 @@ function renderShell(card, s) {
       <span class="meta-chip">${s.permissionMode}</span>
       <span class="meta-chip age" data-age></span>
       <span class="meta-chip activity" data-activity hidden></span>
-      ${s.prLink && (s.state === "ready" || s.state === "starting") ? `<a class="meta-chip pr" href="${esc(s.prLink.url)}" target="_blank" rel="noopener">PR #${esc(s.prLink.number)}</a>` : ""}
+      ${s.prLink && live ? `<a class="meta-chip pr" href="${esc(s.prLink.url)}" target="_blank" rel="noopener">PR #${esc(s.prLink.number)}</a>` : ""}
     </div>
-    ${s.state === "ready" ? extrasHTML([...(s.environmentSessions || []), ...(s.folderSessions || [])]) : ""}
+    ${live ? envRowsHTML(s.environmentSessions) : ""}
+    ${live ? folderGroupHTML(s.id, s.folderSessions) : ""}
     ${s.pairingUrl && s.state === "ready" ? `
       <a class="card-cta" href="${esc(s.pairingUrl)}" target="_blank" rel="noopener">enter cockpit <span class="cta-glyph">→</span></a>
       <details class="qr-details" data-qr="${s.id}">
@@ -702,6 +730,10 @@ function renderShell(card, s) {
   if (qrWasOpen) {
     const qr = card.querySelector(".qr-details");
     if (qr) qr.open = true; // re-adds to openQrs via the toggle listener; harmless
+  }
+  if (folderWasOpen) {
+    const folder = card.querySelector(".folder-details");
+    if (folder) folder.open = true; // re-adds to openFolders via the toggle listener
   }
 }
 
@@ -795,6 +827,20 @@ function updateDynamic(card, s) {
     }
   }
 
+  // per-row busy/idle for environment session rows — statuses live outside the
+  // face, so flips mutate the chip in place (mirrors data-activity). Unknown or
+  // absent status empties the chip (CSS hides :empty) — never a placeholder.
+  const rowChips = card.querySelectorAll("[data-session-status]");
+  if (rowChips.length) {
+    const statuses = new Map((s.environmentSessions || []).map((x) => [x.name, x.status]));
+    for (const chip of rowChips) {
+      const st = statuses.get(chip.dataset.sessionStatus);
+      const text = st === "busy" || st === "idle" ? st : "";
+      if (chip.textContent !== text) chip.textContent = text;
+      chip.classList.toggle("hot", st === "busy");
+    }
+  }
+
   // elapsed ticker on the active launch-sequence stage (starting cards only)
   const provision = card.querySelector("[data-provision]");
   if (provision) provision.textContent = `t+${fmtDur(now - started)}`;
@@ -842,10 +888,15 @@ function renderSessions() {
     // exitCode/debrief join the key: a kill flips the card to exited
     // optimistically, before the server payload carries either — without
     // them the later real exit would never rewrite in the debrief face.
-    // extras and prLink are step changes too — they rewrite exactly when
-    // they change, never on a tick
-    const extras = [...(s.environmentSessions || []), ...(s.folderSessions || [])].map((x) => `${x.name}:${x.status ?? ""}`).join(",");
-    const face = `${s.state}|${s.pairingUrl}|${s.exitCode ?? ""}|${s.debrief?.branchState ?? ""}|${extras}|${s.prLink?.url ?? ""}`;
+    // Row membership is a step change (identities only, sorted — statuses
+    // tick via data-session-status and must never rewrite the shell), and
+    // it leaves the key entirely on exited/error faces so an exit never
+    // triggers a row-churn rewrite. prLink and settingsSkipReason are step
+    // changes too — they rewrite exactly when they change, never on a tick.
+    const live = s.state === "ready" || s.state === "starting";
+    const envRows = live ? (s.environmentSessions || []).map((x) => x.name).sort().join(",") : "";
+    const folderNames = live ? (s.folderSessions || []).map((x) => x.name).sort().join(",") : "";
+    const face = `${s.state}|${s.pairingUrl}|${s.exitCode ?? ""}|${s.debrief?.branchState ?? ""}|${envRows}|${folderNames}|${s.settingsSkipReason ?? ""}|${s.prLink?.url ?? ""}`;
     if (card.dataset.face !== face) {
       if (!card._new) card.style.animation = "none"; // in-place rewrite — no entrance replay
       card.dataset.face = face;
@@ -890,6 +941,7 @@ function renderSessions() {
       openConvos.delete(id);
       convoKeys.delete(id);
       openQrs.delete(id);
+      openFolders.delete(id);
       tails.delete(id);
       card.remove();
     }
@@ -1010,6 +1062,12 @@ document.addEventListener("toggle", async (e) => {
   if (qrId) {
     if (e.target.open) openQrs.add(qrId);
     else openQrs.delete(qrId);
+    return;
+  }
+  const folderId = e.target.dataset?.folder;
+  if (folderId) {
+    if (e.target.open) openFolders.add(folderId);
+    else openFolders.delete(folderId);
     return;
   }
   const convoBox = e.target.querySelector?.(".convo[data-convo]");

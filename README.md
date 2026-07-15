@@ -211,7 +211,7 @@ Design notes, for the curious: the UI is a "paper dispatch" theme — Instrument
 
 - **Not a chat UI.** All conversation happens in the official Claude app; the tower only clears launches and supervises.
 - **Not multi-tenant.** It's your machine and your token.
-- **Not containerized (yet).** Sessions run as your user on the host. The Docker isolation toggle in the launch console is honest about this — it's wired for v1.
+- **Not containerized (yet).** Sessions run as your user on the host.
 
 ## Contributing
 

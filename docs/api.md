@@ -149,6 +149,15 @@ change; renaming one is breaking.
   `claude` only when the normalized value differs from the default, so
   launches keep working on CLIs that predate it. The session object always
   carries the resolved `capacity`.
+- `presetName` — resolve a named [preset](#config) from config: the preset
+  fills only the options the request left empty (`permissionMode`,
+  `capacity`, `spawnMode` — an explicit request field always wins) and
+  supplies the settings JSON for
+  [injection](#preset-settings-injection). A name that no longer resolves
+  is **not** an error: the launch proceeds without injection and the
+  session carries `settingsSkipReason: "preset no longer exists"`, so
+  relaunching a recent whose preset was deleted keeps working. The name is
+  journaled either way.
 - `callbackUrl` — this launch's own webhook: every lifecycle event except
   `session.start` (`session.ready`, `session.kill`, `session.exit`) is POSTed
   to it (same payload shape as [events](#events--notifications)).
@@ -163,6 +172,39 @@ if the deadline passed while still provisioning.
 
 Session states: `starting` → `ready` (pairing URL scraped) → `exited`;
 `error` means it died before ever becoming ready.
+
+#### Preset settings injection
+
+A preset with `settingsJson` has it written to
+`<launch cwd>/.claude/settings.local.json` before spawn — the project-scoped
+settings file Claude Code merges natively — and removed when the session
+exits. For worktree launches the launch cwd is the worktree, so the file
+never touches your checkout. The mechanism never clobbers user files:
+
+- The injected file carries a top-level `"_groundcontrol": true` marker key.
+  Teardown and the boot sweep only ever remove files whose parse shows the
+  marker; a file that lost its marker mid-session is left alone.
+- Creation is an atomic create-if-absent, so two concurrent launches into
+  the same folder can never interleave. When a file already exists: unmarked
+  (or unparseable) means it's yours — injection refuses with
+  `settingsSkipReason: "settings file already exists"`; marked and owned by
+  another live session skips with `"in use by another session"`; marked with
+  no live owner is a crash leftover and is replaced (journaled as
+  `settingsNote: "replaced stale injection"`).
+- At exit the file is removed only when no other live session shares the
+  folder — otherwise removal defers to the last same-folder exit, and each
+  exit re-checks. On boot the runner sweeps marked leftovers in folders
+  whose recent `session.start` entries recorded an injection (crash
+  recovery).
+- While the file exists it affects **every** Claude session started in that
+  folder, including ones you start by hand.
+
+A skip never blocks the launch. The session object carries
+`settingsSkipReason` only when injection was requested but skipped —
+absence means either injected or never requested: the wire never claims
+success, only explains absence. The outcome is flattened into the
+`session.start` journal entry (`settingsInjected`, `settingsSkipReason`,
+`settingsNote`), never a standalone event.
 
 #### Debriefs
 
@@ -426,7 +468,9 @@ applied, so a rejected write leaves the config untouched.
 - `settingsJson` — optional settings-file content as a string: at most 64 KB
   and must parse as a JSON object. A top-level `hooks` key is rejected —
   hooks run shell commands and are a separately gated feature. An `env` key
-  is allowed.
+  is allowed. Injected at launch as
+  `<launch cwd>/.claude/settings.local.json` for the session's lifetime —
+  see [Preset settings injection](#preset-settings-injection).
 
 A token that can reach `PUT /config` can widen `roots` — treat `authToken`
 and any `admin`-scoped token as root on the box. Give automations

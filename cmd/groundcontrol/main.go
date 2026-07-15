@@ -66,6 +66,10 @@ func main() {
 	// first one's live worktrees out from under its sessions.
 	if ws.AcquireRunnerLock() {
 		ws.SweepOrphans()
+		// same single-runner gate: a crashed runner's injected settings files
+		// (journaled as settingsInjected on session.start) are leftovers only
+		// when no other instance could still own live sessions in them
+		sessionMgr.SweepSettingsLeftovers()
 	} else {
 		log.Printf("another groundcontrol instance is running — skipping the orphan-worktree sweep")
 		jnl.Append(map[string]any{"event": "worktree.sweep-skipped", "reason": "another runner holds the lock"})

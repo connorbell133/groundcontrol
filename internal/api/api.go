@@ -678,16 +678,50 @@ func (s *Server) Handler() http.Handler {
 			callbackURL = *req.CallbackURL
 		}
 
+		// resolve the named preset: it fills only the launch options the
+		// request left empty (request wins), and supplies the settings JSON
+		// for injection. A name that no longer resolves is not an error —
+		// relaunching a deleted preset must keep working — the launch just
+		// proceeds without injection and carries the skip reason (R8).
+		var settingsJSON, settingsSkipReason string
+		if req.PresetName != "" {
+			s.configMu.Lock()
+			var preset *config.Preset
+			for i := range s.cfg.Presets {
+				if s.cfg.Presets[i].Name == req.PresetName {
+					preset = &s.cfg.Presets[i]
+					break
+				}
+			}
+			if preset != nil {
+				if req.PermissionMode == "" {
+					req.PermissionMode = preset.PermissionMode
+				}
+				if req.SpawnMode == "" {
+					req.SpawnMode = preset.SpawnMode
+				}
+				if req.Capacity == 0 {
+					req.Capacity = preset.Capacity
+				}
+				settingsJSON = preset.SettingsJSON
+			} else {
+				settingsSkipReason = "preset no longer exists"
+			}
+			s.configMu.Unlock()
+		}
+
 		session, err := s.sessions.Create(sessions.CreateOpts{
-			Folder:         req.Folder,
-			Name:           req.Name,
-			SpawnMode:      req.SpawnMode,
-			Branch:         req.Branch,
-			PermissionMode: req.PermissionMode,
-			Capacity:       req.Capacity,
-			PresetName:     req.PresetName,
-			CallbackURL:    callbackURL,
-			Actor:          actorOf(r).name,
+			Folder:             req.Folder,
+			Name:               req.Name,
+			SpawnMode:          req.SpawnMode,
+			Branch:             req.Branch,
+			PermissionMode:     req.PermissionMode,
+			Capacity:           req.Capacity,
+			PresetName:         req.PresetName,
+			SettingsJSON:       settingsJSON,
+			SettingsSkipReason: settingsSkipReason,
+			CallbackURL:        callbackURL,
+			Actor:              actorOf(r).name,
 		})
 		if err != nil {
 			apiErr(w, 409, "launch_failed", err.Error())

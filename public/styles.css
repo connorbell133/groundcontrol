@@ -943,3 +943,17 @@ html[data-hand="left"] .select-caret { right: auto; left: 14px; }
 .preset-json { font-family: var(--mono); font-size: 12px; }
 .preset-error { color: var(--danger); }
 html[data-hand="left"] .preset-row { flex-direction: row-reverse; }
+
+/* ---------- small screens ---------- */
+@media (max-width: 480px) {
+  .session-card { padding: 18px 15px; }
+  /* header: when the session counter is present it can't share a line with the
+     name — give the name the full first line, counter + status pill the second */
+  .session-head { flex-wrap: wrap; row-gap: 7px; }
+  .session-head:has(.session-usage:not(:empty)) .session-name { flex-basis: 100%; }
+  .session-usage { margin-right: auto; }
+  /* environment ids are identity, not decoration — stack key over value and
+     wrap the full id instead of ellipsizing it */
+  .env-stat { flex-direction: column; align-items: flex-start; gap: 2px; }
+  .env-stat-v { white-space: normal; overflow-wrap: anywhere; }
+}

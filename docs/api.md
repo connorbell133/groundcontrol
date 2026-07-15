@@ -49,6 +49,13 @@ into the journal as `actor`, so the flight log shows who launched what.
 { "ok": true, "version": "0.4.0", "sessions": 1 }
 ```
 
+## Docs endpoint
+
+`GET /docs` serves a [Scalar](https://scalar.com) API reference for this
+API, and `GET /openapi.yaml` serves the raw spec it reads from — both
+unauthenticated by design, same as `/healthz`. Visit
+`http://<host>:<port>/docs` in a browser.
+
 ## Errors
 
 Every error is the same envelope, with a stable machine-readable `code` and a

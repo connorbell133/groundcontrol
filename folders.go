@@ -2,6 +2,7 @@ package main
 
 import (
 	"errors"
+	"log"
 	"os"
 	"path/filepath"
 	"regexp"
@@ -38,6 +39,13 @@ func (a *app) configureBrowser(roots []string, showHidden bool) {
 			resolved, err = filepath.Abs(r)
 			if err != nil {
 				resolved = r
+			}
+		}
+		if _, err := os.ReadDir(resolved); err != nil {
+			if errors.Is(err, os.ErrPermission) {
+				log.Printf("root %s is not readable: permission denied — the OS is blocking this process (on macOS, folders like Desktop/Documents need Full Disk Access in System Settings > Privacy & Security)", resolved)
+			} else {
+				log.Printf("root %s is not readable: %v", resolved, err)
 			}
 		}
 		abs = append(abs, resolved)

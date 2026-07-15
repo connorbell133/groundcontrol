@@ -30,7 +30,7 @@ import (
 )
 
 // release builds override this via -ldflags "-X main.version=..."
-var version = "0.5.0"
+var version = "0.6.0"
 
 func main() {
 	configPath := flag.String("config", "config.json", "path to the config file")

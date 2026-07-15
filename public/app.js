@@ -1,5 +1,5 @@
 /* groundcontrol mobile UI */
-const CLIENT_VERSION = "0.5.0"; // keep in step with main.go's version — healthz mismatch triggers a reload
+const CLIENT_VERSION = "0.6.0"; // keep in step with main.go's version — healthz mismatch triggers a reload
 const $ = (id) => document.getElementById(id);
 // tokens travel by copy-paste, which loves to smuggle in zero-width and other
 // non-ASCII characters — those make `Bearer <token>` an invalid header value

@@ -152,6 +152,10 @@ type Manager struct {
 	sessions map[string]*liveSession
 	// names reserved by launches still between duplicate-check and insertion
 	pendingNames map[string]bool
+	// same-dir launches reserve their normalized folder across the slow spawn
+	// path, mirroring pendingNames: one live environment per folder (R-guard
+	// below in Create)
+	pendingFolders map[string]bool
 	// watchers tracks bridge-pointer goroutines so tests can drain them before
 	// restoring the package seams those goroutines read while alive
 	watchers sync.WaitGroup
@@ -178,13 +182,14 @@ type Manager struct {
 
 func NewManager(j *journal.Journal, bus *events.Bus, ws *workspace.Manager, browser *browse.Browser) *Manager {
 	return &Manager{
-		sessions:     map[string]*liveSession{},
-		pendingNames: map[string]bool{},
-		regWake:      make(chan struct{}, 1),
-		journal:      j,
-		bus:          bus,
-		ws:           ws,
-		browser:      browser,
+		sessions:       map[string]*liveSession{},
+		pendingNames:   map[string]bool{},
+		pendingFolders: map[string]bool{},
+		regWake:        make(chan struct{}, 1),
+		journal:        j,
+		bus:            bus,
+		ws:             ws,
+		browser:        browser,
 	}
 }
 
@@ -427,6 +432,32 @@ func (m *Manager) Create(opts CreateOpts) (Session, error) {
 	mode := workspace.SpawnSameDir
 	if opts.SpawnMode == string(workspace.SpawnWorktree) {
 		mode = workspace.SpawnWorktree
+	}
+
+	// one live environment per folder for same-dir launches: a second one would
+	// register a second claude.ai environment with an identical picker label
+	// (environments are named by folder basename — verified 2.1.210), and one
+	// environment already holds up to --capacity sessions. Worktree launches
+	// get their own uniquely named folders and skip this.
+	if mode == workspace.SpawnSameDir {
+		folderKey := normalizePath(opts.Folder)
+		m.mu.Lock()
+		folderBusy := m.pendingFolders[folderKey]
+		if !folderBusy {
+			m.pendingFolders[folderKey] = true
+		}
+		m.mu.Unlock()
+		if folderBusy {
+			return Session{}, errors.New("an environment is already launching in this folder — one live environment per folder; use worktree mode for a second")
+		}
+		defer func() {
+			m.mu.Lock()
+			delete(m.pendingFolders, folderKey)
+			m.mu.Unlock()
+		}()
+		if m.liveSameFolderExists(opts.Folder) {
+			return Session{}, errors.New("an environment is already live in this folder — open that one in claude.ai, kill it, or launch in worktree mode (claude.ai labels same-folder environments identically)")
+		}
 	}
 	permissionMode := opts.PermissionMode
 	if permissionMode == "" {

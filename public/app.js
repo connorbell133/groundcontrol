@@ -412,18 +412,33 @@ function syncBranchField() {
   // every control stays on screen in every mode — capability only changes copy + enabled state
   const git = !!state.current?.isGit;
   const noBranches = git && state.branchCount === 0; // repo with no commits yet
+  // one live environment per folder (server enforces the same rule): a second
+  // same-dir launch would get an identical label in claude.ai's picker
+  const liveHere = (state.sessions || []).some(
+    (s) => (s.state === "ready" || s.state === "starting") && s.spawnMode === "same-dir" && s.folder === state.current?.path
+  );
+  if (liveHere && state.opts.spawnMode === "same-dir" && git && !noBranches) {
+    state.opts.spawnMode = "worktree";
+    document.querySelectorAll("#optSpawn button").forEach((b) => b.classList.toggle("active", b.dataset.value === "worktree"));
+  }
   const worktree = state.opts.spawnMode === "worktree";
 
-  document.querySelectorAll("#optSpawn button").forEach((b) => (b.disabled = !git || noBranches));
+  document.querySelectorAll("#optSpawn button").forEach(
+    (b) => (b.disabled = !git || noBranches || (liveHere && b.dataset.value === "same-dir"))
+  );
   $("optBranch").disabled = !git || noBranches;
 
   $("spawnHint").textContent = !git
-    ? "not a git folder — runs in place"
+    ? liveHere
+      ? "an environment is already live in this folder — kill it to launch here again (no git, so no worktree)"
+      : "not a git folder — runs in place"
     : noBranches
       ? "no commits yet — worktrees need a branch"
-      : worktree
-        ? "isolated worktree — claude.ai lists the environment by the session name"
-        : "runs directly in this folder — claude.ai lists the environment by the folder's name";
+      : liveHere
+        ? "an environment is already live in this folder — worktree launches keep their own name in claude.ai"
+        : worktree
+          ? "isolated worktree — claude.ai lists the environment by the session name"
+          : "runs directly in this folder — claude.ai lists the environment by the folder's name";
 
   $("branchLabel").textContent = worktree ? "Base branch" : "Branch";
   if (!git) {

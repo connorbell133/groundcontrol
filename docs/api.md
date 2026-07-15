@@ -81,7 +81,7 @@ change; renaming one is breaking.
 | `not_found` | 404 | no such session or job |
 | `not_ready` | 409 | session exists but has no pairing URL yet |
 | `ready_timeout` | 504 | `?wait=ready` deadline passed — session still starting, keep polling |
-| `launch_failed` | 409 | spawn rejected — duplicate live name, unknown branch, dirty checkout on branch switch, worktree creation failed |
+| `launch_failed` | 409 | spawn rejected — duplicate live name, a live environment already in the folder (same-dir launches; one per folder), unknown branch, dirty checkout on branch switch, worktree creation failed |
 | `session_live` | 409 | tried to dismiss a session that's still running |
 | `job_live` | 409 | tried to dismiss a job that's still queued/running — cancel it first |
 | `worktree_error` | 400 | kept-worktree removal failed or path isn't runner-managed |

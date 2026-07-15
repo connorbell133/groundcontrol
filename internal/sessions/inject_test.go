@@ -9,6 +9,7 @@ import (
 	"encoding/json"
 	"os"
 	"path/filepath"
+	"strings"
 	"testing"
 	"time"
 
@@ -157,6 +158,9 @@ func TestInjectReplacesStaleLeftover(t *testing.T) {
 }
 
 func TestInjectSharedFolderDefersRemoval(t *testing.T) {
+	// the one-live-environment-per-folder guard makes two same-dir launches
+	// unreachable through Create, but the deferral path still guards the
+	// exit-vs-launch race — fabricate the second live occupant directly
 	testutil.FakeClaude(t)
 	folder := testutil.ResolvedTempDir(t)
 	m := testManager(t, []string{folder})
@@ -166,27 +170,58 @@ func TestInjectSharedFolderDefersRemoval(t *testing.T) {
 	if err != nil {
 		t.Fatalf("Create s1: %v", err)
 	}
-	s2, err := m.Create(CreateOpts{Folder: folder, Name: "share-2", SettingsJSON: testSettingsJSON})
-	if err != nil {
-		t.Fatalf("Create s2: %v", err)
-	}
-	// the second launch finds a marked file owned by a live session
-	if s2.SettingsSkipReason == nil || *s2.SettingsSkipReason != skipInUse {
-		t.Fatalf("second launch skip reason = %v, want %q", s2.SettingsSkipReason, skipInUse)
-	}
+	insertLive(t, m, "squatter", folder, StateReady)
 
-	// first exit defers: s2 still works in the folder
+	// s1's exit defers: a live session still shares the folder
 	killSessionAndWait(t, m, s1.ID)
 	waitExitEntry(t, m, s1.ID)
 	if _, err := os.Stat(path); err != nil {
 		t.Fatalf("removal must defer while a live session shares the folder: %v", err)
 	}
 
-	// the last same-folder exit removes it
-	killSessionAndWait(t, m, s2.ID)
-	waitExitEntry(t, m, s2.ID)
+	// once the folder empties, the removal path may run again (teardown of the
+	// squatter is synthetic — exercise the helper the real exit path calls)
+	m.mu.Lock()
+	m.sessions["squatter"].State = StateExited
+	m.mu.Unlock()
+	m.removeSettingsIfLast(path, folder)
 	if _, err := os.Stat(path); !os.IsNotExist(err) {
 		t.Errorf("last exit must remove the settings file: %v", err)
+	}
+}
+
+func TestSameDirSecondLaunchBlocked(t *testing.T) {
+	testutil.FakeClaude(t)
+	folder := testutil.ResolvedTempDir(t)
+	m := testManager(t, []string{folder})
+
+	s1, err := m.Create(CreateOpts{Folder: folder, Name: "first"})
+	if err != nil {
+		t.Fatalf("Create first: %v", err)
+	}
+	if _, err := m.Create(CreateOpts{Folder: folder, Name: "second"}); err == nil || !strings.Contains(err.Error(), "already live in this folder") {
+		t.Fatalf("second same-dir launch must be rejected, got err=%v", err)
+	}
+
+	// the folder frees up once the live session exits
+	killSessionAndWait(t, m, s1.ID)
+	waitExitEntry(t, m, s1.ID)
+	if _, err := m.Create(CreateOpts{Folder: folder, Name: "third"}); err != nil {
+		t.Fatalf("launch after exit must succeed: %v", err)
+	}
+}
+
+func TestSameDirGuardIgnoresWorktreeLaunches(t *testing.T) {
+	testutil.FakeClaude(t)
+	repo := testutil.InitRepo(t)
+	m := testManager(t, []string{repo})
+
+	if _, err := m.Create(CreateOpts{Folder: repo, Name: "in-folder"}); err != nil {
+		t.Fatalf("Create same-dir: %v", err)
+	}
+	// a worktree launch runs in its own directory and must not be blocked
+	if _, err := m.Create(CreateOpts{Folder: repo, Name: "isolated", SpawnMode: "worktree", Branch: "main"}); err != nil {
+		t.Fatalf("worktree launch alongside a same-dir session must succeed: %v", err)
 	}
 }
 

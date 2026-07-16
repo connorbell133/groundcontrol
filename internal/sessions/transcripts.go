@@ -81,6 +81,15 @@ func transcriptText(raw json.RawMessage) string {
 	return strings.Join(parts, "\n")
 }
 
+// transcriptScanner sizes a line scanner for Claude transcripts: single
+// messages can run megabytes, and metadata.go shares the same bound so the
+// two tolerant passes can never drift apart.
+func transcriptScanner(f *os.File) *bufio.Scanner {
+	sc := bufio.NewScanner(f)
+	sc.Buffer(make([]byte, 0, 64*1024), 8*1024*1024)
+	return sc
+}
+
 func parseTranscript(path string) *Transcript {
 	f, err := os.Open(path)
 	if err != nil {
@@ -88,8 +97,7 @@ func parseTranscript(path string) *Transcript {
 	}
 	defer f.Close()
 	t := &Transcript{SessionID: strings.TrimSuffix(filepath.Base(path), ".jsonl")}
-	sc := bufio.NewScanner(f)
-	sc.Buffer(make([]byte, 0, 64*1024), 8*1024*1024)
+	sc := transcriptScanner(f)
 	for sc.Scan() {
 		var e struct {
 			Type        string `json:"type"`

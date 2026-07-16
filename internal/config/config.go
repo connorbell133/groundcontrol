@@ -19,6 +19,18 @@ type Config struct {
 	Jobs       *JobsConfig            `json:"jobs,omitempty"`
 	AuthToken  string                 `json:"authToken,omitempty"`
 	Tokens     []TokenConfig          `json:"tokens,omitempty"`
+	Presets    []Preset               `json:"presets,omitempty"`
+}
+
+// Preset is a named launch configuration. Zero values mean "unset" — the
+// launch defaults apply. Validation happens at the PUT /config boundary,
+// not here.
+type Preset struct {
+	Name           string `json:"name"`
+	PermissionMode string `json:"permissionMode,omitempty"`
+	SpawnMode      string `json:"spawnMode,omitempty"`
+	Capacity       int    `json:"capacity,omitempty"`
+	SettingsJSON   string `json:"settingsJson,omitempty"`
 }
 
 type JobsConfig struct {

@@ -1,7 +1,7 @@
 openapi: 3.1.0
 info:
   title: groundcontrol API
-  version: 0.4.0
+  version: 0.6.0
   description: |
     Launch and supervise Claude Code sessions from HTTP. Every action in the
     PWA is a route here; see docs/api.md for the human guide and cookbook.
@@ -85,16 +85,20 @@ components:
                 - not_ready
                 - ready_timeout
                 - launch_failed
+                - folder_in_use
                 - session_live
                 - job_live
                 - worktree_error
+                - branch_held
+                - branch_not_merged
                 - not_implemented
+                - payload_too_large
             message:
               type: string
 
     Session:
       type: object
-      required: [id, name, folder, spawnMode, branch, worktreePath, permissionMode, state, pairingUrl, callbackUrl, startedAt, exitedAt, exitCode, lastOutputAt, lastLine]
+      required: [id, name, folder, spawnMode, branch, worktreePath, permissionMode, capacity, state, pairingUrl, callbackUrl, startedAt, exitedAt, exitCode, lastOutputAt, lastLine]
       properties:
         id: { type: string, description: 8-char launch id }
         name: { type: string }
@@ -102,7 +106,13 @@ components:
         spawnMode: { type: string, enum: [same-dir, worktree] }
         branch: { type: [string, "null"] }
         worktreePath: { type: [string, "null"] }
-        permissionMode: { type: string, description: "claude permission mode: default, acceptEdits, plan, bypassPermissions" }
+        permissionMode: { type: string, description: "claude permission mode: default, acceptEdits, plan, auto, dontAsk, bypassPermissions" }
+        capacity:
+          type: integer
+          description: >
+            Resolved --capacity: how many sessions claude.ai can create in
+            this environment. Always present — 32 (the CLI default) when the
+            launch didn't ask.
         state:
           type: string
           enum: [starting, ready, exited, error]
@@ -114,6 +124,142 @@ components:
         exitCode: { type: [integer, "null"] }
         lastOutputAt: { type: [string, "null"], format: date-time }
         lastLine: { type: [string, "null"], description: "Last meaningful log line, ≤120 chars." }
+        settingsSkipReason:
+          type: string
+          description: >
+            Why a requested preset-settings injection didn't happen — one of
+            "preset no longer exists", "settings file already exists",
+            "in use by another session", "preset settings are not a JSON
+            object", "preset settings exceed 64 KB", "preset settings carry a
+            non-inert key", or "settings write failed". Present only when
+            injection was requested but skipped; absent means injected or never
+            requested (the wire never claims success, only explains
+            absence).
+        capacityUsed:
+          type: integer
+          description: >
+            The environment's live session count, scraped from the CLI's own
+            "Capacity: used/max" status line — preferred over registry-derived
+            counts when present. Absent until the line first appears and after
+            exit; never journaled.
+        capacityMax:
+          type: integer
+          description: >
+            Companion maximum from the same scrape; present exactly when
+            capacityUsed is. Can disagree with capacity if the CLI's default
+            drifts — the scrape wins on display surfaces.
+        claudeSessionId:
+          type: string
+          description: >
+            Claude Code's conversation UUID for the launch's primary session
+            (the id claude --resume wants), captured from the CLI's agents
+            registry. First capture wins; absent until captured. Journaled,
+            so lost and landed objects also carry it after a runner restart.
+        activity:
+          type: string
+          enum: [busy, idle]
+          description: >
+            Registry-sourced live activity. Absent when the registry hasn't
+            confirmed it recently, reports an unknown value, or the session
+            exited — never a stale value. Never journaled, never fanned out.
+        environmentSessions:
+          type: array
+          items: { $ref: "#/components/schemas/ExtraSession" }
+          description: >
+            The environment's own live sessions — registry rows descended
+            from the spawned launcher, primary session first, then by name.
+            The primary row's status reads the same registry row as
+            activity. Rows clear on the first successful poll that no
+            longer lists them; the grace window applies only across failed
+            polls, and rows keep their last confident classification while
+            the process snapshot is unavailable. Absent when none.
+        folderSessions:
+          type: array
+          items: { $ref: "#/components/schemas/ExtraSession" }
+          description: >
+            Live Claude sessions in the launch's directory that do not
+            belong to the environment (manual, IDE), sorted by name — "in
+            this folder" is the literal contract. Rows age out shortly
+            after the registry stops listing them. Absent when none.
+        prLink: { $ref: "#/components/schemas/PRLink" }
+        debrief: { $ref: "#/components/schemas/Debrief" }
+
+    ExtraSession:
+      type: object
+      description: >
+        One live Claude session row, as listed under environmentSessions
+        (the environment's own sessions, descendants of the spawned
+        launcher) or folderSessions (unrelated same-folder sessions —
+        manual, IDE).
+      required: [name]
+      properties:
+        name: { type: string, description: Registry-assigned session name. }
+        status:
+          type: string
+          enum: [busy, idle]
+          description: Omitted when the registry reports anything else.
+
+    PRLink:
+      type: object
+      description: >
+        The newest pr-link record from the session's transcript. Best-effort
+        enrichment of an undocumented transcript detail — absence is the
+        contract, and it never appears on landed objects (no journaled
+        source).
+      required: [number, url]
+      properties:
+        number: { type: integer }
+        url: { type: string }
+
+    Debrief:
+      type: object
+      description: >
+        Exit-time record of what a worktree session left behind, captured
+        before the worktree is cleaned up. Absent for same-dir sessions, and
+        (best-effort) whenever git failed at exit time. Diff stats are
+        measured from the merge-base with the launch base, so upstream work
+        merged into the worktree doesn't count as the run's own; uncommitted
+        edits do count.
+      required: [filesChanged, insertions, deletions, uncommitted, branchState]
+      properties:
+        filesChanged: { type: integer }
+        insertions: { type: integer }
+        deletions: { type: integer }
+        uncommitted: { type: integer, description: "Paths with uncommitted changes (git status --porcelain) at exit." }
+        branchState:
+          type: string
+          enum: [merged, in-orbit, worktree-kept]
+          description: >
+            merged — the gc/ branch is gone or its tip is reachable from the
+            default branch; in-orbit — the branch survived with commits the
+            default branch lacks; worktree-kept — the worktree was dirty and
+            kept on disk, branch intact.
+
+    LandedSession:
+      type: object
+      description: >
+        A finished session reconstructed from its session.start/session.exit
+        journal pair — debriefs that survive runner restarts. Sessions still
+        listed under "sessions" (live, or exited but not yet dismissed) are
+        excluded. Newest exits first, capped at 20, 7-day window, scoped to
+        the configured roots.
+      required: [id, name, folder, branch, spawnMode, permissionMode, startedAt, exitedAt, exitCode]
+      properties:
+        id: { type: string }
+        name: { type: string }
+        folder: { type: string }
+        branch: { type: [string, "null"] }
+        spawnMode: { type: string }
+        permissionMode: { type: string }
+        startedAt: { type: string, format: date-time }
+        exitedAt: { type: string, format: date-time }
+        exitCode: { type: [integer, "null"] }
+        claudeSessionId:
+          type: string
+          description: >
+            Claude conversation UUID, read from the session.exit journal
+            entry; absent when it was never captured.
+        debrief: { $ref: "#/components/schemas/Debrief" }
 
     CreateSession:
       type: object
@@ -127,7 +273,33 @@ components:
           description: >
             Required in worktree mode (base for the private gc/<id> branch).
             In same-dir mode, switches the checkout first; refused if dirty.
-        permissionMode: { type: string, default: default }
+        permissionMode:
+          type: string
+          enum: [default, acceptEdits, plan, auto, dontAsk, bypassPermissions]
+          default: default
+          description: >
+            Unknown values are a 400 invalid_param. dontAsk and
+            bypassPermissions skip Claude Code's confirmation prompts
+            entirely — a launch-scoped token grants that power.
+        capacity:
+          type: integer
+          default: 32
+          description: >
+            Max sessions claude.ai can create in this environment
+            (--capacity). Normalized, never rejected: absent or < 1 falls
+            back to 32 (the CLI default), values above 256 clamp to 256.
+            Passed to claude only when it differs from the default.
+        presetName:
+          type: string
+          description: >
+            Named preset to resolve: it fills only the options the request
+            left empty (an explicit request field always wins) and supplies
+            the settings JSON injected as <launch
+            cwd>/.claude/settings.local.json for the session's lifetime. A
+            name that no longer resolves is not an error — the launch
+            proceeds without injection and the session carries
+            settingsSkipReason "preset no longer exists". Recorded in the
+            journal so recents and relaunch can re-resolve it.
         callbackUrl: { type: string, description: "http(s) URL — every lifecycle event for this launch except session.start is POSTed to it." }
         timeoutMs: { type: integer, default: 60000, minimum: 1000, maximum: 300000, description: "Only meaningful with ?wait=ready." }
 
@@ -171,6 +343,40 @@ components:
           description: >
             Filter tokens: exact names, prefix wildcards (session.*), "*" or
             omitted for everything, and the derived token session.failed.
+
+    Preset:
+      type: object
+      required: [name]
+      properties:
+        name: { type: string, description: Unique and non-empty within the list. }
+        permissionMode:
+          type: string
+          enum: [default, acceptEdits, plan, auto, dontAsk, bypassPermissions]
+          description: Absent/empty means the launch default.
+        spawnMode:
+          type: string
+          enum: [same-dir, worktree]
+          description: Absent/empty means the launch default.
+        capacity:
+          type: integer
+          minimum: 1
+          maximum: 256
+          description: Absent/0 means unset.
+        settingsJson:
+          type: string
+          description: >
+            Optional settings-file content as a string. At most 64 KB and
+            must parse as a JSON object. Only inert top-level keys are allowed
+            (an allowlist of display/model/UX toggles such as model, theme,
+            verbose); any key that can run commands, move credentials, or
+            change permissions — hooks, apiKeyHelper, statusLine, env,
+            permissions, sandbox, and the like — is rejected (invalid_config
+            at write time, or a "preset settings carry a non-inert key" skip
+            at launch). Injected at launch as <launch
+            cwd>/.claude/settings.local.json (marker-scoped: a
+            "_groundcontrol" key brands the file with the owning launch, an
+            existing unmarked file refuses injection, and removal waits for the
+            last same-folder exit).
 
     Job:
       type: object
@@ -237,13 +443,15 @@ components:
 
     RecentLaunch:
       type: object
-      required: [folder, name, branch, spawnMode, permissionMode, at, stale]
+      required: [folder, name, branch, spawnMode, permissionMode, capacity, at, stale]
       properties:
         folder: { type: string }
         name: { type: string }
         branch: { type: [string, "null"] }
         spawnMode: { type: string }
         permissionMode: { type: string }
+        capacity: { type: integer, description: "Defaults to 32 for entries journaled before capacity existed." }
+        presetName: { type: string, description: Absent when the launch didn't come from a preset. }
         at: { type: string, format: date-time }
         stale: { type: boolean, description: The launch's branch no longer exists. }
 
@@ -254,6 +462,12 @@ components:
           required: [id]
           properties:
             id: { type: string }
+            claudeSessionId:
+              type: string
+              description: >
+                Claude conversation UUID from the session.claude-id journal
+                entry — the resume handle for a session a crashed runner
+                forgot. Absent when it was never captured.
 
     KeptWorktree:
       type: object
@@ -265,9 +479,29 @@ components:
         branch: { type: [string, "null"] }
         dirty: { type: boolean }
 
+    OrbitBranch:
+      type: object
+      description: >
+        One leftover gc/* session branch ("in orbit"). Branches checked out
+        by a live session are never listed. heldBy names the worktree (a
+        kept dirty one) that still has the branch checked out — clean that
+        up via DELETE /worktrees instead of the branch sweep.
+      required: [repo, branch, merged, lastCommitAt]
+      properties:
+        repo: { type: string, description: Repo root the branch lives in. }
+        branch: { type: string, description: Always gc/*. }
+        merged:
+          type: boolean
+          description: >
+            The branch tip is reachable from the repo's default branch
+            (origin's declared HEAD, else local main, else master; a repo
+            with no default reads everything as unmerged).
+        lastCommitAt: { type: string, format: date-time }
+        heldBy: { type: string, description: Worktree path that has the branch checked out; absent when unattached. }
+
     ConfigView:
       type: object
-      required: [roots, showHidden, webhooks]
+      required: [roots, showHidden, webhooks, presets]
       properties:
         roots:
           type: array
@@ -276,6 +510,9 @@ components:
         webhooks:
           type: array
           items: { $ref: "#/components/schemas/WebhookConfig" }
+        presets:
+          type: array
+          items: { $ref: "#/components/schemas/Preset" }
 
 paths:
   /roots:
@@ -347,9 +584,11 @@ paths:
     put:
       summary: Update config (partial)
       description: >
-        Any subset of roots, showHidden, webhooks. Persists to config.json.
-        A token that can reach this route can widen roots — treat it as root
-        on the box.
+        Any subset of roots, showHidden, webhooks, presets. Only keys present
+        in the body are touched — an omitted key keeps its current value, an
+        explicit empty array clears the list. Validation runs before anything
+        is applied. Persists to config.json. A token that can reach this
+        route can widen roots — treat it as root on the box.
       requestBody:
         required: true
         content:
@@ -364,6 +603,9 @@ paths:
                 webhooks:
                   type: array
                   items: { $ref: "#/components/schemas/WebhookConfig" }
+                presets:
+                  type: array
+                  items: { $ref: "#/components/schemas/Preset" }
       responses:
         "200":
           description: Applied and persisted.
@@ -413,17 +655,83 @@ paths:
         "401": { $ref: "#/components/responses/Unauthorized" }
         "403": { $ref: "#/components/responses/Forbidden" }
 
+  /orbit:
+    get:
+      summary: List leftover gc/* session branches
+      description: >
+        Scans the distinct repos named by recent session.start journal
+        entries (folders resolved to their repo root, deduped, scoped to the
+        configured roots). Repos absent from the journal's read window (last
+        2000 entries) aren't scanned — a recents-driven view, not an
+        archive.
+      responses:
+        "200":
+          description: Branches in orbit, most recently used repos first.
+          content:
+            application/json:
+              schema:
+                type: object
+                required: [orbit]
+                properties:
+                  orbit:
+                    type: array
+                    items: { $ref: "#/components/schemas/OrbitBranch" }
+        "401": { $ref: "#/components/responses/Unauthorized" }
+        "403": { $ref: "#/components/responses/Forbidden" }
+    delete:
+      summary: Safe-delete a gc/* session branch
+      description: >
+        Always git branch -d — there is no force parameter; unmerged
+        branches must be merged (or their holding worktree cleaned via
+        DELETE /worktrees) first. Non-gc/* names are rejected
+        (invalid_param) before any git work; the repo must be inside the
+        roots, exist, and be a git repo (invalid_path). A successful sweep
+        writes an orbit.swept journal entry.
+      parameters:
+        - name: repo
+          in: query
+          required: true
+          schema: { type: string }
+          description: Repo root, inside a configured root.
+        - name: branch
+          in: query
+          required: true
+          schema: { type: string }
+          description: The gc/* branch to delete.
+      responses:
+        "200":
+          description: Swept.
+          content:
+            application/json:
+              schema:
+                type: object
+                properties:
+                  ok: { type: boolean }
+        "400": { $ref: "#/components/responses/BadRequest" }
+        "401": { $ref: "#/components/responses/Unauthorized" }
+        "403": { $ref: "#/components/responses/Forbidden" }
+        "404":
+          description: "not_found: no such gc/ branch in that repo."
+          content:
+            application/json:
+              schema: { $ref: "#/components/schemas/Error" }
+        "409":
+          description: "branch_held: checked out by a live session or a kept worktree — or branch_not_merged: git's safe delete found unmerged commits; merge the work first. A transient git failure (timeout, index lock) is a 500 worktree_error, not this."
+          content:
+            application/json:
+              schema: { $ref: "#/components/schemas/Error" }
+
   /sessions:
     get:
       summary: List sessions
       responses:
         "200":
-          description: Live sessions plus lost headstones from the journal.
+          description: Live sessions plus journal-derived lost headstones and landed debriefs.
           content:
             application/json:
               schema:
                 type: object
-                required: [sessions, lost]
+                required: [sessions, lost, landed]
                 properties:
                   sessions:
                     type: array
@@ -431,6 +739,9 @@ paths:
                   lost:
                     type: array
                     items: { $ref: "#/components/schemas/LostSession" }
+                  landed:
+                    type: array
+                    items: { $ref: "#/components/schemas/LandedSession" }
         "401": { $ref: "#/components/responses/Unauthorized" }
         "403": { $ref: "#/components/responses/Forbidden" }
     post:
@@ -460,7 +771,7 @@ paths:
         "401": { $ref: "#/components/responses/Unauthorized" }
         "403": { $ref: "#/components/responses/Forbidden" }
         "409":
-          description: "launch_failed: duplicate live name, unknown branch, dirty checkout, worktree failure — or, with ?wait=ready, the process died before pairing."
+          description: "launch_failed: duplicate live name, unknown branch, dirty checkout, worktree failure — or, with ?wait=ready, the process died before pairing. folder_in_use: a same-dir launch into a folder that already has a live environment (one live environment per folder; use worktree mode for a second)."
           content:
             application/json:
               schema: { $ref: "#/components/schemas/Error" }

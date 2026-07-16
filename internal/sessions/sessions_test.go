@@ -1,6 +1,8 @@
 package sessions
 
 import (
+	"fmt"
+	"path/filepath"
 	"strings"
 	"testing"
 	"time"
@@ -23,7 +25,16 @@ func testManager(t *testing.T, roots []string) *Manager {
 	ws := workspace.New(t.TempDir(), jnl)
 	browser := browse.New()
 	browser.Configure(roots, false)
-	return NewManager(jnl, bus, ws, browser)
+	m := NewManager(jnl, bus, ws, browser)
+	t.Cleanup(func() {
+		// drain watcher goroutines before later-registered cleanups restore the
+		// package seams they read (cleanups run LIFO, so this runs first)
+		for _, s := range m.List() {
+			m.Kill(s.ID, "test-cleanup")
+		}
+		m.watchers.Wait()
+	})
+	return m
 }
 
 func TestLastMeaningfulLine(t *testing.T) {
@@ -122,5 +133,271 @@ func TestRecentLaunchesDedupAndOrder(t *testing.T) {
 	// newest first; the duplicate keeps its most recent occurrence
 	if out[0].Name != "n3" || out[1].Name != "n2" {
 		t.Errorf("unexpected order: %+v", out)
+	}
+}
+
+func TestNormalizeCapacity(t *testing.T) {
+	t.Parallel()
+	cases := []struct{ in, want int }{
+		{-3, defaultCapacity},
+		{0, defaultCapacity},
+		{1, 1},
+		{32, 32},
+		{256, 256},
+		{257, maxCapacity},
+		{5000, maxCapacity},
+	}
+	for _, tc := range cases {
+		if got := normalizeCapacity(tc.in); got != tc.want {
+			t.Errorf("normalizeCapacity(%d) = %d, want %d", tc.in, got, tc.want)
+		}
+	}
+}
+
+func TestRecentLaunchesCapacityRoundTrip(t *testing.T) {
+	t.Parallel()
+	root := testutil.ResolvedTempDir(t)
+	m := testManager(t, []string{root})
+
+	// a launch that overrode the default, journaled the way Create writes it
+	m.journal.Append(map[string]any{"event": evSessionStart, "id": "a", "name": "n1", "folder": root, "capacity": 4, "presetName": "fast"})
+	// a pre-capacity entry: no capacity or presetName keys at all
+	m.journal.Append(map[string]any{"event": evSessionStart, "id": "b", "name": "n2", "folder": root, "spawnMode": "worktree"})
+
+	out := m.RecentLaunches(10)
+	if len(out) != 2 {
+		t.Fatalf("expected 2 launches, got %+v", out)
+	}
+	// newest first: the pre-capacity entry defaults cleanly
+	if out[0].Capacity != defaultCapacity || out[0].PresetName != "" {
+		t.Errorf("pre-capacity entry did not default: %+v", out[0])
+	}
+	if out[1].Capacity != 4 || out[1].PresetName != "fast" {
+		t.Errorf("capacity/presetName round-trip failed: %+v", out[1])
+	}
+}
+
+func TestScanCapacity(t *testing.T) {
+	t.Parallel()
+	cases := []struct {
+		name      string
+		text      string
+		wantOK    bool
+		used, max int
+	}{
+		{"no line", "·✔︎· Connected · repo · main", false, 0, 0},
+		{"plain line", "Capacity: 1/32 · New sessions will be created in the current directory", true, 1, 32},
+		{"redraw supersedes", "Capacity: 1/32 · x\nstuff\nCapacity: 4/32 · x", true, 4, 32},
+		{"split then joined", "Capaci" + "ty: 2/32", true, 2, 32},
+		{"malformed numbers ignored", "Capacity: /32", false, 0, 0},
+	}
+	for _, tc := range cases {
+		t.Run(tc.name, func(t *testing.T) {
+			t.Parallel()
+			used, max, ok := scanCapacity(tc.text)
+			if ok != tc.wantOK || used != tc.used || max != tc.max {
+				t.Errorf("scanCapacity(%q) = %d, %d, %v; want %d, %d, %v", tc.text, used, max, ok, tc.used, tc.max, tc.wantOK)
+			}
+		})
+	}
+}
+
+func TestBranchStateAfterRemove(t *testing.T) {
+	t.Parallel()
+	repo := testutil.InitRepo(t)
+	gonePath := filepath.Join(repo, "no-such-worktree")
+
+	// a surviving worktree directory wins over any ref inspection
+	if got := branchStateAfterRemove(repo, repo, "gc/x"); got != branchWorktreeKept {
+		t.Errorf("existing path = %q, want %q", got, branchWorktreeKept)
+	}
+
+	// branch deleted by cleanup: nothing beyond the base survives
+	if got := branchStateAfterRemove(repo, gonePath, "gc/deleted"); got != branchMerged {
+		t.Errorf("missing branch = %q, want %q", got, branchMerged)
+	}
+
+	// branch with a commit main lacks
+	testutil.MustGit(t, repo, "switch", "-c", "gc/orbit")
+	testutil.CommitFile(t, repo, "orbit.txt", "orbit work", "")
+	testutil.MustGit(t, repo, "switch", "main")
+	if got := branchStateAfterRemove(repo, gonePath, "gc/orbit"); got != branchInOrbit {
+		t.Errorf("unmerged branch = %q, want %q", got, branchInOrbit)
+	}
+
+	// once merged into the default branch it stops being in orbit
+	testutil.MustGit(t, repo, "merge", "gc/orbit")
+	if got := branchStateAfterRemove(repo, gonePath, "gc/orbit"); got != branchMerged {
+		t.Errorf("merged branch = %q, want %q", got, branchMerged)
+	}
+}
+
+func TestListLanded(t *testing.T) {
+	t.Parallel()
+	root := testutil.ResolvedTempDir(t)
+	m := testManager(t, []string{root})
+
+	// worktree session whose exit entry carries a debrief
+	m.journal.Append(map[string]any{"event": evSessionStart, "id": "w1", "name": "wt", "folder": root, "spawnMode": "worktree", "branch": "main", "permissionMode": "acceptEdits"})
+	m.journal.Append(map[string]any{"event": evSessionExit, "id": "w1", "code": 0, "filesChanged": 2, "insertions": 5, "deletions": 1, "uncommitted": 1, "branchState": "in-orbit"})
+	// same-dir session: no debrief fields on the exit entry
+	m.journal.Append(map[string]any{"event": evSessionStart, "id": "s1", "name": "plain", "folder": root})
+	m.journal.Append(map[string]any{"event": evSessionExit, "id": "s1", "code": 1})
+	// never exited → not landed (it's lost or live, not landed)
+	m.journal.Append(map[string]any{"event": evSessionStart, "id": "r1", "name": "running", "folder": root})
+	// exited but the manager still lists it → excluded, it's already in "sessions"
+	m.journal.Append(map[string]any{"event": evSessionStart, "id": "live1", "name": "listed", "folder": root})
+	m.journal.Append(map[string]any{"event": evSessionExit, "id": "live1", "code": 0})
+	m.mu.Lock()
+	m.sessions["live1"] = &liveSession{Session: Session{ID: "live1", State: StateExited}}
+	m.mu.Unlock()
+	// folder outside the configured roots → excluded
+	m.journal.Append(map[string]any{"event": evSessionStart, "id": "out1", "name": "outside", "folder": "/definitely/not/in/roots"})
+	m.journal.Append(map[string]any{"event": evSessionExit, "id": "out1", "code": 0})
+
+	landed := m.ListLanded()
+	if len(landed) != 2 {
+		t.Fatalf("expected 2 landed sessions, got %+v", landed)
+	}
+	// newest start first
+	if landed[0].ID != "s1" || landed[1].ID != "w1" {
+		t.Fatalf("unexpected order: %+v", landed)
+	}
+	s1 := landed[0]
+	if s1.Debrief != nil {
+		t.Errorf("same-dir session carries a debrief: %+v", s1.Debrief)
+	}
+	if s1.SpawnMode != string(workspace.SpawnSameDir) || s1.PermissionMode != "default" {
+		t.Errorf("defaults not applied: %+v", s1)
+	}
+	if s1.ExitCode == nil || *s1.ExitCode != 1 {
+		t.Errorf("s1 exitCode = %v, want 1", s1.ExitCode)
+	}
+	w1 := landed[1]
+	if w1.Debrief == nil {
+		t.Fatalf("worktree session missing debrief: %+v", w1)
+	}
+	if w1.Debrief.FilesChanged != 2 || w1.Debrief.Insertions != 5 || w1.Debrief.Deletions != 1 || w1.Debrief.Uncommitted != 1 || w1.Debrief.BranchState != "in-orbit" {
+		t.Errorf("w1 debrief = %+v", w1.Debrief)
+	}
+	if w1.Branch == nil || *w1.Branch != "main" || w1.SpawnMode != "worktree" || w1.PermissionMode != "acceptEdits" {
+		t.Errorf("w1 launch config = %+v", w1)
+	}
+	if w1.StartedAt == "" || w1.ExitedAt == "" {
+		t.Errorf("w1 timestamps missing: %+v", w1)
+	}
+	if w1.ExitCode == nil || *w1.ExitCode != 0 {
+		t.Errorf("w1 exitCode = %v, want 0", w1.ExitCode)
+	}
+}
+
+func TestListLandedCap(t *testing.T) {
+	t.Parallel()
+	root := testutil.ResolvedTempDir(t)
+	m := testManager(t, []string{root})
+	for i := 0; i < landedCap+5; i++ {
+		id := fmt.Sprintf("id-%02d", i)
+		m.journal.Append(map[string]any{"event": evSessionStart, "id": id, "name": id, "folder": root})
+		m.journal.Append(map[string]any{"event": evSessionExit, "id": id, "code": 0})
+	}
+	landed := m.ListLanded()
+	if len(landed) != landedCap {
+		t.Fatalf("expected cap of %d, got %d", landedCap, len(landed))
+	}
+	// newest first: the last-started session leads, the oldest five fall off
+	if landed[0].ID != fmt.Sprintf("id-%02d", landedCap+4) || landed[landedCap-1].ID != "id-05" {
+		t.Errorf("unexpected window: first %s, last %s", landed[0].ID, landed[landedCap-1].ID)
+	}
+}
+
+// TestDismissedSessionsStayGone covers the landed-resurrection bug: Remove must
+// journal a dismissal so the journal-derived landed and lost views exclude the
+// id even after a runner restart rebuilds them from the journal.
+func TestDismissedSessionsStayGone(t *testing.T) {
+	t.Parallel()
+	root := testutil.ResolvedTempDir(t)
+	dir := t.TempDir()
+	m := managerOverJournal(t, dir, []string{root})
+
+	// a landed session: start + exit in the journal, still held in the map as
+	// exited (the real state when the user clicks Dismiss on an exited card)
+	m.journal.Append(map[string]any{"event": evSessionStart, "id": "landed1", "name": "l", "folder": root})
+	m.journal.Append(map[string]any{"event": evSessionExit, "id": "landed1", "code": 0})
+	insertLive(t, m, "landed1", root, StateExited)
+	// a lost session: start with no exit
+	m.journal.Append(map[string]any{"event": evSessionStart, "id": "lost1", "name": "x", "folder": root})
+
+	if removed, err := m.Remove("landed1"); err != nil || !removed {
+		t.Fatalf("Remove(landed1) = %v, %v", removed, err)
+	}
+	if got := m.ListLanded(); len(got) != 0 {
+		t.Errorf("dismissed landed card still listed: %+v", got)
+	}
+
+	// a fresh runner over the same journal must not resurrect the dismissed card
+	m2 := managerOverJournal(t, dir, []string{root})
+	if got := m2.ListLanded(); len(got) != 0 {
+		t.Errorf("dismissed landed card resurrected after restart: %+v", got)
+	}
+
+	// lost-headstone dismissal must be durable too: populate the cache, dismiss,
+	// then confirm a third runner doesn't re-derive it
+	if got := m2.ListLost(); len(got) != 1 || got[0].ID != "lost1" {
+		t.Fatalf("lost = %+v, want lost1", got)
+	}
+	if removed, err := m2.Remove("lost1"); err != nil || !removed {
+		t.Fatalf("Remove(lost1) = %v, %v", removed, err)
+	}
+	m3 := managerOverJournal(t, dir, []string{root})
+	for _, l := range m3.ListLost() {
+		if l.ID == "lost1" {
+			t.Errorf("dismissed lost session resurrected after restart: %+v", l)
+		}
+	}
+}
+
+// TestLandedReconstructionAndDismiss reconstructs a landed session from the
+// journal (the prior-runner history case) and verifies its debrief fields
+// survive, then that dismissing the landed id removes it permanently.
+func TestLandedReconstructionAndDismiss(t *testing.T) {
+	t.Parallel()
+	root := testutil.ResolvedTempDir(t)
+	dir := t.TempDir()
+	m := managerOverJournal(t, dir, []string{root})
+
+	m.journal.Append(map[string]any{
+		"event": evSessionStart, "id": "past1", "name": "orbit", "folder": root,
+		"spawnMode": "worktree", "branch": "gc/x", "permissionMode": "plan",
+	})
+	m.journal.Append(map[string]any{
+		"event": evSessionExit, "id": "past1", "code": 1, "branchState": "in-orbit",
+		"filesChanged": 1, "insertions": 2, "deletions": 0, "uncommitted": 0,
+	})
+
+	landed := m.ListLanded()
+	if len(landed) != 1 || landed[0].ID != "past1" {
+		t.Fatalf("landed = %+v, want past1", landed)
+	}
+	l := landed[0]
+	if l.Name != "orbit" || l.Folder != root || l.SpawnMode != "worktree" || l.ExitedAt == "" {
+		t.Errorf("landed entry = %+v", l)
+	}
+	if l.ExitCode == nil || *l.ExitCode != 1 {
+		t.Errorf("landed exitCode = %v, want 1", l.ExitCode)
+	}
+	if l.Debrief == nil || l.Debrief.BranchState != "in-orbit" || l.Debrief.FilesChanged != 1 || l.Debrief.Insertions != 2 {
+		t.Errorf("landed debrief = %+v", l.Debrief)
+	}
+
+	// a landed card (not in the live map) is dismissable and stays gone
+	if removed, err := m.Remove("past1"); err != nil || !removed {
+		t.Fatalf("Remove(past1) = %v, %v", removed, err)
+	}
+	if got := m.ListLanded(); len(got) != 0 {
+		t.Errorf("dismissed landed card still listed: %+v", got)
+	}
+	// an id the runner never launched is a genuine not-found
+	if removed, err := m.Remove("never"); err != nil || removed {
+		t.Errorf("Remove(unknown) = %v, %v, want false, nil", removed, err)
 	}
 }

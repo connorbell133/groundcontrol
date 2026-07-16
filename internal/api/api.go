@@ -35,7 +35,8 @@ import (
 // Documented in docs/api.md; adding a code is fine, renaming one is a breaking change.
 // Codes in use: unauthorized, insufficient_scope, invalid_json, missing_param,
 // invalid_param, invalid_path, invalid_config, outside_roots, not_found, not_ready,
-// ready_timeout, launch_failed, session_live, job_live, worktree_error, not_implemented.
+// ready_timeout, launch_failed, folder_in_use, session_live, job_live, worktree_error,
+// not_implemented, branch_held, branch_not_merged, payload_too_large.
 
 // scope names one capability a token can grant; the wire format stays the
 // plain string ("read" etc.) in config files and error messages.
@@ -115,9 +116,19 @@ func nonNil[T any](s []T) []T {
 // decodeBody unmarshals the request body into dst and writes the 400 itself
 // on failure: malformed JSON (or a non-object body) is invalid_json, a field
 // of the wrong JSON type is invalid_param. Unknown fields are ignored.
+// maxBodyBytes caps any JSON request body. Generous for the largest legitimate
+// payload (a 64 KB preset settings blob plus surrounding config) while keeping
+// an authed caller from streaming an unbounded body into memory.
+const maxBodyBytes = 2 << 20 // 2 MiB
+
 func decodeBody(w http.ResponseWriter, r *http.Request, dst any) bool {
-	data, err := io.ReadAll(r.Body)
+	data, err := io.ReadAll(http.MaxBytesReader(w, r.Body, maxBodyBytes))
 	if err != nil {
+		var tooLarge *http.MaxBytesError
+		if errors.As(err, &tooLarge) {
+			apiErr(w, 413, "payload_too_large", fmt.Sprintf("request body exceeds %d bytes", maxBodyBytes))
+			return false
+		}
 		apiErr(w, 400, "invalid_json", "request body must be valid JSON")
 		return false
 	}
@@ -304,10 +315,24 @@ type createSessionRequest struct {
 	SpawnMode      string `json:"spawnMode"`
 	Branch         string `json:"branch"`
 	PermissionMode string `json:"permissionMode"`
+	Capacity       int    `json:"capacity"`   // 0/absent → CLI default; normalized in Create, never rejected
+	PresetName     string `json:"presetName"` // journaled launch fact, so recents/relaunch can re-resolve it
 	// pointers so "sent but empty/zero" still fails validation while "absent"
 	// falls back cleanly
 	CallbackURL *string  `json:"callbackUrl"`
 	TimeoutMs   *float64 `json:"timeoutMs"` // only meaningful with ?wait=ready
+}
+
+// permissionModes is the CLI's six documented modes (2.1.210). Empty means
+// "let Create default it"; anything else fails fast here as invalid_param
+// instead of reaching claude.
+var permissionModes = map[string]bool{
+	"default":           true,
+	"acceptEdits":       true,
+	"plan":              true,
+	"auto":              true,
+	"dontAsk":           true,
+	"bypassPermissions": true,
 }
 
 type createJobRequest struct {
@@ -328,6 +353,7 @@ type putConfigRequest struct {
 	Roots      *[]string               `json:"roots"`
 	ShowHidden *bool                   `json:"showHidden"`
 	Webhooks   *[]events.WebhookConfig `json:"webhooks"`
+	Presets    *[]config.Preset        `json:"presets"`
 }
 
 // Handler returns the API handler, mounted by main at /api/v1 (canonical) and
@@ -376,6 +402,7 @@ func (s *Server) Handler() http.Handler {
 		roots := append([]string(nil), s.cfg.Roots...)
 		showHidden := s.cfg.ShowHidden
 		webhooks := append([]events.WebhookConfig(nil), s.cfg.Webhooks...)
+		presets := append([]config.Preset(nil), s.cfg.Presets...)
 		s.configMu.Unlock()
 		if webhooks == nil {
 			webhooks = []events.WebhookConfig{}
@@ -384,7 +411,8 @@ func (s *Server) Handler() http.Handler {
 			Roots      []string               `json:"roots"`
 			ShowHidden bool                   `json:"showHidden"`
 			Webhooks   []events.WebhookConfig `json:"webhooks"`
-		}{nonNil(roots), showHidden, webhooks})
+			Presets    []config.Preset        `json:"presets"`
+		}{nonNil(roots), showHidden, webhooks, nonNil(presets)})
 	}))
 
 	mux.HandleFunc("PUT /config", need(scopeAdmin, func(w http.ResponseWriter, r *http.Request) {
@@ -428,6 +456,53 @@ func (s *Server) Handler() http.Handler {
 				}
 			}
 		}
+		if req.Presets != nil {
+			seen := map[string]bool{}
+			for _, p := range *req.Presets {
+				if strings.TrimSpace(p.Name) == "" {
+					apiErr(w, 400, "invalid_config", "preset name must be non-empty")
+					return
+				}
+				if seen[p.Name] {
+					apiErr(w, 400, "invalid_config", fmt.Sprintf("duplicate preset name: %s", p.Name))
+					return
+				}
+				seen[p.Name] = true
+				switch p.PermissionMode {
+				case "", "default", "acceptEdits", "plan", "auto", "dontAsk", "bypassPermissions":
+				default:
+					apiErr(w, 400, "invalid_config", fmt.Sprintf("preset %s: unknown permission mode: %s", p.Name, p.PermissionMode))
+					return
+				}
+				switch p.SpawnMode {
+				case "", "same-dir", "worktree":
+				default:
+					apiErr(w, 400, "invalid_config", fmt.Sprintf("preset %s: unknown spawn mode: %s", p.Name, p.SpawnMode))
+					return
+				}
+				// 0 means unset — the launch default applies
+				if p.Capacity < 0 || p.Capacity > 256 {
+					apiErr(w, 400, "invalid_config", fmt.Sprintf("preset %s: capacity must be 1..256: %d", p.Name, p.Capacity))
+					return
+				}
+				if p.SettingsJSON != "" {
+					if len(p.SettingsJSON) > 64*1024 {
+						apiErr(w, 400, "invalid_config", fmt.Sprintf("preset %s: settings JSON exceeds 64 KB", p.Name))
+						return
+					}
+					// a nil map after a clean parse means the literal null
+					var settings map[string]json.RawMessage
+					if err := json.Unmarshal([]byte(p.SettingsJSON), &settings); err != nil || settings == nil {
+						apiErr(w, 400, "invalid_config", fmt.Sprintf("preset %s: settings JSON must be a JSON object", p.Name))
+						return
+					}
+					if bad := sessions.ForbiddenSettingsKey(settings); bad != "" {
+						apiErr(w, 400, "invalid_config", fmt.Sprintf("preset %s: settings key %q is not on the inert allowlist — keys that run commands, move credentials, or change permissions (hooks, apiKeyHelper, env, permissions, sandbox, …) are refused", p.Name, bad))
+						return
+					}
+				}
+			}
+		}
 
 		s.configMu.Lock()
 		defer s.configMu.Unlock()
@@ -439,6 +514,9 @@ func (s *Server) Handler() http.Handler {
 		}
 		if req.Webhooks != nil {
 			s.cfg.Webhooks = *req.Webhooks
+		}
+		if req.Presets != nil {
+			s.cfg.Presets = *req.Presets
 		}
 		s.applyAndPersistConfigLocked()
 		WriteJSON(w, 200, struct {
@@ -467,11 +545,60 @@ func (s *Server) Handler() http.Handler {
 		}{true})
 	}))
 
-	mux.HandleFunc("GET /sessions", need(scopeRead, func(w http.ResponseWriter, r *http.Request) {
+	mux.HandleFunc("GET /orbit", need(scopeRead, func(w http.ResponseWriter, r *http.Request) {
 		WriteJSON(w, 200, struct {
-			Sessions []sessions.Session     `json:"sessions"`
-			Lost     []sessions.LostSession `json:"lost"`
-		}{nonNil(s.sessions.List()), nonNil(s.sessions.ListLost())})
+			Orbit []sessions.OrbitBranch `json:"orbit"`
+		}{nonNil(s.sessions.ListOrbit())})
+	}))
+
+	mux.HandleFunc("DELETE /orbit", need(scopeAdmin, func(w http.ResponseWriter, r *http.Request) {
+		repo := r.URL.Query().Get("repo")
+		branch := r.URL.Query().Get("branch")
+		if repo == "" || branch == "" {
+			apiErr(w, 400, "missing_param", "repo and branch required")
+			return
+		}
+		// gc/ gate first — before any filesystem or git work, so a crafted
+		// name (a flag, a user branch) is refused outright
+		if !strings.HasPrefix(branch, "gc/") {
+			apiErr(w, 400, "invalid_param", "only gc/* session branches can be swept")
+			return
+		}
+		if !s.browser.WithinRoots(repo) || !util.PathExists(repo) {
+			apiErr(w, 400, "invalid_path", "repo outside configured roots, or gone")
+			return
+		}
+		err := s.sessions.SweepOrbitBranch(repo, branch)
+		switch {
+		case err == nil:
+			WriteJSON(w, 200, struct {
+				OK bool `json:"ok"`
+			}{true})
+		case errors.Is(err, sessions.ErrOrbitRepo):
+			apiErr(w, 400, "invalid_path", err.Error())
+		case errors.Is(err, sessions.ErrOrbitNotFound):
+			apiErr(w, 404, "not_found", err.Error())
+		case errors.Is(err, sessions.ErrOrbitHeld):
+			apiErr(w, 409, "branch_held", err.Error())
+		case errors.Is(err, sessions.ErrOrbitNotMerged):
+			// git refused the safe delete: unmerged commits — there is no
+			// force path; merge the work or clean its worktree first
+			apiErr(w, 409, "branch_not_merged", err.Error())
+		default:
+			// a transient git failure (timeout, index lock, permissions) — not
+			// the user's merge state; surface it as a server-side error
+			apiErr(w, 500, "worktree_error", err.Error())
+		}
+	}))
+
+	mux.HandleFunc("GET /sessions", need(scopeRead, func(w http.ResponseWriter, r *http.Request) {
+		// a reader is watching: flip the registry poller to its fast tier
+		s.sessions.MarkObserved()
+		WriteJSON(w, 200, struct {
+			Sessions []sessions.Session       `json:"sessions"`
+			Lost     []sessions.LostSession   `json:"lost"`
+			Landed   []sessions.LandedSession `json:"landed"`
+		}{nonNil(s.sessions.List()), nonNil(s.sessions.ListLost()), nonNil(s.sessions.ListLanded())})
 	}))
 
 	mux.HandleFunc("GET /journal/recent", need(scopeRead, func(w http.ResponseWriter, r *http.Request) {
@@ -552,6 +679,10 @@ func (s *Server) Handler() http.Handler {
 			apiErr(w, 400, "outside_roots", "folder outside configured roots")
 			return
 		}
+		if req.PermissionMode != "" && !permissionModes[req.PermissionMode] {
+			apiErr(w, 400, "invalid_param", "permissionMode must be one of default, acceptEdits, plan, auto, dontAsk, bypassPermissions")
+			return
+		}
 		var callbackURL string
 		if req.CallbackURL != nil {
 			if !httpURL.MatchString(*req.CallbackURL) {
@@ -561,16 +692,61 @@ func (s *Server) Handler() http.Handler {
 			callbackURL = *req.CallbackURL
 		}
 
+		// resolve the named preset: it fills only the launch options the
+		// request left empty (request wins), and supplies the settings JSON
+		// for injection. A name that no longer resolves is not an error —
+		// relaunching a deleted preset must keep working — the launch just
+		// proceeds without injection and carries the skip reason (R8).
+		var settingsJSON, settingsSkipReason string
+		if req.PresetName != "" {
+			s.configMu.Lock()
+			var preset *config.Preset
+			for i := range s.cfg.Presets {
+				if s.cfg.Presets[i].Name == req.PresetName {
+					preset = &s.cfg.Presets[i]
+					break
+				}
+			}
+			if preset != nil {
+				if req.PermissionMode == "" {
+					req.PermissionMode = preset.PermissionMode
+				}
+				if req.SpawnMode == "" {
+					req.SpawnMode = preset.SpawnMode
+				}
+				if req.Capacity < 1 {
+					// < 1 (unset or negative) takes the preset's capacity, matching
+					// normalizeCapacity which treats anything below 1 as "not asked"
+					req.Capacity = preset.Capacity
+				}
+				settingsJSON = preset.SettingsJSON
+			} else {
+				settingsSkipReason = "preset no longer exists"
+			}
+			s.configMu.Unlock()
+		}
+
 		session, err := s.sessions.Create(sessions.CreateOpts{
-			Folder:         req.Folder,
-			Name:           req.Name,
-			SpawnMode:      req.SpawnMode,
-			Branch:         req.Branch,
-			PermissionMode: req.PermissionMode,
-			CallbackURL:    callbackURL,
-			Actor:          actorOf(r).name,
+			Folder:             req.Folder,
+			Name:               req.Name,
+			SpawnMode:          req.SpawnMode,
+			Branch:             req.Branch,
+			PermissionMode:     req.PermissionMode,
+			Capacity:           req.Capacity,
+			PresetName:         req.PresetName,
+			SettingsJSON:       settingsJSON,
+			SettingsSkipReason: settingsSkipReason,
+			CallbackURL:        callbackURL,
+			Actor:              actorOf(r).name,
 		})
 		if err != nil {
+			// the one-live-environment-per-folder guard gets its own code so
+			// clients can distinguish it from a generic launch failure and flip
+			// the launch sheet to worktree mode
+			if errors.Is(err, sessions.ErrFolderInUse) {
+				apiErr(w, 409, "folder_in_use", err.Error())
+				return
+			}
 			apiErr(w, 409, "launch_failed", err.Error())
 			return
 		}

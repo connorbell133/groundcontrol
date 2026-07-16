@@ -1,11 +1,15 @@
 // Package sessions owns interactive remote-control sessions: a real PTY per
-// launch, lifecycle events, and the journal-derived views (recent launches,
-// lost sessions) that make a restarted runner honest about what it forgot.
+// launch, lifecycle events, registry-sourced enrichment (Claude conversation
+// ids, busy/idle activity, folder-mate sessions), and the journal-derived
+// views (recent launches, lost sessions) that make a restarted runner honest
+// about what it forgot.
 package sessions
 
 import (
+	"context"
 	"errors"
 	"fmt"
+	"log"
 	"os"
 	"os/exec"
 	"path/filepath"
@@ -39,13 +43,21 @@ const (
 )
 
 // session lifecycle event names; evSessionFailed is a derived match token
-// (announce adds it alongside a failed exit), never an emitted event itself
+// (announce adds it alongside a failed exit), never an emitted event itself.
+// evSessionClaudeID is journal-only: the registry poller appends it on first
+// UUID capture but never announces it — enrichment facts don't fan out (R8).
 const (
-	evSessionStart  = "session.start"
-	evSessionReady  = "session.ready"
-	evSessionKill   = "session.kill"
-	evSessionExit   = "session.exit"
-	evSessionFailed = "session.failed"
+	evSessionStart        = "session.start"
+	evSessionReady        = "session.ready"
+	evSessionKill         = "session.kill"
+	evSessionExit         = "session.exit"
+	evSessionFailed       = "session.failed"
+	evSessionClaudeID     = "session.claude-id"
+	evSessionInjectIntent = "session.inject-intent"
+	evSessionDismissed    = "session.dismissed"
+	// journal-only record that the scrape corrected a drifted pointer URL after
+	// ready; announced as session.ready so SSE clients re-render the card
+	evSessionPairingCorrected = "session.pairing-corrected"
 )
 
 type Session struct {
@@ -56,15 +68,76 @@ type Session struct {
 	Branch         *string             `json:"branch"`
 	WorktreePath   *string             `json:"worktreePath"`
 	PermissionMode string              `json:"permissionMode"`
-	State          State               `json:"state"`
-	PairingURL     *string             `json:"pairingUrl"`
-	CallbackURL    *string             `json:"callbackUrl"`
-	StartedAt      string              `json:"startedAt"`
-	ExitedAt       *string             `json:"exitedAt"`
-	ExitCode       *int                `json:"exitCode"`
-	LastOutputAt   *string             `json:"lastOutputAt"`
-	LastLine       *string             `json:"lastLine"`
+	// resolved --capacity: how many sessions claude.ai can create in this
+	// environment. Always populated from the normalized launch opts (the CLI
+	// default 32 when the launch didn't ask), so the card's "N of capacity"
+	// reads the live wire, never the journal.
+	Capacity     int     `json:"capacity"`
+	State        State   `json:"state"`
+	PairingURL   *string `json:"pairingUrl"`
+	CallbackURL  *string `json:"callbackUrl"`
+	StartedAt    string  `json:"startedAt"`
+	ExitedAt     *string `json:"exitedAt"`
+	ExitCode     *int    `json:"exitCode"`
+	LastOutputAt *string `json:"lastOutputAt"`
+	LastLine     *string `json:"lastLine"`
+	// scraped from the CLI's own "Capacity: used/max" status line — the
+	// environment's live session count, preferred over registry-derived
+	// counts when present. Absent until the line first appears, cleared at
+	// exit, never journaled. Max can disagree with Capacity if the CLI's
+	// default drifts; the scrape wins on the card.
+	CapacityUsed *int `json:"capacityUsed,omitempty"`
+	CapacityMax  *int `json:"capacityMax,omitempty"`
+	// why a requested settings injection didn't happen; absent whenever the
+	// file was injected or no preset settings were in play — the wire only
+	// ever explains absence, never claims success (R11)
+	SettingsSkipReason *string `json:"settingsSkipReason,omitempty"`
+	// registry-sourced enrichment: every field degrades to absence and none
+	// of them ever drives a state transition — the PTY stays the sole exit
+	// authority (R6)
+	ClaudeSessionID *string `json:"claudeSessionId,omitempty"`
+	Activity        *string `json:"activity,omitempty"`
+	// the environment's own live sessions (registry rows descended from the
+	// spawned pid, primary first) vs foreign sessions that merely share the
+	// launch folder — split at join time, where ownership is still knowable
+	EnvironmentSessions []ExtraSession `json:"environmentSessions,omitempty"`
+	FolderSessions      []ExtraSession `json:"folderSessions,omitempty"`
+	PRLink              *PRLink        `json:"prLink,omitempty"`
+	Debrief             *Debrief       `json:"debrief,omitempty"`
 }
+
+// ExtraSession is one live Claude session row, listed under
+// EnvironmentSessions (the environment's own sessions — descendants of the
+// spawned pid, phone- or claude.ai-created, primary first) or FolderSessions
+// (unrelated sessions — manual, IDE — that happen to run in the folder;
+// "in this folder" is the literal contract). Status carries only
+// "busy"/"idle"; any other registry value reads as absent, mirroring the
+// primary activity rule.
+type ExtraSession struct {
+	Name   string `json:"name"`
+	Status string `json:"status,omitempty"`
+}
+
+// Debrief records what a worktree run left behind, captured at exit because
+// the worktree (and any uncommitted work in it) is gone right after. Absent
+// for same-dir sessions and whenever git failed at exit time.
+type Debrief struct {
+	gitx.DiffStats
+	BranchState string `json:"branchState"`
+}
+
+// ErrFolderInUse is returned by Create when a same-dir launch collides with an
+// environment already launching or live in the same folder. The API maps it to
+// the folder_in_use error code — distinct from a generic launch_failed so
+// clients can key on it (e.g. to flip the launch sheet to worktree mode).
+var ErrFolderInUse = errors.New("folder already has a live environment")
+
+// branchState values: what actually survived worktree cleanup
+const (
+	branchMerged       = "merged"        // branch gone, or its tip reachable from the default branch
+	branchInOrbit      = "in-orbit"      // branch survived with commits the default branch lacks
+	branchWorktreeKept = "worktree-kept" // dirty worktree kept on disk, branch intact
+)
 
 type liveSession struct {
 	Session
@@ -73,10 +146,25 @@ type liveSession struct {
 	log    []string
 	killed bool
 	cwd    string // where claude actually runs: the worktree (or subfolder) in worktree mode
+	// which source set PairingURL (bridge.go); the scrape keeps scanning while
+	// the pointer holds it, so a drifted constructed URL can still be corrected
+	pairingSource string
+	// logged once when the CLI prints a claude.ai URL matching no known pairing
+	// shape — a drift tripwire, not per-chunk noise
+	pairingShapeWarned bool
 	// worktree cleanup context, captured at launch
 	repoRoot   string
 	wtBranch   string
 	baseCommit string
+	// settings.local.json this launch is responsible for (set whenever a
+	// preset carried settings, even when injection skipped — the marker check
+	// at removal protects user files); empty means nothing to tear down
+	settingsPath string
+	// registry enrichment bookkeeping, all guarded by m.mu
+	extrasSeen             map[string]extraRecord // last sighting per extra row, for wall-clock aging
+	activitySeenAt         time.Time              // last successful registry confirm of Activity
+	claudeIDConflictLogged bool                   // a disagreeing later sessionId is logged once, not per tick
+	prStatSize             int64                  // transcript size at the last pr-link scan (stat-gate)
 }
 
 // Manager owns the live session table. Lost-session and recent-launch views
@@ -86,10 +174,27 @@ type Manager struct {
 	sessions map[string]*liveSession
 	// names reserved by launches still between duplicate-check and insertion
 	pendingNames map[string]bool
+	// same-dir launches reserve their normalized folder across the slow spawn
+	// path, mirroring pendingNames: one live environment per folder (R-guard
+	// below in Create)
+	pendingFolders map[string]bool
+	// watchers tracks bridge-pointer goroutines so tests can drain them before
+	// restoring the package seams those goroutines read while alive
+	watchers sync.WaitGroup
 
 	lostMu       sync.Mutex
 	lostCache    []LostSession
 	lostComputed bool
+
+	// registry poller lifecycle (guarded by mu): regCtx arms the loop,
+	// regRunning guarantees at most one loop goroutine, observedAt feeds the
+	// watched cadence tier
+	regCtx     context.Context
+	regRunning bool
+	observedAt time.Time
+	// regWake cuts a slow poll sleep short when a reader appears; buffered so
+	// MarkObserved never blocks an API request
+	regWake chan struct{}
 
 	journal *journal.Journal
 	bus     *events.Bus
@@ -99,24 +204,47 @@ type Manager struct {
 
 func NewManager(j *journal.Journal, bus *events.Bus, ws *workspace.Manager, browser *browse.Browser) *Manager {
 	return &Manager{
-		sessions:     map[string]*liveSession{},
-		pendingNames: map[string]bool{},
-		journal:      j,
-		bus:          bus,
-		ws:           ws,
-		browser:      browser,
+		sessions:       map[string]*liveSession{},
+		pendingNames:   map[string]bool{},
+		pendingFolders: map[string]bool{},
+		regWake:        make(chan struct{}, 1),
+		journal:        j,
+		bus:            bus,
+		ws:             ws,
+		browser:        browser,
 	}
 }
 
 var (
 	ansiRE = regexp.MustCompile(`\x1b\[[0-9;?]*[a-zA-Z]|\x1b\][^\x07]*\x07?`)
-	urlRE  = regexp.MustCompile(`https://[^\s"'\x1b]+`)
+	// the two observed claude.ai pairing-URL shapes (2.1.210). The scrape keys
+	// on this narrow shape, not any https URL: an unrelated URL the CLI prints
+	// (an update banner, a docs link) must not be mistaken for the pairing URL
+	// and pin the source — which would let it clobber a correct pointer URL (R16).
+	pairingURLRE = regexp.MustCompile(`https://claude\.ai/(?:code\?environment=|remote/)[^\s"'\x1b]+`)
 	// box-drawing, blocks, braille spinners, and ASCII rule/spinner chars — lines of only these are visual noise
 	junkRE      = regexp.MustCompile(`[─-╿▀-▟⠀-⣿|\\/·•●◐◓◑◒~\-_=+*.\s]`)
 	trailingRE  = regexp.MustCompile(`[).,]+$`)
 	lineSplitRE = regexp.MustCompile(`[\r\n]+`)
 	alnumRE     = regexp.MustCompile(`[A-Za-z0-9]`)
+	capacityRE  = regexp.MustCompile(`Capacity:\s*(\d+)\s*/\s*(\d+)`)
 )
+
+// scanCapacity finds the newest "Capacity: used/max" pair in text — the TUI
+// redraws its status area, so later occurrences supersede earlier ones.
+func scanCapacity(text string) (used, max int, ok bool) {
+	ms := capacityRE.FindAllStringSubmatch(text, -1)
+	if len(ms) == 0 {
+		return 0, 0, false
+	}
+	last := ms[len(ms)-1]
+	u, err1 := strconv.Atoi(last[1])
+	x, err2 := strconv.Atoi(last[2])
+	if err1 != nil || err2 != nil {
+		return 0, 0, false
+	}
+	return u, x, true
+}
 
 func lastMeaningfulLine(log []string) string {
 	start := len(log) - 8
@@ -242,6 +370,21 @@ func (m *Manager) LiveWorktreePaths() map[string]bool {
 	return live
 }
 
+// LiveWorktreeBranches snapshots the gc/ branches checked out by running
+// sessions. Exited-but-undismissed sessions don't count: their surviving
+// branches are exactly what the orbit view exists to surface.
+func (m *Manager) LiveWorktreeBranches() map[string]bool {
+	live := map[string]bool{}
+	m.mu.Lock()
+	for _, s := range m.sessions {
+		if s.wtBranch != "" && s.State != StateExited && s.State != StateError {
+			live[s.wtBranch] = true
+		}
+	}
+	m.mu.Unlock()
+	return live
+}
+
 // WaitForReady blocks until the session pairs, dies, or the deadline passes —
 // 300ms poll is plenty against a multi-second provision and immune to event races.
 func (m *Manager) WaitForReady(id string, timeout time.Duration) string {
@@ -263,6 +406,39 @@ func (m *Manager) WaitForReady(id string, timeout time.Duration) string {
 
 type CreateOpts struct {
 	Folder, Name, SpawnMode, Branch, PermissionMode, CallbackURL, Actor string
+	// PresetName is the launch preset (if any) these opts came from — a
+	// durable launch fact journaled for recents/relaunch, never interpreted here.
+	PresetName string
+	// Capacity is the requested --capacity; zero means "not asked" and
+	// normalizes to the CLI default.
+	Capacity int
+	// SettingsJSON is the resolved preset's settings payload; non-empty asks
+	// Create to inject it as <launch cwd>/.claude/settings.local.json before
+	// spawn (inject.go owns the mechanism).
+	SettingsJSON string
+	// SettingsSkipReason pre-decides the injection outcome — the API layer
+	// sets it when the named preset no longer exists, so the relaunch still
+	// proceeds and the reason still reaches the journal and the wire (R8).
+	SettingsSkipReason string
+}
+
+// --capacity bounds, matching the CLI (default probed on 2.1.210). Requests
+// normalize instead of rejecting — absent or < 1 falls back to the default,
+// oversized clamps to 256 — so a pre-capacity recent replayed through
+// POST /sessions keeps launching.
+const (
+	defaultCapacity = 32
+	maxCapacity     = 256
+)
+
+func normalizeCapacity(n int) int {
+	switch {
+	case n < 1:
+		return defaultCapacity
+	case n > maxCapacity:
+		return maxCapacity
+	}
+	return n
 }
 
 func (m *Manager) Create(opts CreateOpts) (Session, error) {
@@ -300,10 +476,37 @@ func (m *Manager) Create(opts CreateOpts) (Session, error) {
 	if opts.SpawnMode == string(workspace.SpawnWorktree) {
 		mode = workspace.SpawnWorktree
 	}
+
+	// one live environment per folder for same-dir launches: a second one would
+	// register a second claude.ai environment with an identical picker label
+	// (environments are named by folder basename — verified 2.1.210), and one
+	// environment already holds up to --capacity sessions. Worktree launches
+	// get their own uniquely named folders and skip this.
+	if mode == workspace.SpawnSameDir {
+		folderKey := normalizePath(opts.Folder)
+		m.mu.Lock()
+		folderBusy := m.pendingFolders[folderKey]
+		if !folderBusy {
+			m.pendingFolders[folderKey] = true
+		}
+		m.mu.Unlock()
+		if folderBusy {
+			return Session{}, fmt.Errorf("%w: an environment is already launching in this folder — one live environment per folder; use worktree mode for a second", ErrFolderInUse)
+		}
+		defer func() {
+			m.mu.Lock()
+			delete(m.pendingFolders, folderKey)
+			m.mu.Unlock()
+		}()
+		if m.liveSameFolderExists(opts.Folder) {
+			return Session{}, fmt.Errorf("%w: an environment is already live in this folder — open that one in claude.ai, kill it, or launch in worktree mode (claude.ai labels same-folder environments identically)", ErrFolderInUse)
+		}
+	}
 	permissionMode := opts.PermissionMode
 	if permissionMode == "" {
 		permissionMode = "default"
 	}
+	capacity := normalizeCapacity(opts.Capacity)
 	id := util.RandomID(8)
 
 	worktreePath := ""
@@ -357,14 +560,39 @@ func (m *Manager) Create(opts CreateOpts) (Session, error) {
 		}
 	}
 
+	// preset settings injection — before spawn, into the launch cwd (the
+	// worktree in worktree mode), so the pre-created session reads the file
+	// natively; a skip never blocks the launch
+	settingsInjected := false
+	settingsReplaced := false
+	settingsSkipReason := opts.SettingsSkipReason
+	settingsPath := ""
+	if settingsSkipReason == "" && opts.SettingsJSON != "" {
+		settingsPath = settingsFilePath(cwd)
+		// journal the intent before writing the file so a crash between the
+		// write and the session.start entry still leaves a folder the boot
+		// sweep can find and reclaim (R12); a crash before the write leaves an
+		// intent with no file, which the marker-gated sweep no-ops on.
+		m.journal.Append(map[string]any{"event": evSessionInjectIntent, "id": id, "folder": opts.Folder})
+		settingsInjected, settingsReplaced, settingsSkipReason = m.injectSettings(settingsPath, cwd, opts.SettingsJSON, id)
+	}
+
 	// always --spawn same-dir: the runner already handled worktree creation itself
 	args := []string{"remote-control", "--name", name, "--spawn", string(workspace.SpawnSameDir), "--permission-mode", permissionMode}
+	if capacity != defaultCapacity {
+		// omitted at the default so launches keep working on CLIs that predate --capacity
+		args = append(args, "--capacity", strconv.Itoa(capacity))
+	}
 	// real PTY: the CLI prints its pairing URL and stays alive as it would in a terminal
 	cmd := exec.Command("claude", args...)
 	cmd.Dir = cwd
 	cmd.Env = append(os.Environ(), "FORCE_COLOR=0", "NO_COLOR=1", "TERM=xterm-256color")
 	ptmx, err := pty.StartWithSize(cmd, &pty.Winsize{Rows: 40, Cols: 120})
 	if err != nil {
+		if settingsInjected {
+			// no session will ever tear this down — reclaim it here
+			removeMarkedSettings(settingsPath)
+		}
 		if worktreePath != "" {
 			m.ws.Remove(repoRootForCleanup, worktreePath, wtBranch, baseCommit)
 		}
@@ -380,6 +608,7 @@ func (m *Manager) Create(opts CreateOpts) (Session, error) {
 			Branch:         util.StrPtr(branch),
 			WorktreePath:   util.StrPtr(worktreePath),
 			PermissionMode: permissionMode,
+			Capacity:       capacity,
 			State:          StateStarting,
 			PairingURL:     nil,
 			CallbackURL:    util.StrPtr(opts.CallbackURL),
@@ -388,18 +617,32 @@ func (m *Manager) Create(opts CreateOpts) (Session, error) {
 			ExitCode:       nil,
 			LastOutputAt:   nil,
 			LastLine:       nil,
+			// present only when injection was requested but skipped (R11)
+			SettingsSkipReason: util.StrPtr(settingsSkipReason),
 		},
-		ptmx:       ptmx,
-		cmd:        cmd,
-		cwd:        cwd,
-		repoRoot:   repoRootForCleanup,
-		wtBranch:   wtBranch,
-		baseCommit: baseCommit,
+		ptmx:         ptmx,
+		cmd:          cmd,
+		cwd:          cwd,
+		repoRoot:     repoRootForCleanup,
+		wtBranch:     wtBranch,
+		baseCommit:   baseCommit,
+		settingsPath: settingsPath,
 	}
 	m.mu.Lock()
 	m.sessions[id] = s
 	snap := s.Session
+	// arm the registry poller on the 0→1 live-session transition: regRunning
+	// flips under the same lock the loop uses when it observes zero live
+	// sessions, so exactly one loop goroutine can exist at a time
+	startPoll := m.regCtx != nil && !m.regRunning
+	if startPoll {
+		m.regRunning = true
+	}
+	regCtx := m.regCtx
 	m.mu.Unlock()
+	if startPoll {
+		go m.registryLoop(regCtx)
+	}
 
 	entry := map[string]any{
 		"event":          evSessionStart,
@@ -410,6 +653,24 @@ func (m *Manager) Create(opts CreateOpts) (Session, error) {
 		"branch":         util.StrPtr(branch),
 		"permissionMode": permissionMode,
 	}
+	if capacity != defaultCapacity {
+		// journaled exactly when the flag is spawned, so entry presence mirrors
+		// the args and a defaulted (or pre-capacity) entry reads back as 32
+		entry["capacity"] = capacity
+	}
+	if opts.PresetName != "" {
+		entry["presetName"] = opts.PresetName
+	}
+	// injection outcome flattens into session.start — never a standalone
+	// event: it's a launch fact, and the startup sweep reads it back from here
+	if settingsInjected {
+		entry["settingsInjected"] = true
+		if settingsReplaced {
+			entry["settingsNote"] = noteReplacedStale
+		}
+	} else if settingsSkipReason != "" {
+		entry["settingsSkipReason"] = settingsSkipReason
+	}
 	if opts.Actor != "" {
 		entry["actor"] = opts.Actor
 	}
@@ -417,6 +678,12 @@ func (m *Manager) Create(opts CreateOpts) (Session, error) {
 	m.announce(evSessionStart, snap, false)
 
 	go m.readLoop(s)
+	// primary pairing-URL source; short-lived, ends at first resolution or timeout
+	m.watchers.Add(1)
+	go func() {
+		defer m.watchers.Done()
+		m.watchBridgePointer(s, cmd.Process.Pid)
+	}()
 
 	return snap, nil
 }
@@ -427,8 +694,8 @@ func (m *Manager) readLoop(s *liveSession) {
 		n, err := s.ptmx.Read(buf)
 		if n > 0 {
 			chunk := string(buf[:n])
-			var readySnap *Session
-			var readyURL string
+			var readySnap, correctedSnap *Session
+			var readyURL, correctedURL string
 			m.mu.Lock()
 			s.LastOutputAt = util.StrPtr(util.NowISO())
 			text := ansiRE.ReplaceAllString(chunk, "")
@@ -439,14 +706,37 @@ func (m *Manager) readLoop(s *liveSession) {
 			if line := lastMeaningfulLine(s.log); line != "" {
 				s.LastLine = util.StrPtr(line)
 			}
-			if s.PairingURL == nil {
-				if found := urlRE.FindString(strings.Join(s.log, "")); found != "" {
+			// a chunk boundary can split the capacity line, so scan a short log
+			// tail rather than the chunk; no match keeps the last known value
+			capTail := s.log
+			if len(capTail) > 4 {
+				capTail = capTail[len(capTail)-4:]
+			}
+			if used, max, ok := scanCapacity(strings.Join(capTail, "")); ok {
+				s.CapacityUsed = util.IntPtr(used)
+				s.CapacityMax = util.IntPtr(max)
+			}
+			// keep scanning past ready while the bridge pointer holds the URL:
+			// the CLI's own output must be able to overrule a constructed URL
+			if s.PairingURL == nil || s.pairingSource == pairingSourcePointer {
+				joined := strings.Join(s.log, "")
+				if found := pairingURLRE.FindString(joined); found != "" {
 					url := trailingRE.ReplaceAllString(found, "")
-					s.PairingURL = &url
-					s.State = StateReady
-					readyURL = url
-					snap := s.Session
-					readySnap = &snap
+					if snap := s.setReadyLocked(url, pairingSourceScrape); snap != nil {
+						readyURL, readySnap = url, snap
+					} else if snap := s.reconcileScrapedURLLocked(url); snap != nil {
+						// scrape corrected a drifted pointer URL — journal and
+						// announce it so SSE clients converge (R17). A distinct
+						// event, not a second session.ready: the ready transition
+						// still happens exactly once.
+						correctedURL, correctedSnap = url, snap
+					}
+				} else if strings.Contains(joined, "claude.ai/") && !s.pairingShapeWarned {
+					// a claude.ai URL is present but no known pairing shape
+					// matched — the CLI's URL shape may have drifted; surface it
+					// in logs instead of silently failing to pair (tripwire)
+					s.pairingShapeWarned = true
+					log.Printf("session %s: a claude.ai URL is present but matches no known pairing shape — the pairing-URL shape may have drifted", s.ID)
 				}
 			}
 			id := s.ID
@@ -454,6 +744,10 @@ func (m *Manager) readLoop(s *liveSession) {
 			if readySnap != nil {
 				m.journal.Append(map[string]any{"event": evSessionReady, "id": id, "pairingUrl": readyURL})
 				m.announce(evSessionReady, *readySnap, false)
+			}
+			if correctedSnap != nil {
+				m.journal.Append(map[string]any{"event": evSessionPairingCorrected, "id": id, "pairingUrl": correctedURL})
+				m.announce(evSessionReady, *correctedSnap, false)
 			}
 		}
 		if err != nil {
@@ -484,6 +778,12 @@ func (m *Manager) readLoop(s *liveSession) {
 	}
 	s.ExitedAt = util.StrPtr(util.NowISO())
 	s.ExitCode = util.IntPtr(exitCode)
+	// exit is authoritative for registry enrichment too: a "busy" chip must
+	// die with the session (the poller's state guard keeps a stale snapshot
+	// from resurrecting it), while the extras list freezes as-is
+	s.Activity = nil
+	// capacity describes a live environment; a dead card must not claim one
+	s.CapacityUsed, s.CapacityMax = nil, nil
 	s.ptmx = nil
 	id := s.ID
 	killed := s.killed
@@ -496,14 +796,73 @@ func (m *Manager) readLoop(s *liveSession) {
 		cleanupRoot = s.Folder
 	}
 	wtBranch, baseCommit := s.wtBranch, s.baseCommit
+	settingsPath, cwd := s.settingsPath, s.cwd
 	snap := s.Session
 	m.mu.Unlock()
 
-	if wtPath != "" {
-		m.ws.Remove(cleanupRoot, wtPath, wtBranch, baseCommit)
+	if settingsPath != "" {
+		// before the debrief and worktree cleanup: the injected file must not
+		// count as the run's own uncommitted work or keep a worktree dirty.
+		// Removal defers to the last same-folder exit; the marker check keeps
+		// user files untouchable either way (inject.go).
+		m.removeSettingsIfLast(settingsPath, cwd)
 	}
-	m.journal.Append(map[string]any{"event": evSessionExit, "id": id, "code": exitCode})
+
+	var debrief *Debrief
+	if wtPath != "" {
+		// stats must precede Remove — the worktree and its uncommitted work are
+		// about to be deleted. Best-effort throughout: any git failure means an
+		// absent debrief, never a blocked teardown.
+		if st, err := gitx.DiffStat(wtPath, baseCommit); err == nil {
+			debrief = &Debrief{DiffStats: st}
+		}
+		m.ws.Remove(cleanupRoot, wtPath, wtBranch, baseCommit)
+		if debrief != nil {
+			// after Remove: disk and refs are reality, not Remove's intent
+			debrief.BranchState = branchStateAfterRemove(cleanupRoot, wtPath, wtBranch)
+		}
+	}
+	if debrief != nil {
+		m.mu.Lock()
+		s.Debrief = debrief
+		snap = s.Session
+		m.mu.Unlock()
+	}
+	exitEntry := map[string]any{"event": evSessionExit, "id": id, "code": exitCode}
+	if snap.ClaudeSessionID != nil {
+		// flattened like the debrief fields so ListLanded (and a restarted
+		// runner) can read it off the exit entry even after the standalone
+		// session.claude-id event scrolls off the journal's read window
+		exitEntry["claudeSessionId"] = *snap.ClaudeSessionID
+	}
+	if debrief != nil {
+		exitEntry["filesChanged"] = debrief.FilesChanged
+		exitEntry["insertions"] = debrief.Insertions
+		exitEntry["deletions"] = debrief.Deletions
+		exitEntry["uncommitted"] = debrief.Uncommitted
+		exitEntry["branchState"] = debrief.BranchState
+	}
+	m.journal.Append(exitEntry)
 	m.announce(evSessionExit, snap, killed)
+}
+
+// branchStateAfterRemove inspects what workspace.Remove actually left behind
+// rather than plumbing its decisions back out: the answer stays honest even
+// when Remove's internals change.
+func branchStateAfterRemove(root, wtPath, wtBranch string) string {
+	if util.PathExists(wtPath) {
+		return branchWorktreeKept // removal refused (dirty) — the work is still on disk
+	}
+	tip, err := gitx.Out(root, 5*time.Second, "rev-parse", "--verify", "--quiet", "refs/heads/"+wtBranch)
+	if err != nil || tip == "" {
+		return branchMerged // Remove deleted the no-commit branch: nothing beyond the base survives
+	}
+	if def := gitx.DefaultRef(root); def != "" {
+		if gitx.Run(root, 5*time.Second, "merge-base", "--is-ancestor", tip, def) == nil {
+			return branchMerged
+		}
+	}
+	return branchInOrbit
 }
 
 func (m *Manager) Kill(id, actor string) *Session {
@@ -534,21 +893,55 @@ func (m *Manager) Remove(id string) (bool, error) {
 	s, ok := m.sessions[id]
 	if !ok {
 		m.mu.Unlock()
-		// lost-session headstones dismiss through the same endpoint
+		// not in the live map: a lost headstone, a landed (prior-runner) session,
+		// or an unknown id. Splice the headstone cache if present, then journal a
+		// dismissal for any id the journal knows so ListLanded/ListLost drop it —
+		// including across a restart. A genuinely unknown id is a 404.
 		m.lostMu.Lock()
-		defer m.lostMu.Unlock()
 		for i, l := range m.lostCache {
 			if l.ID == id {
 				m.lostCache = append(m.lostCache[:i], m.lostCache[i+1:]...)
-				return true, nil
+				break
 			}
 		}
-		return false, nil
+		m.lostMu.Unlock()
+		if !m.knownInJournal(id) {
+			return false, nil
+		}
+		m.journalDismissal(id)
+		return true, nil
 	}
-	defer m.mu.Unlock()
 	if s.State != StateExited && s.State != StateError {
+		m.mu.Unlock()
 		return false, errors.New("session is still live; kill it first")
 	}
 	delete(m.sessions, id)
+	m.mu.Unlock()
+	// journal the dismissal (outside the lock — it does disk IO): ListLanded
+	// rebuilds ended sessions from the journal, so without this marker the card
+	// resurrects on the next poll
+	m.journalDismissal(id)
 	return true, nil
+}
+
+// knownInJournal reports whether the id has a session.start entry — i.e. it is
+// a real session (live, lost, or landed), not an unknown id. Used to keep
+// DELETE /sessions/{id}/record a 404 for ids the runner never launched.
+func (m *Manager) knownInJournal(id string) bool {
+	for _, e := range m.journal.Read() {
+		if jStr(e, "id") == id && jStr(e, "event") == evSessionStart {
+			return true
+		}
+	}
+	return false
+}
+
+// journalDismissal records a session.dismissed marker so the journal-derived
+// landed and lost views permanently exclude the id. A flat named event read
+// with the tolerant jStr idiom — no generic fact envelope (deliberately
+// rejected in prior work); it may scroll off the 2000-entry read window while
+// its exit entry survives, the same tolerance the landed/lost views already
+// carry.
+func (m *Manager) journalDismissal(id string) {
+	m.journal.Append(map[string]any{"event": evSessionDismissed, "id": id})
 }

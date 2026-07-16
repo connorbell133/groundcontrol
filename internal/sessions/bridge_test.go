@@ -486,6 +486,12 @@ func TestBridgeScrapedURLWinsOnDisagreementE2E(t *testing.T) {
 	if n, _ := readyEntries(m, s.ID); n != 1 {
 		t.Errorf("overwrite produced a second session.ready (n=%d)", n)
 	}
+	// R17: the correction is journaled (a distinct event) and announced so SSE
+	// clients converge on the corrected URL
+	corr := journalEntries(m, evSessionPairingCorrected, s.ID)
+	if len(corr) != 1 || corr[0]["pairingUrl"] != scraped {
+		t.Errorf("correction journal = %+v, want one session.pairing-corrected with %q", corr, scraped)
+	}
 	if n := strings.Count(logBuf.String(), "disagrees"); n != 1 {
 		t.Errorf("drift tripwire logged %d times, want exactly 1\n%s", n, logBuf.String())
 	}
@@ -508,4 +514,31 @@ func (w *syncBuffer) String() string {
 	w.mu.Lock()
 	defer w.mu.Unlock()
 	return w.b.String()
+}
+
+func TestPairingURLRE(t *testing.T) {
+	t.Parallel()
+	match := []string{
+		"https://claude.ai/code?environment=env_abc123",
+		"https://claude.ai/remote/scraped999",
+		"noise https://claude.ai/remote/xyz trailing",
+	}
+	for _, s := range match {
+		if pairingURLRE.FindString(s) == "" {
+			t.Errorf("expected a pairing-URL match in %q", s)
+		}
+	}
+	// unrelated URLs the CLI might print must NOT be mistaken for a pairing URL
+	// (R16): an update banner, a docs link, or another claude.ai path
+	nomatch := []string{
+		"https://claude.ai/download",
+		"https://docs.anthropic.com/claude-code",
+		"visit https://example.com/code?environment=x",
+		"https://claude.ai/",
+	}
+	for _, s := range nomatch {
+		if got := pairingURLRE.FindString(s); got != "" {
+			t.Errorf("unrelated URL matched pairing regex: %q -> %q", s, got)
+		}
+	}
 }

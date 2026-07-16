@@ -3,6 +3,7 @@ package sessions
 import (
 	"errors"
 	"fmt"
+	"strings"
 	"time"
 
 	"github.com/connorbell133/groundcontrol/internal/gitx"
@@ -118,7 +119,8 @@ func (m *Manager) ListLost() []LostSession {
 	claudeIDs := map[string]string{}
 	for _, e := range entries {
 		ev := jStr(e, "event")
-		if (ev == evSessionExit || ev == evSessionKill) && jStr(e, "id") != "" {
+		if (ev == evSessionExit || ev == evSessionKill || ev == evSessionDismissed) && jStr(e, "id") != "" {
+			// dismissed lost headstones must not re-derive on a cache rebuild
 			terminated[jStr(e, "id")] = true
 		}
 		if ev == evSessionClaudeID && jStr(e, "id") != "" {
@@ -236,9 +238,10 @@ func (m *Manager) ListOrbit() []OrbitBranch {
 
 // Orbit sweep failures the API maps to distinct stable error codes.
 var (
-	ErrOrbitRepo     = errors.New("repo is not a git repository")
-	ErrOrbitNotFound = errors.New("no such gc/ branch")
-	ErrOrbitHeld     = errors.New("branch is held")
+	ErrOrbitRepo      = errors.New("repo is not a git repository")
+	ErrOrbitNotFound  = errors.New("no such gc/ branch")
+	ErrOrbitHeld      = errors.New("branch is held")
+	ErrOrbitNotMerged = errors.New("branch has unmerged commits")
 )
 
 // SweepOrbitBranch safe-deletes one gc/* branch. Never a force delete: git's
@@ -267,8 +270,17 @@ func (m *Manager) SweepOrbitBranch(repo, branch string) error {
 		// delete a branch out from under a checkout anyway
 		return fmt.Errorf("%w by worktree %s", ErrOrbitHeld, found.WorktreePath)
 	}
-	// "--" so a crafted branch name can never read as a flag
-	if err := gitx.Run(repo, 10*time.Second, "branch", "-d", "--", branch); err != nil {
+	// "--" so a crafted branch name can never read as a flag. Full stderr (not
+	// just the last line) so the "not fully merged" refusal is distinguishable
+	// from a transient failure (timeout, index lock) — the API maps them to
+	// different status codes.
+	if stderr, err := gitx.Stderr(repo, 10*time.Second, "branch", "-d", "--", branch); err != nil {
+		if strings.Contains(stderr, "not fully merged") {
+			return fmt.Errorf("%w: %s", ErrOrbitNotMerged, branch)
+		}
+		if stderr != "" {
+			return errors.New(stderr)
+		}
 		return err
 	}
 	m.journal.Append(map[string]any{"event": "orbit.swept", "repo": repo, "branch": branch})
@@ -310,9 +322,17 @@ func (m *Manager) ListLanded() []LandedSession {
 
 	entries := m.journal.Read()
 	exits := map[string]map[string]any{}
+	dismissed := map[string]bool{}
 	for _, e := range entries {
-		if jStr(e, "event") == evSessionExit && jStr(e, "id") != "" {
-			exits[jStr(e, "id")] = e
+		switch jStr(e, "event") {
+		case evSessionExit:
+			if jStr(e, "id") != "" {
+				exits[jStr(e, "id")] = e
+			}
+		case evSessionDismissed:
+			if jStr(e, "id") != "" {
+				dismissed[jStr(e, "id")] = true
+			}
 		}
 	}
 	cutoff := time.Now().Add(-lostWindow)
@@ -327,7 +347,7 @@ func (m *Manager) ListLanded() []LandedSession {
 		}
 		seen[id] = true
 		exit, ok := exits[id]
-		if !ok || liveIDs[id] {
+		if !ok || liveIDs[id] || dismissed[id] {
 			continue
 		}
 		exitedAt := jStr(exit, "at")

@@ -383,7 +383,7 @@ func TestJoinRegistryFallback(t *testing.T) {
 			t.Errorf("uuid match should bind regardless of cwd and ps: %+v", j)
 		}
 		if len(j.extras) != 1 || !j.extras[0].owned || !j.extras[0].primary {
-			t.Errorf("uuid-bound primary must emit as an owned primary row: %+v", j.extras)
+			t.Errorf("66666666-6666-4666-8666-666666666666 primary must emit as an owned primary row: %+v", j.extras)
 		}
 	})
 }
@@ -408,25 +408,25 @@ func TestApplyRegistryTickFirstCaptureWins(t *testing.T) {
 	window := time.Minute
 	snaps := []regSessionSnap{{id: "s1"}}
 
-	captures, _ := m.applyRegistryTick(snaps, map[string]*regJoin{"s1": {rowSeen: true, uuid: "conv-1", activity: "busy"}}, true, window, now)
-	if len(captures) != 1 || captures[0].uuid != "conv-1" {
-		t.Fatalf("first tick should capture conv-1, got %+v", captures)
+	captures, _ := m.applyRegistryTick(snaps, map[string]*regJoin{"s1": {rowSeen: true, uuid: "11111111-1111-4111-8111-111111111111", activity: "busy"}}, true, window, now)
+	if len(captures) != 1 || captures[0].uuid != "11111111-1111-4111-8111-111111111111" {
+		t.Fatalf("first tick should capture 11111111-1111-4111-8111-111111111111, got %+v", captures)
 	}
 	got := m.Get("s1")
-	if got.ClaudeSessionID == nil || *got.ClaudeSessionID != "conv-1" {
-		t.Fatalf("claudeSessionId = %v, want conv-1", got.ClaudeSessionID)
+	if got.ClaudeSessionID == nil || *got.ClaudeSessionID != "11111111-1111-4111-8111-111111111111" {
+		t.Fatalf("claudeSessionId = %v, want 11111111-1111-4111-8111-111111111111", got.ClaudeSessionID)
 	}
 	if got.Activity == nil || *got.Activity != "busy" {
 		t.Errorf("activity = %v, want busy", got.Activity)
 	}
 
 	// a later disagreeing sessionId never overwrites and never re-captures
-	captures, _ = m.applyRegistryTick(snaps, map[string]*regJoin{"s1": {rowSeen: true, uuid: "conv-2", activity: "idle"}}, true, window, now.Add(time.Second))
+	captures, _ = m.applyRegistryTick(snaps, map[string]*regJoin{"s1": {rowSeen: true, uuid: "22222222-2222-4222-8222-222222222222", activity: "idle"}}, true, window, now.Add(time.Second))
 	if len(captures) != 0 {
 		t.Errorf("disagreement must not produce a capture: %+v", captures)
 	}
 	got = m.Get("s1")
-	if got.ClaudeSessionID == nil || *got.ClaudeSessionID != "conv-1" {
+	if got.ClaudeSessionID == nil || *got.ClaudeSessionID != "11111111-1111-4111-8111-111111111111" {
 		t.Errorf("first capture must win, got %v", got.ClaudeSessionID)
 	}
 	if !s.claudeIDConflictLogged {
@@ -446,7 +446,7 @@ func TestApplyRegistryTickStateGuard(t *testing.T) {
 		insertLive(t, m, id, "/w/a", state)
 		captures, scans := m.applyRegistryTick(
 			[]regSessionSnap{{id: id}},
-			map[string]*regJoin{id: {rowSeen: true, uuid: "conv-late", activity: "busy", extras: []extraRow{{key: "k", name: "n", owned: true, primary: true}, {key: "k2", name: "n2"}}}},
+			map[string]*regJoin{id: {rowSeen: true, uuid: "55555555-5555-4555-8555-555555555555", activity: "busy", extras: []extraRow{{key: "k", name: "n", owned: true, primary: true}, {key: "k2", name: "n2"}}}},
 			true, time.Minute, time.Now(),
 		)
 		if len(scans) != 0 {
@@ -752,7 +752,7 @@ func TestExitForceClearsActivityAndFreezesExtras(t *testing.T) {
 	m.mu.Lock()
 	ls := m.sessions[created.ID]
 	busy := "busy"
-	uuid := "conv-exit"
+	uuid := "33333333-3333-4333-8333-333333333333"
 	ls.Activity = &busy
 	ls.ClaudeSessionID = &uuid
 	ls.EnvironmentSessions = []ExtraSession{{Name: "frozen-env", Status: "busy"}}
@@ -768,7 +768,7 @@ func TestExitForceClearsActivityAndFreezesExtras(t *testing.T) {
 		len(got.FolderSessions) != 1 || got.FolderSessions[0].Name != "frozen-mate" {
 		t.Errorf("both lists must freeze at exit, got env=%+v folder=%+v", got.EnvironmentSessions, got.FolderSessions)
 	}
-	if got.ClaudeSessionID == nil || *got.ClaudeSessionID != "conv-exit" {
+	if got.ClaudeSessionID == nil || *got.ClaudeSessionID != "33333333-3333-4333-8333-333333333333" {
 		t.Errorf("claudeSessionId must survive exit, got %v", got.ClaudeSessionID)
 	}
 
@@ -777,8 +777,8 @@ func TestExitForceClearsActivityAndFreezesExtras(t *testing.T) {
 		return len(journalEntries(m, evSessionExit, created.ID)) == 1
 	})
 	exit := journalEntries(m, evSessionExit, created.ID)[0]
-	if exit["claudeSessionId"] != "conv-exit" {
-		t.Errorf("exit entry claudeSessionId = %v, want conv-exit", exit["claudeSessionId"])
+	if exit["claudeSessionId"] != "33333333-3333-4333-8333-333333333333" {
+		t.Errorf("exit entry claudeSessionId = %v, want 33333333-3333-4333-8333-333333333333", exit["claudeSessionId"])
 	}
 }
 
@@ -850,13 +850,13 @@ func TestRegistryLoopCaptureActivityAndJournal(t *testing.T) {
 	// grandchild of the spawned launcher (via forked server 88000)
 	h.setPs(map[int]int{88001: 88000, 88000: launcher})
 	h.set([]claudex.Agent{
-		{PID: 88001, Cwd: cwd, SessionID: "conv-1", Name: "gc-auto-1", Status: "busy", StartedAt: time.Now().UnixMilli()},
-		{PID: 99001, Cwd: cwd, SessionID: "conv-extra", Name: "folder-mate", Status: "idle", StartedAt: time.Now().UnixMilli()},
+		{PID: 88001, Cwd: cwd, SessionID: "11111111-1111-4111-8111-111111111111", Name: "gc-auto-1", Status: "busy", StartedAt: time.Now().UnixMilli()},
+		{PID: 99001, Cwd: cwd, SessionID: "44444444-4444-4444-8444-444444444444", Name: "folder-mate", Status: "idle", StartedAt: time.Now().UnixMilli()},
 	}, nil)
 
 	waitFor(t, 10*time.Second, "uuid capture and busy activity", func() bool {
 		s := m.Get(created.ID)
-		return s.ClaudeSessionID != nil && *s.ClaudeSessionID == "conv-1" &&
+		return s.ClaudeSessionID != nil && *s.ClaudeSessionID == "11111111-1111-4111-8111-111111111111" &&
 			s.Activity != nil && *s.Activity == "busy"
 	})
 	waitFor(t, 10*time.Second, "environment and folder rows", func() bool {
@@ -869,17 +869,17 @@ func TestRegistryLoopCaptureActivityAndJournal(t *testing.T) {
 
 	// a later disagreeing sessionId never overwrites the capture
 	h.set([]claudex.Agent{
-		{PID: 88001, Cwd: cwd, SessionID: "conv-2", Name: "gc-auto-1", Status: "busy", StartedAt: time.Now().UnixMilli()},
+		{PID: 88001, Cwd: cwd, SessionID: "22222222-2222-4222-8222-222222222222", Name: "gc-auto-1", Status: "busy", StartedAt: time.Now().UnixMilli()},
 	}, nil)
 	time.Sleep(20 * registryFastInterval)
-	if s := m.Get(created.ID); s.ClaudeSessionID == nil || *s.ClaudeSessionID != "conv-1" {
+	if s := m.Get(created.ID); s.ClaudeSessionID == nil || *s.ClaudeSessionID != "11111111-1111-4111-8111-111111111111" {
 		t.Errorf("claudeSessionId = %v, first capture must win", s.ClaudeSessionID)
 	}
 
 	// exactly one journal capture across all those ticks, and never a bus event
 	if entries := journalEntries(m, evSessionClaudeID, created.ID); len(entries) != 1 {
 		t.Fatalf("session.claude-id journal entries = %d, want exactly 1", len(entries))
-	} else if entries[0]["claudeSessionId"] != "conv-1" {
+	} else if entries[0]["claudeSessionId"] != "11111111-1111-4111-8111-111111111111" {
 		t.Errorf("journaled claudeSessionId = %v", entries[0]["claudeSessionId"])
 	}
 	seenMu.Lock()
@@ -910,8 +910,8 @@ func TestRegistryLoopCaptureActivityAndJournal(t *testing.T) {
 	waitFor(t, 5*time.Second, "exit entry", func() bool {
 		return len(journalEntries(m, evSessionExit, created.ID)) == 1
 	})
-	if exit := journalEntries(m, evSessionExit, created.ID)[0]; exit["claudeSessionId"] != "conv-1" {
-		t.Errorf("exit entry claudeSessionId = %v, want conv-1", exit["claudeSessionId"])
+	if exit := journalEntries(m, evSessionExit, created.ID)[0]; exit["claudeSessionId"] != "11111111-1111-4111-8111-111111111111" {
+		t.Errorf("exit entry claudeSessionId = %v, want 11111111-1111-4111-8111-111111111111", exit["claudeSessionId"])
 	}
 }
 
@@ -1017,10 +1017,10 @@ func TestRestartHonestyLostAndLanded(t *testing.T) {
 
 	before := managerOverJournal(t, dataDir, []string{root})
 	before.journal.Append(map[string]any{"event": evSessionStart, "id": "lost1", "name": "l1", "folder": root})
-	before.journal.Append(map[string]any{"event": evSessionClaudeID, "id": "lost1", "claudeSessionId": "uuid-lost"})
+	before.journal.Append(map[string]any{"event": evSessionClaudeID, "id": "lost1", "claudeSessionId": "88888888-8888-4888-8888-888888888888"})
 	before.journal.Append(map[string]any{"event": evSessionStart, "id": "lost2", "name": "l2", "folder": root, "spawnMode": "worktree"})
 	before.journal.Append(map[string]any{"event": evSessionStart, "id": "done1", "name": "d1", "folder": root})
-	before.journal.Append(map[string]any{"event": evSessionExit, "id": "done1", "code": 0, "claudeSessionId": "uuid-done"})
+	before.journal.Append(map[string]any{"event": evSessionExit, "id": "done1", "code": 0, "claudeSessionId": "77777777-7777-4777-8777-777777777777"})
 	before.journal.Append(map[string]any{"event": evSessionStart, "id": "done2", "name": "d2", "folder": root})
 	before.journal.Append(map[string]any{"event": evSessionExit, "id": "done2", "code": 0})
 
@@ -1034,8 +1034,8 @@ func TestRestartHonestyLostAndLanded(t *testing.T) {
 	if len(lost) != 2 {
 		t.Fatalf("lost = %+v, want lost1 and lost2", lost)
 	}
-	if lost["lost1"].ClaudeSessionID == nil || *lost["lost1"].ClaudeSessionID != "uuid-lost" {
-		t.Errorf("lost1 claudeSessionId = %v, want uuid-lost", lost["lost1"].ClaudeSessionID)
+	if lost["lost1"].ClaudeSessionID == nil || *lost["lost1"].ClaudeSessionID != "88888888-8888-4888-8888-888888888888" {
+		t.Errorf("lost1 claudeSessionId = %v, want 88888888-8888-4888-8888-888888888888", lost["lost1"].ClaudeSessionID)
 	}
 	if lost["lost2"].ClaudeSessionID != nil {
 		t.Errorf("lost2 without a claude-id entry must expose nothing, got %v", *lost["lost2"].ClaudeSessionID)
@@ -1048,10 +1048,149 @@ func TestRestartHonestyLostAndLanded(t *testing.T) {
 	if len(landed) != 2 {
 		t.Fatalf("landed = %+v, want done1 and done2", landed)
 	}
-	if landed["done1"].ClaudeSessionID == nil || *landed["done1"].ClaudeSessionID != "uuid-done" {
-		t.Errorf("done1 claudeSessionId = %v, want uuid-done", landed["done1"].ClaudeSessionID)
+	if landed["done1"].ClaudeSessionID == nil || *landed["done1"].ClaudeSessionID != "77777777-7777-4777-8777-777777777777" {
+		t.Errorf("done1 claudeSessionId = %v, want 77777777-7777-4777-8777-777777777777", landed["done1"].ClaudeSessionID)
 	}
 	if landed["done2"].ClaudeSessionID != nil {
 		t.Errorf("done2 without a flattened uuid must expose nothing, got %v", *landed["done2"].ClaudeSessionID)
 	}
+}
+
+func TestApplyRegistryTickRejectsMalformedUUID(t *testing.T) {
+	t.Parallel()
+	m := testManager(t, nil)
+	insertLive(t, m, "s1", "/w/a", StateReady)
+	now := time.Now()
+	window := time.Minute
+	snaps := []regSessionSnap{{id: "s1"}}
+
+	// a non-UUID value (here a traversal attempt) must never be captured,
+	// journaled, or spliced into a transcript path
+	captures, _ := m.applyRegistryTick(snaps, map[string]*regJoin{"s1": {rowSeen: true, uuid: "../../etc/passwd", activity: "busy"}}, true, window, now)
+	if len(captures) != 0 {
+		t.Errorf("malformed uuid must not be captured: %+v", captures)
+	}
+	if got := m.Get("s1"); got.ClaudeSessionID != nil {
+		t.Errorf("malformed uuid must not be stored, got %v", *got.ClaudeSessionID)
+	}
+}
+
+func TestApplyRegistryTickActivityHoldsOnPsLessAmbiguity(t *testing.T) {
+	t.Parallel()
+	m := testManager(t, nil)
+	insertLive(t, m, "s1", "/w/a", StateReady)
+	now := time.Now()
+	window := time.Minute
+	snaps := []regSessionSnap{{id: "s1"}}
+
+	// establish activity from a joined row
+	m.applyRegistryTick(snaps, map[string]*regJoin{"s1": {rowSeen: true, activity: "busy"}}, true, window, now)
+	if got := m.Get("s1"); got.Activity == nil || *got.Activity != "busy" {
+		t.Fatalf("activity = %v, want busy", got.Activity)
+	}
+
+	// a ps-less tick where the row didn't bind (pre-capture, ambiguous) must not
+	// flicker the chip off within the window
+	m.applyRegistryTick(snaps, map[string]*regJoin{"s1": {rowSeen: false}}, false, window, now.Add(time.Second))
+	if got := m.Get("s1"); got.Activity == nil || *got.Activity != "busy" {
+		t.Errorf("ambiguous ps-less tick must hold activity, got %v", got.Activity)
+	}
+
+	// past the window, even an ambiguous tick clears — degrade to absence
+	m.applyRegistryTick(snaps, map[string]*regJoin{"s1": {rowSeen: false}}, false, window, now.Add(2*time.Minute))
+	if got := m.Get("s1"); got.Activity != nil {
+		t.Errorf("activity must age out past the window, got %v", *got.Activity)
+	}
+
+	// with ps available, a missing row is authoritative — clear immediately
+	m.applyRegistryTick(snaps, map[string]*regJoin{"s1": {rowSeen: true, activity: "idle"}}, true, window, now.Add(3*time.Minute))
+	m.applyRegistryTick(snaps, map[string]*regJoin{"s1": {rowSeen: false}}, true, window, now.Add(3*time.Minute+time.Second))
+	if got := m.Get("s1"); got.Activity != nil {
+		t.Errorf("ps-confirmed absence must clear now, got %v", *got.Activity)
+	}
+}
+
+func TestRegistrySnapshotTiers(t *testing.T) {
+	t.Parallel()
+	// helper: insert a live session and stamp its StartedAt
+	setup := func(m *Manager, id string, startedAgo time.Duration, uuid string) {
+		s := insertLive(t, m, id, "/w/"+id, StateReady)
+		m.mu.Lock()
+		s.StartedAt = time.Now().Add(-startedAgo).Format(time.RFC3339)
+		if uuid != "" {
+			u := uuid
+			s.ClaudeSessionID = &u
+		}
+		m.mu.Unlock()
+	}
+
+	t.Run("pre-capture within chase window is fast", func(t *testing.T) {
+		t.Parallel()
+		m := testManager(t, nil)
+		setup(m, "a", 10*time.Second, "") // no uuid, young
+		m.mu.Lock()
+		m.observedAt = time.Now().Add(-time.Hour) // not observed recently
+		m.mu.Unlock()
+		_, fast, ok := m.registrySnapshot(time.Now())
+		if !ok || !fast {
+			t.Errorf("young pre-capture session must force fast tier: ok=%v fast=%v", ok, fast)
+		}
+	})
+
+	t.Run("pre-capture past chase window is slow", func(t *testing.T) {
+		t.Parallel()
+		m := testManager(t, nil)
+		setup(m, "a", registryUUIDChaseWindow+time.Minute, "") // no uuid, old
+		m.mu.Lock()
+		m.observedAt = time.Now().Add(-time.Hour)
+		m.mu.Unlock()
+		_, fast, ok := m.registrySnapshot(time.Now())
+		if !ok || fast {
+			t.Errorf("stale pre-capture session must not force fast tier: ok=%v fast=%v", ok, fast)
+		}
+	})
+
+	t.Run("captured uuid is slow", func(t *testing.T) {
+		t.Parallel()
+		m := testManager(t, nil)
+		setup(m, "a", 10*time.Second, "77777777-7777-4777-8777-777777777777")
+		m.mu.Lock()
+		m.observedAt = time.Now().Add(-time.Hour)
+		m.mu.Unlock()
+		_, fast, ok := m.registrySnapshot(time.Now())
+		if !ok || fast {
+			t.Errorf("captured session should not force fast via chase: ok=%v fast=%v", ok, fast)
+		}
+	})
+
+	t.Run("recent observation forces fast", func(t *testing.T) {
+		t.Parallel()
+		m := testManager(t, nil)
+		setup(m, "a", registryUUIDChaseWindow+time.Minute, "77777777-7777-4777-8777-777777777777")
+		m.mu.Lock()
+		m.observedAt = time.Now() // just watched
+		m.mu.Unlock()
+		_, fast, ok := m.registrySnapshot(time.Now())
+		if !ok || !fast {
+			t.Errorf("a recent GET /sessions must force fast tier: ok=%v fast=%v", ok, fast)
+		}
+	})
+
+	t.Run("zero live sessions parks the loop", func(t *testing.T) {
+		t.Parallel()
+		m := testManager(t, nil)
+		m.mu.Lock()
+		m.regRunning = true
+		m.mu.Unlock()
+		_, _, ok := m.registrySnapshot(time.Now())
+		if ok {
+			t.Error("no live sessions must return ok=false")
+		}
+		m.mu.Lock()
+		running := m.regRunning
+		m.mu.Unlock()
+		if running {
+			t.Error("registrySnapshot must clear regRunning when it parks")
+		}
+	})
 }

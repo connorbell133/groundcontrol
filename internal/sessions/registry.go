@@ -15,12 +15,18 @@ import (
 	"log"
 	"math/rand"
 	"path/filepath"
+	"regexp"
 	"sort"
 	"strconv"
 	"time"
 
 	"github.com/connorbell133/groundcontrol/internal/claudex"
 )
+
+// uuidRE is the exact Claude conversation-id shape. Captured ids are journaled
+// permanently and spliced into a transcript file path, so anything that isn't
+// a strict UUID (including a `../` traversal attempt) is refused before either.
+var uuidRE = regexp.MustCompile(`^[0-9a-fA-F]{8}-[0-9a-fA-F]{4}-[0-9a-fA-F]{4}-[0-9a-fA-F]{4}-[0-9a-fA-F]{12}$`)
 
 // Cadence tiers. Package vars, not consts, so tests can shrink them
 // (precedent: transcripts.go's claudeProjectsDir). One registry exec costs
@@ -44,7 +50,6 @@ const (
 	registryUUIDChaseWindow = 2 * time.Minute
 	// `claude agents --json` first shipped in this CLI release
 	registryVersionFloor = "2.1.145"
-	// bound on the pid→ppid walk; the observed topology is launcher → forked
 )
 
 // Exec seams, swappable in tests so registry scenarios need no real CLI or
@@ -108,11 +113,25 @@ func (m *Manager) stopRegistryLoop() {
 }
 
 func (m *Manager) registryLoop(ctx context.Context) {
-	if v, err := registryProbeVersion(); err == nil && !claudex.AtLeast(v, registryVersionFloor) {
-		// old CLI: agents --json doesn't exist. Degrade to absent enrichment
-		// instead of hammering a subcommand that can't answer; the next 0→1
-		// transition re-probes, so a CLI upgrade needs no runner restart.
-		log.Printf("sessions: claude %s lacks agents --json (needs %s) — registry enrichment off", v, registryVersionFloor)
+	// a Create can spawn this goroutine right as shutdown cancels the context;
+	// check before the version-probe exec so a dead context isn't handed a CLI
+	// call it will only throw away
+	if ctx.Err() != nil {
+		m.stopRegistryLoop()
+		return
+	}
+	v, err := registryProbeVersion()
+	if err != nil || !claudex.AtLeast(v, registryVersionFloor) {
+		// old CLI (agents --json doesn't exist) OR an unparseable probe (wrapper
+		// scripts, update banners): fail closed and degrade to absent enrichment
+		// rather than hammer a subcommand that can't answer — matching claudex's
+		// fail-closed version contract. The next 0→1 transition re-probes, so a
+		// CLI upgrade needs no runner restart.
+		if err != nil {
+			log.Printf("sessions: claude --version probe failed (%v) — registry enrichment off", err)
+		} else {
+			log.Printf("sessions: claude %s lacks agents --json (needs %s) — registry enrichment off", v, registryVersionFloor)
+		}
 		m.stopRegistryLoop()
 		return
 	}
@@ -491,7 +510,10 @@ func (m *Manager) applyRegistryTick(snaps []regSessionSnap, joins map[string]*re
 				s.Activity = nil // unknown status value reads as absent, not as an error
 			}
 			s.activitySeenAt = now
-			if j.uuid != "" {
+			// only a well-formed UUID is captured: it is journaled permanently
+			// and spliced into a transcript file path, so a malformed value
+			// (or a path-traversal attempt) must never reach either
+			if j.uuid != "" && uuidRE.MatchString(j.uuid) {
 				switch {
 				case s.ClaudeSessionID == nil:
 					u := j.uuid
@@ -505,9 +527,17 @@ func (m *Manager) applyRegistryTick(snaps []regSessionSnap, joins map[string]*re
 				}
 			}
 		} else {
-			// the registry answered and this session's row is gone: absence
-			// is authoritative — clear now, no grace (R3's no-stale rule)
-			s.Activity = nil
+			// the registry answered but this session has no row. Normally
+			// absence is authoritative — clear now (R3's no-stale rule). But
+			// when ps is unavailable AND this session hasn't captured its UUID
+			// yet, the join deliberately refuses to bind on ambiguity, so a
+			// missing row is not a confident absence — let the wall-clock
+			// window age it out instead of flickering the chip off on a single
+			// ps outage (mirrors the sticky-ownership rule for extras below).
+			ambiguous := !psOK && s.ClaudeSessionID == nil
+			if !ambiguous || now.Sub(s.activitySeenAt) > window {
+				s.Activity = nil
+			}
 		}
 		if s.extrasSeen == nil {
 			s.extrasSeen = map[string]extraRecord{}

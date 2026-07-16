@@ -17,7 +17,14 @@ const api = async (path, opts = {}) => {
     throw new Error("unauthorized");
   }
   const body = res.headers.get("content-type")?.includes("json") ? await res.json() : await res.text();
-  if (!res.ok) throw new Error(body?.error?.message || res.statusText);
+  if (!res.ok) {
+    // carry the HTTP status and the stable error code so callers can branch on
+    // them (e.g. a folder_in_use 409 flips the launch sheet to worktree)
+    const err = new Error(body?.error?.message || res.statusText);
+    err.status = res.status;
+    err.code = body?.error?.code;
+    throw err;
+  }
   return body;
 };
 
@@ -74,16 +81,35 @@ function toast(msg, isError = false) {
 }
 
 const esc = (s) => String(s).replace(/[&<>"']/g, (c) => ({ "&": "&amp;", "<": "&lt;", ">": "&gt;", '"': "&quot;", "'": "&#39;" })[c]);
+// esc() blocks attribute breakout but not a javascript: URI in an href. The
+// PR-link URL comes from a transcript record a permissive-mode agent can write,
+// so gate any rendered link on an https scheme (mirrors the server's httpURL check).
+const isHttps = (u) => /^https:\/\//i.test(String(u || ""));
 
 /* ---------- double-tap confirm ----------
    first tap arms the button with warning copy; a second tap within 4s runs
    fn; untouched, the arm dissolves back to the original label. Shared by
    YOLO launches, worktree cleans, and orbit branch sweeps. */
-function armConfirm(btn, copy, fn) {
+// disarm clears any pending arm state and its revert timer. Called on the
+// confirming tap, when the launch context changes (mode switch), and at the
+// top of doLaunch so a stale timer can't fire mid-launch and clobber the
+// "Launching…" label.
+function disarm(btn) {
+  if (!btn) return;
+  if (btn._armTimer) {
+    clearTimeout(btn._armTimer);
+    btn._armTimer = null;
+  }
   if (btn.dataset.confirm === "1") {
     btn.dataset.confirm = "";
     btn.classList.remove("warn");
     if (btn._armLabel != null) btn.innerHTML = btn._armLabel;
+  }
+}
+
+function armConfirm(btn, copy, fn) {
+  if (btn.dataset.confirm === "1") {
+    disarm(btn);
     fn();
     return;
   }
@@ -91,7 +117,8 @@ function armConfirm(btn, copy, fn) {
   btn._armLabel = btn.innerHTML;
   btn.classList.add("warn");
   btn.innerHTML = copy;
-  setTimeout(() => {
+  btn._armTimer = setTimeout(() => {
+    btn._armTimer = null;
     if (btn.dataset.confirm !== "1") return;
     btn.dataset.confirm = "";
     btn.classList.remove("warn");
@@ -463,6 +490,9 @@ async function loadBranches(folder) {
   select.innerHTML = "";
   try {
     const { branches } = await api(`/api/v1/branches?path=${encodeURIComponent(folder)}`);
+    // the sheet may have moved to another folder while this was in flight — a
+    // late response must not populate the wrong folder's branch list (R22)
+    if (state.path !== folder) return;
     state.branchCount = branches.length;
     if (branches.length === 0) {
       // repo with no commits yet: no branches to pick and worktrees are impossible
@@ -519,6 +549,14 @@ function openSheet(prefill) {
   loadSheetPresets(); // …then refreshed from GET /config (tolerates absence)
   syncBranchField();
   if (git) loadBranches(folder);
+  // the Browse-tab poll skips session refresh, so state.sessions can be stale
+  // here — pull fresh state, then re-sync so liveHere (and the same-dir/worktree
+  // flip) reflects environments launched from another device or session
+  refreshSessions()
+    .then(() => {
+      if (state.path === folder) syncBranchField();
+    })
+    .catch(() => {});
 
   $("optName").value = prefill?.name || "";
   $("sheet").hidden = false;
@@ -546,6 +584,9 @@ function wireSegment(id, key, onChange) {
   document.querySelectorAll(`#${id} button`).forEach((b) => {
     b.onclick = () => {
       if (b.disabled) return;
+      // changing the launch context invalidates a pending YOLO arm — a later
+      // tap must re-confirm, and the revert timer must not fire mid-launch
+      disarm($("launchBtn"));
       state.opts[key] = b.dataset.value;
       syncSegment(id, b.dataset.value);
       onChange?.();
@@ -565,6 +606,7 @@ function launch() {
 
 async function doLaunch() {
   const btn = $("launchBtn");
+  disarm(btn); // clear any armed state + its timer so the revert can't clobber the label below
   btn.disabled = true;
   btn.innerHTML = `<span class="cta-glyph">◴</span> Launching…`;
   try {
@@ -593,10 +635,28 @@ async function doLaunch() {
     switchTab("sessions");
     toast("Environment starting");
   } catch (e) {
-    toast(e.message, true);
+    if (e.status === 409 && e.code === "folder_in_use") {
+      // an environment is already live in this folder (possibly launched from
+      // another device). Refresh so liveHere is current, then re-sync the sheet:
+      // syncBranchField flips a git folder to worktree and disables same-dir with
+      // a reason, or disables both for a non-git folder — the sheet stays open.
+      await refreshSessions();
+      syncBranchField();
+      // syncBranchField flips to worktree only for a git folder with commits;
+      // a non-git / no-commits folder has no worktree fallback, so tell the
+      // truth about which state the sheet landed in
+      toast(
+        state.opts.spawnMode === "worktree"
+          ? "An environment is already live here — switched to worktree"
+          : "An environment is already live here — kill it to launch here again",
+        true
+      );
+    } else {
+      toast(e.message, true);
+    }
   } finally {
     btn.disabled = false;
-    btn.innerHTML = `<span class="cta-glyph">▶</span> Launch session`;
+    btn.innerHTML = `<span class="cta-glyph">▶</span> Launch environment`;
   }
 }
 
@@ -818,12 +878,12 @@ function renderShell(card, s) {
     <div class="session-ticker" data-ticker></div>
     ${s.state === "ready" ? `<div class="session-snippet" data-snippet hidden></div>` : ""}
     <div class="session-meta">
-      <span class="meta-chip">${s.spawnMode}</span>
+      <span class="meta-chip">${esc(s.spawnMode)}</span>
       ${s.branch ? `<span class="meta-chip branch">⎇ ${esc(s.branch)}</span>` : ""}
-      <span class="meta-chip">${s.permissionMode}</span>
+      <span class="meta-chip">${esc(s.permissionMode)}</span>
       <span class="meta-chip age" data-age></span>
       <span class="meta-chip activity" data-activity hidden></span>
-      ${s.prLink && live ? `<a class="meta-chip pr" href="${esc(s.prLink.url)}" target="_blank" rel="noopener">PR #${esc(s.prLink.number)}</a>` : ""}
+      ${s.prLink && live && isHttps(s.prLink.url) ? `<a class="meta-chip pr" href="${esc(s.prLink.url)}" target="_blank" rel="noopener">PR #${esc(s.prLink.number)}</a>` : ""}
     </div>
     ${live ? envStatsHTML(s) : ""}
     ${live ? envRowsHTML(s.environmentSessions) : ""}
@@ -930,6 +990,7 @@ function renderLandedShell(card, l) {
     <div class="session-actions">
       <button class="btn" data-relaunch="${l.id}">Relaunch</button>
       ${l.debrief?.branchState === "in-orbit" ? `<button class="btn" data-orbit-clean="${l.id}">Clean branch</button>` : ""}
+      <button class="btn" data-remove="${l.id}">Dismiss</button>
     </div>`;
 }
 
@@ -1303,6 +1364,10 @@ document.addEventListener("click", async (e) => {
           spawnMode: cfg.spawnMode,
           branch: cfg.branch ?? undefined,
           permissionMode: cfg.permissionMode,
+          // carry capacity + preset when the source card has them (live/lost
+          // sessions do; landed cards don't), matching the recents relaunch path
+          capacity: cfg.capacity ?? undefined,
+          presetName: cfg.presetName || undefined,
           // name omitted deliberately: reusing it risks a duplicate-name conflict
         }),
       });
@@ -1331,9 +1396,13 @@ document.addEventListener("click", async (e) => {
     }
   }
   if (remove) {
+    const id = remove.dataset.remove;
     try {
-      await api(`/api/v1/sessions/${remove.dataset.remove}/record`, { method: "DELETE" });
-      state.lost = state.lost.filter((l) => l.id !== remove.dataset.remove);
+      await api(`/api/v1/sessions/${id}/record`, { method: "DELETE" });
+      // optimistic: drop from both journal-derived lists so the card doesn't
+      // linger until the next poll (the server marks it dismissed for good)
+      state.lost = (state.lost || []).filter((l) => l.id !== id);
+      state.landed = (state.landed || []).filter((l) => l.id !== id);
       refreshSessions();
     } catch (err) {
       toast(err.message, true);

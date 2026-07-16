@@ -126,20 +126,25 @@ func (s *liveSession) setReadyLocked(url, source string) *Session {
 }
 
 // reconcileScrapedURLLocked handles the scrape speaking after the pointer
-// already won ready. Agreement just retires the scan; disagreement means the
-// observed URL shape drifted — the scraped URL overwrites the constructed one
-// (CLI output is ground truth) and the tripwire logs. At most once per
-// session by construction: the source flips to scrape either way, and the
-// readLoop only scans while the source is still the pointer. Caller holds m.mu.
-func (s *liveSession) reconcileScrapedURLLocked(url string) {
+// already won ready. Agreement just retires the scan (returns nil); a
+// disagreement means the constructed URL drifted — the scraped URL overwrites
+// it (CLI output is ground truth), the tripwire logs, and a snapshot is
+// returned so the caller journals and announces the correction (R17). At most
+// once per session by construction: the source flips to scrape either way, and
+// the readLoop only scans while the source is still the pointer. Caller holds
+// m.mu.
+func (s *liveSession) reconcileScrapedURLLocked(url string) *Session {
 	if s.pairingSource != pairingSourcePointer || s.PairingURL == nil {
-		return
-	}
-	if *s.PairingURL != url {
-		log.Printf("session %s: scraped pairing URL %q disagrees with bridge-pointer URL %q — scrape wins (URL-shape drift tripwire)", s.ID, url, *s.PairingURL)
-		s.PairingURL = &url
+		return nil
 	}
 	s.pairingSource = pairingSourceScrape
+	if *s.PairingURL == url {
+		return nil
+	}
+	log.Printf("session %s: scraped pairing URL %q disagrees with bridge-pointer URL %q — scrape wins (URL-shape drift tripwire)", s.ID, url, *s.PairingURL)
+	s.PairingURL = &url
+	snap := s.Session
+	return &snap
 }
 
 // watchBridgePointer polls the launch cwd's project dir for a pid-validated

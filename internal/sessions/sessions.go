@@ -9,6 +9,7 @@ import (
 	"context"
 	"errors"
 	"fmt"
+	"log"
 	"os"
 	"os/exec"
 	"path/filepath"
@@ -46,12 +47,17 @@ const (
 // evSessionClaudeID is journal-only: the registry poller appends it on first
 // UUID capture but never announces it — enrichment facts don't fan out (R8).
 const (
-	evSessionStart    = "session.start"
-	evSessionReady    = "session.ready"
-	evSessionKill     = "session.kill"
-	evSessionExit     = "session.exit"
-	evSessionFailed   = "session.failed"
-	evSessionClaudeID = "session.claude-id"
+	evSessionStart        = "session.start"
+	evSessionReady        = "session.ready"
+	evSessionKill         = "session.kill"
+	evSessionExit         = "session.exit"
+	evSessionFailed       = "session.failed"
+	evSessionClaudeID     = "session.claude-id"
+	evSessionInjectIntent = "session.inject-intent"
+	evSessionDismissed    = "session.dismissed"
+	// journal-only record that the scrape corrected a drifted pointer URL after
+	// ready; announced as session.ready so SSE clients re-render the card
+	evSessionPairingCorrected = "session.pairing-corrected"
 )
 
 type Session struct {
@@ -120,6 +126,12 @@ type Debrief struct {
 	BranchState string `json:"branchState"`
 }
 
+// ErrFolderInUse is returned by Create when a same-dir launch collides with an
+// environment already launching or live in the same folder. The API maps it to
+// the folder_in_use error code — distinct from a generic launch_failed so
+// clients can key on it (e.g. to flip the launch sheet to worktree mode).
+var ErrFolderInUse = errors.New("folder already has a live environment")
+
 // branchState values: what actually survived worktree cleanup
 const (
 	branchMerged       = "merged"        // branch gone, or its tip reachable from the default branch
@@ -137,6 +149,9 @@ type liveSession struct {
 	// which source set PairingURL (bridge.go); the scrape keeps scanning while
 	// the pointer holds it, so a drifted constructed URL can still be corrected
 	pairingSource string
+	// logged once when the CLI prints a claude.ai URL matching no known pairing
+	// shape — a drift tripwire, not per-chunk noise
+	pairingShapeWarned bool
 	// worktree cleanup context, captured at launch
 	repoRoot   string
 	wtBranch   string
@@ -202,7 +217,11 @@ func NewManager(j *journal.Journal, bus *events.Bus, ws *workspace.Manager, brow
 
 var (
 	ansiRE = regexp.MustCompile(`\x1b\[[0-9;?]*[a-zA-Z]|\x1b\][^\x07]*\x07?`)
-	urlRE  = regexp.MustCompile(`https://[^\s"'\x1b]+`)
+	// the two observed claude.ai pairing-URL shapes (2.1.210). The scrape keys
+	// on this narrow shape, not any https URL: an unrelated URL the CLI prints
+	// (an update banner, a docs link) must not be mistaken for the pairing URL
+	// and pin the source — which would let it clobber a correct pointer URL (R16).
+	pairingURLRE = regexp.MustCompile(`https://claude\.ai/(?:code\?environment=|remote/)[^\s"'\x1b]+`)
 	// box-drawing, blocks, braille spinners, and ASCII rule/spinner chars — lines of only these are visual noise
 	junkRE      = regexp.MustCompile(`[─-╿▀-▟⠀-⣿|\\/·•●◐◓◑◒~\-_=+*.\s]`)
 	trailingRE  = regexp.MustCompile(`[).,]+$`)
@@ -472,7 +491,7 @@ func (m *Manager) Create(opts CreateOpts) (Session, error) {
 		}
 		m.mu.Unlock()
 		if folderBusy {
-			return Session{}, errors.New("an environment is already launching in this folder — one live environment per folder; use worktree mode for a second")
+			return Session{}, fmt.Errorf("%w: an environment is already launching in this folder — one live environment per folder; use worktree mode for a second", ErrFolderInUse)
 		}
 		defer func() {
 			m.mu.Lock()
@@ -480,7 +499,7 @@ func (m *Manager) Create(opts CreateOpts) (Session, error) {
 			m.mu.Unlock()
 		}()
 		if m.liveSameFolderExists(opts.Folder) {
-			return Session{}, errors.New("an environment is already live in this folder — open that one in claude.ai, kill it, or launch in worktree mode (claude.ai labels same-folder environments identically)")
+			return Session{}, fmt.Errorf("%w: an environment is already live in this folder — open that one in claude.ai, kill it, or launch in worktree mode (claude.ai labels same-folder environments identically)", ErrFolderInUse)
 		}
 	}
 	permissionMode := opts.PermissionMode
@@ -550,7 +569,12 @@ func (m *Manager) Create(opts CreateOpts) (Session, error) {
 	settingsPath := ""
 	if settingsSkipReason == "" && opts.SettingsJSON != "" {
 		settingsPath = settingsFilePath(cwd)
-		settingsInjected, settingsReplaced, settingsSkipReason = m.injectSettings(settingsPath, cwd, opts.SettingsJSON)
+		// journal the intent before writing the file so a crash between the
+		// write and the session.start entry still leaves a folder the boot
+		// sweep can find and reclaim (R12); a crash before the write leaves an
+		// intent with no file, which the marker-gated sweep no-ops on.
+		m.journal.Append(map[string]any{"event": evSessionInjectIntent, "id": id, "folder": opts.Folder})
+		settingsInjected, settingsReplaced, settingsSkipReason = m.injectSettings(settingsPath, cwd, opts.SettingsJSON, id)
 	}
 
 	// always --spawn same-dir: the runner already handled worktree creation itself
@@ -670,8 +694,8 @@ func (m *Manager) readLoop(s *liveSession) {
 		n, err := s.ptmx.Read(buf)
 		if n > 0 {
 			chunk := string(buf[:n])
-			var readySnap *Session
-			var readyURL string
+			var readySnap, correctedSnap *Session
+			var readyURL, correctedURL string
 			m.mu.Lock()
 			s.LastOutputAt = util.StrPtr(util.NowISO())
 			text := ansiRE.ReplaceAllString(chunk, "")
@@ -695,14 +719,24 @@ func (m *Manager) readLoop(s *liveSession) {
 			// keep scanning past ready while the bridge pointer holds the URL:
 			// the CLI's own output must be able to overrule a constructed URL
 			if s.PairingURL == nil || s.pairingSource == pairingSourcePointer {
-				if found := urlRE.FindString(strings.Join(s.log, "")); found != "" {
+				joined := strings.Join(s.log, "")
+				if found := pairingURLRE.FindString(joined); found != "" {
 					url := trailingRE.ReplaceAllString(found, "")
 					if snap := s.setReadyLocked(url, pairingSourceScrape); snap != nil {
-						readyURL = url
-						readySnap = snap
-					} else {
-						s.reconcileScrapedURLLocked(url)
+						readyURL, readySnap = url, snap
+					} else if snap := s.reconcileScrapedURLLocked(url); snap != nil {
+						// scrape corrected a drifted pointer URL — journal and
+						// announce it so SSE clients converge (R17). A distinct
+						// event, not a second session.ready: the ready transition
+						// still happens exactly once.
+						correctedURL, correctedSnap = url, snap
 					}
+				} else if strings.Contains(joined, "claude.ai/") && !s.pairingShapeWarned {
+					// a claude.ai URL is present but no known pairing shape
+					// matched — the CLI's URL shape may have drifted; surface it
+					// in logs instead of silently failing to pair (tripwire)
+					s.pairingShapeWarned = true
+					log.Printf("session %s: a claude.ai URL is present but matches no known pairing shape — the pairing-URL shape may have drifted", s.ID)
 				}
 			}
 			id := s.ID
@@ -710,6 +744,10 @@ func (m *Manager) readLoop(s *liveSession) {
 			if readySnap != nil {
 				m.journal.Append(map[string]any{"event": evSessionReady, "id": id, "pairingUrl": readyURL})
 				m.announce(evSessionReady, *readySnap, false)
+			}
+			if correctedSnap != nil {
+				m.journal.Append(map[string]any{"event": evSessionPairingCorrected, "id": id, "pairingUrl": correctedURL})
+				m.announce(evSessionReady, *correctedSnap, false)
 			}
 		}
 		if err != nil {
@@ -855,21 +893,55 @@ func (m *Manager) Remove(id string) (bool, error) {
 	s, ok := m.sessions[id]
 	if !ok {
 		m.mu.Unlock()
-		// lost-session headstones dismiss through the same endpoint
+		// not in the live map: a lost headstone, a landed (prior-runner) session,
+		// or an unknown id. Splice the headstone cache if present, then journal a
+		// dismissal for any id the journal knows so ListLanded/ListLost drop it —
+		// including across a restart. A genuinely unknown id is a 404.
 		m.lostMu.Lock()
-		defer m.lostMu.Unlock()
 		for i, l := range m.lostCache {
 			if l.ID == id {
 				m.lostCache = append(m.lostCache[:i], m.lostCache[i+1:]...)
-				return true, nil
+				break
 			}
 		}
-		return false, nil
+		m.lostMu.Unlock()
+		if !m.knownInJournal(id) {
+			return false, nil
+		}
+		m.journalDismissal(id)
+		return true, nil
 	}
-	defer m.mu.Unlock()
 	if s.State != StateExited && s.State != StateError {
+		m.mu.Unlock()
 		return false, errors.New("session is still live; kill it first")
 	}
 	delete(m.sessions, id)
+	m.mu.Unlock()
+	// journal the dismissal (outside the lock — it does disk IO): ListLanded
+	// rebuilds ended sessions from the journal, so without this marker the card
+	// resurrects on the next poll
+	m.journalDismissal(id)
 	return true, nil
+}
+
+// knownInJournal reports whether the id has a session.start entry — i.e. it is
+// a real session (live, lost, or landed), not an unknown id. Used to keep
+// DELETE /sessions/{id}/record a 404 for ids the runner never launched.
+func (m *Manager) knownInJournal(id string) bool {
+	for _, e := range m.journal.Read() {
+		if jStr(e, "id") == id && jStr(e, "event") == evSessionStart {
+			return true
+		}
+	}
+	return false
+}
+
+// journalDismissal records a session.dismissed marker so the journal-derived
+// landed and lost views permanently exclude the id. A flat named event read
+// with the tolerant jStr idiom — no generic fact envelope (deliberately
+// rejected in prior work); it may scroll off the 2000-entry read window while
+// its exit entry survives, the same tolerance the landed/lost views already
+// carry.
+func (m *Manager) journalDismissal(id string) {
+	m.journal.Append(map[string]any{"event": evSessionDismissed, "id": id})
 }

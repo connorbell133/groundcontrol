@@ -309,3 +309,95 @@ func TestListLandedCap(t *testing.T) {
 		t.Errorf("unexpected window: first %s, last %s", landed[0].ID, landed[landedCap-1].ID)
 	}
 }
+
+// TestDismissedSessionsStayGone covers the landed-resurrection bug: Remove must
+// journal a dismissal so the journal-derived landed and lost views exclude the
+// id even after a runner restart rebuilds them from the journal.
+func TestDismissedSessionsStayGone(t *testing.T) {
+	t.Parallel()
+	root := testutil.ResolvedTempDir(t)
+	dir := t.TempDir()
+	m := managerOverJournal(t, dir, []string{root})
+
+	// a landed session: start + exit in the journal, still held in the map as
+	// exited (the real state when the user clicks Dismiss on an exited card)
+	m.journal.Append(map[string]any{"event": evSessionStart, "id": "landed1", "name": "l", "folder": root})
+	m.journal.Append(map[string]any{"event": evSessionExit, "id": "landed1", "code": 0})
+	insertLive(t, m, "landed1", root, StateExited)
+	// a lost session: start with no exit
+	m.journal.Append(map[string]any{"event": evSessionStart, "id": "lost1", "name": "x", "folder": root})
+
+	if removed, err := m.Remove("landed1"); err != nil || !removed {
+		t.Fatalf("Remove(landed1) = %v, %v", removed, err)
+	}
+	if got := m.ListLanded(); len(got) != 0 {
+		t.Errorf("dismissed landed card still listed: %+v", got)
+	}
+
+	// a fresh runner over the same journal must not resurrect the dismissed card
+	m2 := managerOverJournal(t, dir, []string{root})
+	if got := m2.ListLanded(); len(got) != 0 {
+		t.Errorf("dismissed landed card resurrected after restart: %+v", got)
+	}
+
+	// lost-headstone dismissal must be durable too: populate the cache, dismiss,
+	// then confirm a third runner doesn't re-derive it
+	if got := m2.ListLost(); len(got) != 1 || got[0].ID != "lost1" {
+		t.Fatalf("lost = %+v, want lost1", got)
+	}
+	if removed, err := m2.Remove("lost1"); err != nil || !removed {
+		t.Fatalf("Remove(lost1) = %v, %v", removed, err)
+	}
+	m3 := managerOverJournal(t, dir, []string{root})
+	for _, l := range m3.ListLost() {
+		if l.ID == "lost1" {
+			t.Errorf("dismissed lost session resurrected after restart: %+v", l)
+		}
+	}
+}
+
+// TestLandedReconstructionAndDismiss reconstructs a landed session from the
+// journal (the prior-runner history case) and verifies its debrief fields
+// survive, then that dismissing the landed id removes it permanently.
+func TestLandedReconstructionAndDismiss(t *testing.T) {
+	t.Parallel()
+	root := testutil.ResolvedTempDir(t)
+	dir := t.TempDir()
+	m := managerOverJournal(t, dir, []string{root})
+
+	m.journal.Append(map[string]any{
+		"event": evSessionStart, "id": "past1", "name": "orbit", "folder": root,
+		"spawnMode": "worktree", "branch": "gc/x", "permissionMode": "plan",
+	})
+	m.journal.Append(map[string]any{
+		"event": evSessionExit, "id": "past1", "code": 1, "branchState": "in-orbit",
+		"filesChanged": 1, "insertions": 2, "deletions": 0, "uncommitted": 0,
+	})
+
+	landed := m.ListLanded()
+	if len(landed) != 1 || landed[0].ID != "past1" {
+		t.Fatalf("landed = %+v, want past1", landed)
+	}
+	l := landed[0]
+	if l.Name != "orbit" || l.Folder != root || l.SpawnMode != "worktree" || l.ExitedAt == "" {
+		t.Errorf("landed entry = %+v", l)
+	}
+	if l.ExitCode == nil || *l.ExitCode != 1 {
+		t.Errorf("landed exitCode = %v, want 1", l.ExitCode)
+	}
+	if l.Debrief == nil || l.Debrief.BranchState != "in-orbit" || l.Debrief.FilesChanged != 1 || l.Debrief.Insertions != 2 {
+		t.Errorf("landed debrief = %+v", l.Debrief)
+	}
+
+	// a landed card (not in the live map) is dismissable and stays gone
+	if removed, err := m.Remove("past1"); err != nil || !removed {
+		t.Fatalf("Remove(past1) = %v, %v", removed, err)
+	}
+	if got := m.ListLanded(); len(got) != 0 {
+		t.Errorf("dismissed landed card still listed: %+v", got)
+	}
+	// an id the runner never launched is a genuine not-found
+	if removed, err := m.Remove("never"); err != nil || removed {
+		t.Errorf("Remove(unknown) = %v, %v, want false, nil", removed, err)
+	}
+}

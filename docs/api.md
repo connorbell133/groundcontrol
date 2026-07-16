@@ -81,13 +81,15 @@ change; renaming one is breaking.
 | `not_found` | 404 | no such session or job |
 | `not_ready` | 409 | session exists but has no pairing URL yet |
 | `ready_timeout` | 504 | `?wait=ready` deadline passed — session still starting, keep polling |
-| `launch_failed` | 409 | spawn rejected — duplicate live name, a live environment already in the folder (same-dir launches; one per folder), unknown branch, dirty checkout on branch switch, worktree creation failed |
+| `launch_failed` | 409 | spawn rejected — duplicate live name, unknown branch, dirty checkout on branch switch, worktree creation failed |
+| `folder_in_use` | 409 | same-dir launch into a folder that already has a live environment (one per folder; use worktree mode for a second). Distinct from `launch_failed` so clients can flip the launch sheet to worktree — key off the code, not message text. Behavioral change: stacked same-dir launches previously returned `launch_failed` |
 | `session_live` | 409 | tried to dismiss a session that's still running |
 | `job_live` | 409 | tried to dismiss a job that's still queued/running — cancel it first |
-| `worktree_error` | 400 | kept-worktree removal failed or path isn't runner-managed |
+| `worktree_error` | 400/500 | kept-worktree removal failed or path isn't runner-managed (400); or a transient git failure (timeout, index lock) during an orbit sweep (500), as opposed to git's merge-state refusal (`branch_not_merged`) |
 | `branch_held` | 409 | orbit sweep refused — the branch is checked out by a live session or a kept worktree (clean that up via `DELETE /worktrees` instead) |
 | `branch_not_merged` | 409 | orbit sweep refused — git's safe delete found unmerged commits; merge the work first (there is no force delete) |
 | `not_implemented` | 501 | the field is real but the feature isn't (Docker isolation) — rejected rather than silently ignored |
+| `payload_too_large` | 413 | request body exceeded the 2 MiB limit |
 
 ## Endpoints
 
@@ -186,21 +188,27 @@ settings file Claude Code merges natively — and removed when the session
 exits. For worktree launches the launch cwd is the worktree, so the file
 never touches your checkout. The mechanism never clobbers user files:
 
-- The injected file carries a top-level `"_groundcontrol": true` marker key.
-  Teardown and the boot sweep only ever remove files whose parse shows the
-  marker; a file that lost its marker mid-session is left alone.
+- The injected file carries a top-level `"_groundcontrol"` marker recording
+  the owning launch (its runner pid and host). Teardown and the boot sweep
+  only ever remove files whose parse shows the marker; a file that lost its
+  marker mid-session is left alone.
 - Creation is an atomic create-if-absent, so two concurrent launches into
   the same folder can never interleave. When a file already exists: unmarked
   (or unparseable) means it's yours — injection refuses with
-  `settingsSkipReason: "settings file already exists"`; marked and owned by
-  another live session skips with `"in use by another session"`; marked with
-  no live owner is a crash leftover and is replaced (journaled as
-  `settingsNote: "replaced stale injection"`).
+  `settingsSkipReason: "settings file already exists"`; marked and still owned
+  by a live session (this runner's, or a second runner's whose recorded pid is
+  alive) skips with `"in use by another session"`; marked with no live owner
+  is a crash leftover and is replaced atomically (journaled as
+  `settingsNote: "replaced stale injection"`). Other skip reasons cover a
+  malformed preset (`"preset settings are not a JSON object"`), an oversized
+  one (`"preset settings exceed 64 KB"`), a forbidden key (`"preset settings
+  carry a non-inert key"`), and a write failure (`"settings write failed"`).
 - At exit the file is removed only when no other live session shares the
   folder — otherwise removal defers to the last same-folder exit, and each
-  exit re-checks. On boot the runner sweeps marked leftovers in folders
-  whose recent `session.start` entries recorded an injection (crash
-  recovery).
+  exit re-checks. On boot the runner sweeps marked leftovers in folders whose
+  recent `session.start` entries recorded an injection, and in folders named by
+  a `session.inject-intent` entry (journaled just before each write, so a crash
+  between the write and `session.start` is still recovered).
 - While the file exists it affects **every** Claude session started in that
   folder, including ones you start by hand.
 
@@ -475,11 +483,14 @@ applied, so a rejected write leaves the config untouched.
 - `spawnMode` — empty, or `same-dir` / `worktree`.
 - `capacity` — 0 (unset) or 1–256.
 - `settingsJson` — optional settings-file content as a string: at most 64 KB
-  and must parse as a JSON object. A top-level `hooks` key is rejected —
-  hooks run shell commands and are a separately gated feature. An `env` key
-  is allowed. Injected at launch as
-  `<launch cwd>/.claude/settings.local.json` for the session's lifetime —
-  see [Preset settings injection](#preset-settings-injection).
+  and must parse as a JSON object. Only inert top-level keys are allowed — an
+  allowlist of display/model/UX toggles (`model`, `theme`, `verbose`, and the
+  like). Any key that can run commands, move credentials, or change
+  permissions — `hooks`, `apiKeyHelper`, `statusLine`, `env`, `permissions`,
+  `sandbox`, and similar — is rejected (an allowlist, so a key added by a
+  future CLI release is refused until vetted rather than injected sight-unseen).
+  Injected at launch as `<launch cwd>/.claude/settings.local.json` for the
+  session's lifetime — see [Preset settings injection](#preset-settings-injection).
 
 A token that can reach `PUT /config` can widen `roots` — treat `authToken`
 and any `admin`-scoped token as root on the box. Give automations

@@ -508,7 +508,7 @@ func TestPostSessionsPresetResolution(t *testing.T) {
 	env := newTestEnv(t, config.Config{
 		Roots: []string{root},
 		Presets: []config.Preset{
-			{Name: "fast", PermissionMode: "acceptEdits", Capacity: 4, SettingsJSON: `{"env":{"GC_PRESET":"1"}}`},
+			{Name: "fast", PermissionMode: "acceptEdits", Capacity: 4, SettingsJSON: `{"theme":"dark"}`},
 		},
 	})
 
@@ -600,7 +600,8 @@ func TestSessionExitDebriefInOrbit(t *testing.T) {
 		t.Errorf("landed must exclude sessions the manager still lists: %+v", list.Landed)
 	}
 
-	// dismissing the record surfaces the journal-derived landed entry
+	// dismissing the record removes the card for good (R5): it disappears from
+	// the live list and does NOT reappear as a journal-derived landed card
 	if rec := doReq(t, env.handler, "DELETE", "/sessions/"+created.ID+"/record", "", nil); rec.Code != 200 {
 		t.Fatalf("dismiss = %d: %s", rec.Code, rec.Body.String())
 	}
@@ -608,18 +609,13 @@ func TestSessionExitDebriefInOrbit(t *testing.T) {
 	if err := json.Unmarshal(rec.Body.Bytes(), &list); err != nil {
 		t.Fatal(err)
 	}
-	if len(list.Landed) != 1 || list.Landed[0].ID != created.ID {
-		t.Fatalf("landed after dismissal = %+v", list.Landed)
+	for _, s := range list.Sessions {
+		if s.ID == created.ID {
+			t.Errorf("dismissed session still in the live list: %+v", s)
+		}
 	}
-	l := list.Landed[0]
-	if l.Debrief == nil || l.Debrief.BranchState != "in-orbit" || l.Debrief.FilesChanged != 1 || l.Debrief.Insertions != 2 {
-		t.Errorf("landed debrief = %+v", l.Debrief)
-	}
-	if l.Name != "orbit" || l.Folder != repo || l.SpawnMode != "worktree" || l.StartedAt == "" || l.ExitedAt == "" {
-		t.Errorf("landed entry = %+v", l)
-	}
-	if l.ExitCode == nil || *l.ExitCode != 1 {
-		t.Errorf("landed exitCode = %v, want 1 (signal-killed)", l.ExitCode)
+	if len(list.Landed) != 0 {
+		t.Errorf("dismissed session must not resurrect as a landed card: %+v", list.Landed)
 	}
 }
 
@@ -1090,10 +1086,10 @@ func TestPutConfigPresets(t *testing.T) {
 	env := newTestEnv(t, config.Config{})
 	h := env.handler
 
-	// two presets round-trip: one fully loaded (env key in settings is fine),
+	// two presets round-trip: one fully loaded (an inert settings key is fine),
 	// one bare name (no settings JSON is valid)
 	body := `{"presets":[
-		{"name":"yolo","permissionMode":"bypassPermissions","spawnMode":"worktree","capacity":4,"settingsJson":"{\"env\":{\"FOO\":\"bar\"}}"},
+		{"name":"yolo","permissionMode":"bypassPermissions","spawnMode":"worktree","capacity":4,"settingsJson":"{\"model\":\"opus\"}"},
 		{"name":"plain"}
 	]}`
 	if rec := doReq(t, h, "PUT", "/config", body, nil); rec.Code != 200 {
@@ -1104,7 +1100,7 @@ func TestPutConfigPresets(t *testing.T) {
 		t.Fatalf("presets = %+v, want 2", presets)
 	}
 	p := presets[0]
-	if p.Name != "yolo" || p.PermissionMode != "bypassPermissions" || p.SpawnMode != "worktree" || p.Capacity != 4 || p.SettingsJSON != `{"env":{"FOO":"bar"}}` {
+	if p.Name != "yolo" || p.PermissionMode != "bypassPermissions" || p.SpawnMode != "worktree" || p.Capacity != 4 || p.SettingsJSON != `{"model":"opus"}` {
 		t.Errorf("preset did not round-trip: %+v", p)
 	}
 	if presets[1].Name != "plain" || presets[1].SettingsJSON != "" {
@@ -1165,6 +1161,10 @@ func TestPutConfigPresetValidation(t *testing.T) {
 		{"settings null", `{"presets":[{"name":"a","settingsJson":"null"}]}`},
 		{"settings over 64KB", `{"presets":[{"name":"a","settingsJson":"` + oversized + `"}]}`},
 		{"hooks key", `{"presets":[{"name":"a","settingsJson":"{\"hooks\":{}}"}]}`},
+		{"env key", `{"presets":[{"name":"a","settingsJson":"{\"env\":{\"ANTHROPIC_BASE_URL\":\"http://evil\"}}"}]}`},
+		{"apiKeyHelper key", `{"presets":[{"name":"a","settingsJson":"{\"apiKeyHelper\":\"x\"}"}]}`},
+		{"permissions key", `{"presets":[{"name":"a","settingsJson":"{\"permissions\":{}}"}]}`},
+		{"inert key among a bad one", `{"presets":[{"name":"a","settingsJson":"{\"model\":\"opus\",\"sandbox\":{}}"}]}`},
 	}
 	for _, tc := range cases {
 		t.Run(tc.name, func(t *testing.T) {
@@ -1527,4 +1527,30 @@ func TestSessionsExtrasOverHTTP(t *testing.T) {
 		time.Sleep(100 * time.Millisecond)
 	}
 	t.Fatal("folder-mate extra never appeared on GET /sessions")
+}
+
+// TestSameDirSecondLaunch409OverHTTP asserts the one-live-environment-per-folder
+// guard on the wire: a second same-dir launch into a live folder returns 409
+// folder_in_use (distinct from launch_failed) so clients can flip to worktree.
+func TestSameDirSecondLaunch409OverHTTP(t *testing.T) {
+	testutil.FakeClaude(t)
+	root := testutil.InitRepo(t)
+	env := newTestEnv(t, config.Config{Roots: []string{root}})
+
+	first := createSession(t, env, fmt.Sprintf(`{"folder":%q,"name":"first"}`, root))
+	_ = first
+
+	rec := doReq(t, env.handler, "POST", "/sessions", fmt.Sprintf(`{"folder":%q,"name":"second"}`, root), nil)
+	if rec.Code != 409 {
+		t.Fatalf("second same-dir launch = %d, want 409: %s", rec.Code, rec.Body.String())
+	}
+	if code := errCode(t, rec); code != "folder_in_use" {
+		t.Errorf("error code = %q, want folder_in_use", code)
+	}
+
+	// worktree mode into the same repo is still allowed alongside the live same-dir env
+	wt := createSession(t, env, fmt.Sprintf(`{"folder":%q,"name":"wt","spawnMode":"worktree","branch":"main"}`, root))
+	if wt.WorktreePath == nil || *wt.WorktreePath == "" {
+		t.Errorf("worktree launch should succeed beside a live same-dir env: %+v", wt)
+	}
 }

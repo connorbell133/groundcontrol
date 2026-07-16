@@ -30,11 +30,11 @@
 <sub><strong>1. Browse</strong> — tap a folder, see its branch</sub>
 </td>
 <td align="center" width="33%">
-<img src="assets/launch.png" width="220" alt="Launch console — worktree toggle, base branch picker, permission modes"><br>
-<sub><strong>2. Launch</strong> — worktree, base branch, permission mode</sub>
+<img src="assets/launch.png" width="220" alt="Launch console — preset picker, worktree toggle, base branch, six permission modes"><br>
+<sub><strong>2. Launch</strong> — preset, worktree, base branch, permission mode</sub>
 </td>
 <td align="center" width="33%">
-<img src="assets/sessions.png" width="220" alt="Environment card — live status, pairing QR, kill switch"><br>
+<img src="assets/sessions.png" width="220" alt="Environment card — live session count, env id and Claude session, pairing QR"><br>
 <sub><strong>3. Scan</strong> — QR pairs you straight into the Claude app</sub>
 </td>
 </tr>

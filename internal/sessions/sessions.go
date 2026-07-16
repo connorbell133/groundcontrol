@@ -217,11 +217,10 @@ func NewManager(j *journal.Journal, bus *events.Bus, ws *workspace.Manager, brow
 
 var (
 	ansiRE = regexp.MustCompile(`\x1b\[[0-9;?]*[a-zA-Z]|\x1b\][^\x07]*\x07?`)
-	urlRE  = regexp.MustCompile(`https://[^\s"'\x1b]+`)
 	// the two observed claude.ai pairing-URL shapes (2.1.210). The scrape keys
-	// on this, not the broad urlRE: an unrelated https URL the CLI prints (an
-	// update banner, a docs link) must not be mistaken for the pairing URL and
-	// pin the source — which would let it clobber a correct pointer URL (R16).
+	// on this narrow shape, not any https URL: an unrelated URL the CLI prints
+	// (an update banner, a docs link) must not be mistaken for the pairing URL
+	// and pin the source — which would let it clobber a correct pointer URL (R16).
 	pairingURLRE = regexp.MustCompile(`https://claude\.ai/(?:code\?environment=|remote/)[^\s"'\x1b]+`)
 	// box-drawing, blocks, braille spinners, and ASCII rule/spinner chars — lines of only these are visual noise
 	junkRE      = regexp.MustCompile(`[─-╿▀-▟⠀-⣿|\\/·•●◐◓◑◒~\-_=+*.\s]`)

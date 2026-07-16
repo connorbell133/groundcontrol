@@ -675,7 +675,10 @@ func (s *Server) Handler() http.Handler {
 			apiErr(w, 400, "missing_param", "folder required")
 			return
 		}
-		if !s.browser.WithinRoots(req.Folder) {
+		// runner-managed worktrees count as inside the roots: an agent already
+		// running in one (a job, a session) must be able to spawn a rescue
+		// session in its exact working directory for the stuck-agent handoff
+		if !s.browser.WithinRoots(req.Folder) && !s.ws.Manages(req.Folder) {
 			apiErr(w, 400, "outside_roots", "folder outside configured roots")
 			return
 		}
@@ -799,7 +802,8 @@ func (s *Server) Handler() http.Handler {
 			apiErr(w, 400, "missing_param", "prompt required")
 			return
 		}
-		if !s.browser.WithinRoots(req.Folder) {
+		// same relaxation as POST /sessions: runner-managed worktrees are launchable
+		if !s.browser.WithinRoots(req.Folder) && !s.ws.Manages(req.Folder) {
 			apiErr(w, 400, "outside_roots", "folder outside configured roots")
 			return
 		}

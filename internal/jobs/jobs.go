@@ -88,6 +88,10 @@ type Manager struct {
 	queue    []string
 	running  int
 	defaults struct{ concurrency, timeoutMs int }
+	// the runner's own reachable base URL (http://host:port), set by main once
+	// the listener resolves its port; spawned agents receive it as
+	// GROUNDCONTROL_URL so a stuck run knows where to call back
+	advertisedURL string
 
 	journal *journal.Journal
 	bus     *events.Bus
@@ -103,6 +107,14 @@ func NewManager(j *journal.Journal, bus *events.Bus, ws *workspace.Manager) *Man
 	}
 	m.defaults = struct{ concurrency, timeoutMs int }{concurrency: 2, timeoutMs: 15 * 60 * 1000}
 	return m
+}
+
+// SetAdvertisedURL records the runner's reachable base URL for env injection
+// into spawned jobs. Empty (never set) simply omits the variable.
+func (m *Manager) SetAdvertisedURL(u string) {
+	m.mu.Lock()
+	m.advertisedURL = u
+	m.mu.Unlock()
 }
 
 // Configure overrides the queue defaults; zero values keep the current setting.
@@ -341,7 +353,17 @@ func (m *Manager) startJob(j *liveJob) {
 	// and leave the job stuck in "running" long after the kill
 	cmd := exec.Command("claude", args...)
 	cmd.Dir = cwd
-	cmd.Env = append(os.Environ(), "FORCE_COLOR=0", "NO_COLOR=1")
+	// GROUNDCONTROL_* tells the agent where the runner lives and which job it
+	// is, so a stuck run can spawn a rescue session in its own cwd (the
+	// stuck-agent handoff in docs/api.md). No token is ever injected — the
+	// full runner environment is already inherited, so the operator decides
+	// what credential (if any) rides along.
+	cmd.Env = append(os.Environ(), "FORCE_COLOR=0", "NO_COLOR=1", "GROUNDCONTROL_JOB_ID="+j.ID)
+	m.mu.Lock()
+	if m.advertisedURL != "" {
+		cmd.Env = append(cmd.Env, "GROUNDCONTROL_URL="+m.advertisedURL)
+	}
+	m.mu.Unlock()
 	cmd.SysProcAttr = &syscall.SysProcAttr{Setpgid: true}
 
 	stdoutPipe, outErr := cmd.StdoutPipe()

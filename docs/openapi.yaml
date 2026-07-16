@@ -7,11 +7,58 @@ info:
     PWA is a route here; see docs/api.md for the human guide and cookbook.
     The unversioned /api/* paths are a deprecated alias of /api/v1 kept for
     one release.
+
+    This reference is served live at /docs (Scalar), and the raw spec at
+    /openapi.yaml — both unauthenticated, same as /healthz.
+
+    ## The stuck-agent handoff
+
+    The API is built so that an agent (a `claude -p` job, a CI harness, any
+    automation) that hits a wall can hand its exact working state to a human
+    and wait:
+
+    1. `POST /sessions?wait=ready` with `folder` set to the agent's own
+       working directory — one round-trip returns `pairingUrl`, a
+       claude.ai link that opens a live session in that folder.
+    2. Send the user that link ("I'm stuck on X — hop in here and I'll pick
+       up when you're done").
+    3. Poll `GET /sessions/{id}` (watch `activity` flip busy→idle and read
+       `/transcript`), subscribe to `GET /events` (SSE), or register a
+       `callbackUrl` — then resume when the human's work lands.
+    4. `DELETE /sessions/{id}` when done.
+
+    Agents spawned by this runner find their coordinates in the environment:
+    `GROUNDCONTROL_URL` (this API's base URL) and `GROUNDCONTROL_JOB_ID` /
+    `GROUNDCONTROL_SESSION_ID` (their own launch). Runner-managed worktree
+    folders (under ~/.groundcontrol/worktrees) are always launchable, so a
+    job can rescue itself in its own checkout. No credential is injected:
+    spawned agents inherit the runner's environment, so export a scoped
+    launch token there (or carry one in the prompt) if the API requires auth.
 servers:
   - url: /api/v1
 
 security:
   - bearer: []
+
+tags:
+  - name: Sessions
+    description: >
+      Spawn and supervise interactive claude remote-control environments —
+      the pairing-link handoff lives here.
+  - name: Jobs
+    description: Headless claude -p runs — queue, poll, cancel.
+  - name: Browse
+    description: Folder roots, subfolders, and branches for picking a launch target.
+  - name: Events
+    description: Lifecycle event stream (SSE); webhooks share the same payload.
+  - name: Worktrees
+    description: Kept worktrees — dirty orphans the sweeps refused to delete.
+  - name: Orbit
+    description: Leftover gc/* session branches and their guarded cleanup.
+  - name: Config
+    description: Roots, webhooks, and launch presets.
+  - name: Meta
+    description: Health and service identity.
 
 components:
   securitySchemes:
@@ -117,7 +164,14 @@ components:
           type: string
           enum: [starting, ready, exited, error]
           description: error means the process died before a pairing URL appeared.
-        pairingUrl: { type: [string, "null"] }
+        pairingUrl:
+          type: [string, "null"]
+          description: >
+            The claude.ai link that opens this live environment — the "magic
+            link" to hand a human (or scan via /sessions/{id}/qr). Null until
+            state reaches ready; POST /sessions?wait=ready returns it in one
+            round-trip.
+          examples: ["https://claude.ai/remote/abc123"]
         callbackUrl: { type: [string, "null"], description: "Per-launch webhook: every lifecycle event except session.start is POSTed here." }
         startedAt: { type: string, format: date-time }
         exitedAt: { type: [string, "null"], format: date-time }
@@ -517,6 +571,8 @@ components:
 paths:
   /roots:
     get:
+      operationId: listRoots
+      tags: [Browse]
       summary: List configured browse roots
       responses:
         "200":
@@ -535,6 +591,8 @@ paths:
 
   /browse:
     get:
+      operationId: browseFolder
+      tags: [Browse]
       summary: Browse a folder
       parameters:
         - $ref: "#/components/parameters/pathQuery"
@@ -550,6 +608,8 @@ paths:
 
   /branches:
     get:
+      operationId: listBranches
+      tags: [Browse]
       summary: List branches for the repo containing a path
       description: Local and remote-tracking refs deduped to plain names, newest commit first.
       parameters:
@@ -572,6 +632,8 @@ paths:
 
   /config:
     get:
+      operationId: getConfig
+      tags: [Config]
       summary: Read config
       responses:
         "200":
@@ -582,6 +644,8 @@ paths:
         "401": { $ref: "#/components/responses/Unauthorized" }
         "403": { $ref: "#/components/responses/Forbidden" }
     put:
+      operationId: updateConfig
+      tags: [Config]
       summary: Update config (partial)
       description: >
         Any subset of roots, showHidden, webhooks, presets. Only keys present
@@ -621,6 +685,8 @@ paths:
 
   /worktrees:
     get:
+      operationId: listWorktrees
+      tags: [Worktrees]
       summary: List kept worktrees
       description: Dirty orphans the cleanup sweeps refused to delete.
       responses:
@@ -638,6 +704,8 @@ paths:
         "401": { $ref: "#/components/responses/Unauthorized" }
         "403": { $ref: "#/components/responses/Forbidden" }
     delete:
+      operationId: removeWorktree
+      tags: [Worktrees]
       summary: Force-remove a kept worktree
       description: Merged gc/* session branches are deleted; unmerged ones kept.
       parameters:
@@ -657,6 +725,8 @@ paths:
 
   /orbit:
     get:
+      operationId: listOrbitBranches
+      tags: [Orbit]
       summary: List leftover gc/* session branches
       description: >
         Scans the distinct repos named by recent session.start journal
@@ -679,6 +749,8 @@ paths:
         "401": { $ref: "#/components/responses/Unauthorized" }
         "403": { $ref: "#/components/responses/Forbidden" }
     delete:
+      operationId: sweepOrbitBranch
+      tags: [Orbit]
       summary: Safe-delete a gc/* session branch
       description: >
         Always git branch -d — there is no force parameter; unmerged
@@ -723,6 +795,8 @@ paths:
 
   /sessions:
     get:
+      operationId: listSessions
+      tags: [Sessions]
       summary: List sessions
       responses:
         "200":
@@ -745,6 +819,8 @@ paths:
         "401": { $ref: "#/components/responses/Unauthorized" }
         "403": { $ref: "#/components/responses/Forbidden" }
     post:
+      operationId: createSession
+      tags: [Sessions]
       summary: Spawn an agent session
       description: >
         Spawns claude remote-control in the folder (or a fresh worktree).
@@ -783,6 +859,8 @@ paths:
 
   /sessions/{id}:
     get:
+      operationId: getSession
+      tags: [Sessions]
       summary: Inspect a session
       parameters:
         - $ref: "#/components/parameters/sessionId"
@@ -796,6 +874,8 @@ paths:
         "403": { $ref: "#/components/responses/Forbidden" }
         "404": { $ref: "#/components/responses/NotFound" }
     delete:
+      operationId: killSession
+      tags: [Sessions]
       summary: Kill a session
       description: SIGTERM to the PTY; the worktree is cleaned on exit (kept if dirty).
       parameters:
@@ -812,6 +892,8 @@ paths:
 
   /sessions/{id}/qr:
     get:
+      operationId: getSessionQr
+      tags: [Sessions]
       summary: Pairing QR (SVG)
       parameters:
         - $ref: "#/components/parameters/sessionId"
@@ -832,6 +914,8 @@ paths:
 
   /sessions/{id}/log:
     get:
+      operationId: getSessionLog
+      tags: [Sessions]
       summary: Runtime log tail
       description: Last ~400 output chunks, ANSI-stripped, as plain text.
       parameters:
@@ -848,6 +932,8 @@ paths:
 
   /sessions/{id}/transcript:
     get:
+      operationId: getSessionTranscript
+      tags: [Sessions]
       summary: Conversation transcripts
       description: >
         The actual conversations of this launch — user prompts and assistant
@@ -874,6 +960,8 @@ paths:
 
   /sessions/{id}/record:
     delete:
+      operationId: dismissSession
+      tags: [Sessions]
       summary: Dismiss a dead or lost session
       parameters:
         - $ref: "#/components/parameters/sessionId"
@@ -897,6 +985,8 @@ paths:
 
   /events:
     get:
+      operationId: streamEvents
+      tags: [Events]
       summary: Lifecycle event stream (SSE)
       description: >
         Server-sent events: one message per lifecycle event (LifecycleEvent as
@@ -914,6 +1004,8 @@ paths:
 
   /jobs:
     get:
+      operationId: listJobs
+      tags: [Jobs]
       summary: List jobs
       responses:
         "200":
@@ -930,6 +1022,8 @@ paths:
         "401": { $ref: "#/components/responses/Unauthorized" }
         "403": { $ref: "#/components/responses/Forbidden" }
     post:
+      operationId: createJob
+      tags: [Jobs]
       summary: Queue a headless job
       description: >
         Runs claude -p <prompt> --output-format json to completion — no PTY,
@@ -962,6 +1056,8 @@ paths:
 
   /jobs/{id}:
     get:
+      operationId: getJob
+      tags: [Jobs]
       summary: Inspect a job
       parameters:
         - $ref: "#/components/parameters/sessionId"
@@ -975,6 +1071,8 @@ paths:
         "403": { $ref: "#/components/responses/Forbidden" }
         "404": { $ref: "#/components/responses/NotFound" }
     delete:
+      operationId: cancelJob
+      tags: [Jobs]
       summary: Cancel a job
       description: Dequeues a queued job, kills a running one's whole process group; a no-op on finished jobs.
       parameters:
@@ -991,6 +1089,8 @@ paths:
 
   /jobs/{id}/log:
     get:
+      operationId: getJobLog
+      tags: [Jobs]
       summary: Job log (raw stdout+stderr)
       parameters:
         - $ref: "#/components/parameters/sessionId"
@@ -1006,6 +1106,8 @@ paths:
 
   /jobs/{id}/record:
     delete:
+      operationId: dismissJob
+      tags: [Jobs]
       summary: Drop a finished job from the list
       parameters:
         - $ref: "#/components/parameters/sessionId"
@@ -1029,6 +1131,8 @@ paths:
 
   /journal/recent:
     get:
+      operationId: listRecentLaunches
+      tags: [Sessions]
       summary: Recent launch configs
       parameters:
         - name: limit
@@ -1048,3 +1152,28 @@ paths:
                     items: { $ref: "#/components/schemas/RecentLaunch" }
         "401": { $ref: "#/components/responses/Unauthorized" }
         "403": { $ref: "#/components/responses/Forbidden" }
+
+  /healthz:
+    servers:
+      - url: /
+        description: Served at the server root, outside the /api/v1 prefix.
+    get:
+      operationId: getHealth
+      tags: [Meta]
+      summary: Liveness probe
+      description: >
+        Unauthenticated by design (uptime probes), like GET /docs and
+        GET /openapi.yaml. sessions counts ready sessions only.
+      security: []
+      responses:
+        "200":
+          description: The runner is up.
+          content:
+            application/json:
+              schema:
+                type: object
+                required: [ok, version, sessions]
+                properties:
+                  ok: { type: boolean }
+                  version: { type: string }
+                  sessions: { type: integer, description: Live sessions currently in the ready state. }

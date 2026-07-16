@@ -137,6 +137,19 @@ func main() {
 	}
 	fmt.Printf("groundcontrol listening on http://%s:%d\n", host, port)
 
+	// Spawned agents learn where the runner lives via GROUNDCONTROL_URL, so a
+	// stuck job or session can call back and launch a rescue session in its
+	// own working directory (the stuck-agent handoff, docs/api.md). Agents run
+	// on this box, so loopback is always reachable even when the server binds
+	// a broader interface like 0.0.0.0.
+	advertiseHost := host
+	if advertiseHost == "0.0.0.0" || advertiseHost == "::" {
+		advertiseHost = "127.0.0.1"
+	}
+	advertisedURL := fmt.Sprintf("http://%s/api/v1", net.JoinHostPort(advertiseHost, strconv.Itoa(port)))
+	sessionMgr.SetAdvertisedURL(advertisedURL)
+	jobMgr.SetAdvertisedURL(advertisedURL)
+
 	ctx, stop := signal.NotifyContext(context.Background(), syscall.SIGINT, syscall.SIGTERM)
 	defer stop()
 

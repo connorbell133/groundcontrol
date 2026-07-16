@@ -35,6 +35,7 @@ type testEnv struct {
 	browser    *browse.Browser
 	sessions   *sessions.Manager
 	jobs       *jobs.Manager
+	ws         *workspace.Manager
 }
 
 // newTestEnv builds an isolated instance wired the way main() wires it.
@@ -63,6 +64,7 @@ func newTestEnv(t *testing.T, cfg config.Config) *testEnv {
 		browser:    browser,
 		sessions:   sessionMgr,
 		jobs:       jobMgr,
+		ws:         ws,
 	}
 }
 
@@ -1532,6 +1534,88 @@ func TestSessionsExtrasOverHTTP(t *testing.T) {
 // TestSameDirSecondLaunch409OverHTTP asserts the one-live-environment-per-folder
 // guard on the wire: a second same-dir launch into a live folder returns 409
 // folder_in_use (distinct from launch_failed) so clients can flip to worktree.
+// The stuck-agent handoff depends on this: a folder inside the runner's own
+// worktree base counts as launchable even though it sits outside the
+// configured roots, so an agent running in a worktree can spawn a rescue
+// session in its exact working directory.
+func TestPostSessionsFromRunnerWorktree(t *testing.T) {
+	testutil.FakeClaude(t)
+	repo := testutil.InitRepo(t)
+	env := newTestEnv(t, config.Config{Roots: []string{repo}})
+
+	wt, err := env.ws.Add(repo, "main", "resc0001", "rescue")
+	if err != nil {
+		t.Fatalf("ws.Add: %v", err)
+	}
+	created := createSession(t, env, fmt.Sprintf(`{"folder":%q,"name":"rescue"}`, wt.Path))
+	if created.Folder != wt.Path {
+		t.Errorf("session folder = %q, want the worktree %q", created.Folder, wt.Path)
+	}
+
+	// an arbitrary folder outside both the roots and the worktree base is
+	// still refused — the relaxation is scoped to runner-managed paths
+	outside := testutil.ResolvedTempDir(t)
+	rec := doReq(t, env.handler, "POST", "/sessions", fmt.Sprintf(`{"folder":%q}`, outside), nil)
+	if rec.Code != 400 || errCode(t, rec) != "outside_roots" {
+		t.Errorf("outside launch = %d %s, want 400 outside_roots", rec.Code, rec.Body.String())
+	}
+}
+
+// Spawned agents receive the runner's coordinates in their environment —
+// GROUNDCONTROL_URL plus their own launch id — which is what lets a stuck
+// run call back and open a rescue session (docs/api.md).
+func TestSpawnedAgentsInheritRunnerCoordinates(t *testing.T) {
+	// custom claude stub: dump the injected vars, then behave like FakeClaude
+	// (pairing line + block) so the session lifecycle still works
+	dir := t.TempDir()
+	script := "#!/bin/sh\n" +
+		"echo \"COORDS url=$GROUNDCONTROL_URL session=$GROUNDCONTROL_SESSION_ID job=$GROUNDCONTROL_JOB_ID\"\n" +
+		"echo \"https://claude.ai/remote/abc123\"\n" +
+		"case \"$1\" in -p) exit 0 ;; *) exec sleep 300 ;; esac\n"
+	if err := os.WriteFile(filepath.Join(dir, "claude"), []byte(script), 0o755); err != nil {
+		t.Fatalf("write claude stub: %v", err)
+	}
+	t.Setenv("PATH", dir+string(os.PathListSeparator)+os.Getenv("PATH"))
+
+	root := testutil.ResolvedTempDir(t)
+	env := newTestEnv(t, config.Config{Roots: []string{root}})
+	env.sessions.SetAdvertisedURL("http://127.0.0.1:3020/api/v1")
+	env.jobs.SetAdvertisedURL("http://127.0.0.1:3020/api/v1")
+
+	created := createSession(t, env, fmt.Sprintf(`{"folder":%q,"name":"coords"}`, root))
+	wantSession := fmt.Sprintf("COORDS url=http://127.0.0.1:3020/api/v1 session=%s job=", created.ID)
+	waitForLogLine(t, func() *string { return env.sessions.GetLog(created.ID) }, wantSession)
+
+	rec := doReq(t, env.handler, "POST", "/jobs", fmt.Sprintf(`{"folder":%q,"prompt":"hi","spawnMode":"same-dir"}`, root), nil)
+	if rec.Code != 202 {
+		t.Fatalf("POST /jobs = %d: %s", rec.Code, rec.Body.String())
+	}
+	var job jobs.Job
+	if err := json.Unmarshal(rec.Body.Bytes(), &job); err != nil {
+		t.Fatalf("job body not JSON: %v", err)
+	}
+	wantJob := fmt.Sprintf("COORDS url=http://127.0.0.1:3020/api/v1 session= job=%s", job.ID)
+	waitForLogLine(t, func() *string { return env.jobs.GetLog(job.ID) }, wantJob)
+}
+
+// waitForLogLine polls a log getter until want appears — spawn output lands
+// asynchronously via the read loops.
+func waitForLogLine(t *testing.T, get func() *string, want string) {
+	t.Helper()
+	deadline := time.Now().Add(10 * time.Second)
+	for time.Now().Before(deadline) {
+		if log := get(); log != nil && strings.Contains(*log, want) {
+			return
+		}
+		time.Sleep(20 * time.Millisecond)
+	}
+	got := ""
+	if log := get(); log != nil {
+		got = *log
+	}
+	t.Fatalf("log never contained %q; log:\n%s", want, got)
+}
+
 func TestSameDirSecondLaunch409OverHTTP(t *testing.T) {
 	testutil.FakeClaude(t)
 	root := testutil.InitRepo(t)

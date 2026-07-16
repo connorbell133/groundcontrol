@@ -54,7 +54,12 @@ into the journal as `actor`, so the flight log shows who launched what.
 `GET /docs` serves a [Scalar](https://scalar.com) API reference for this
 API, and `GET /openapi.yaml` serves the raw spec it reads from — both
 unauthenticated by design, same as `/healthz`. Visit
-`http://<host>:<port>/docs` in a browser.
+`http://<host>:<port>/docs` in a browser. The Scalar script loads from
+jsdelivr (pinned to major v1); when the CDN is unreachable the page says so
+and points at the locally-served spec instead. Every operation in the spec
+carries an `operationId` and a tag, so SDK generators and agent harnesses
+that turn OpenAPI into tools get stable, readable names
+(`createSession`, `listJobs`, …).
 
 ## Errors
 
@@ -131,7 +136,11 @@ change; renaming one is breaking.
 }
 ```
 
-- `folder` (required) — must be inside a configured root.
+- `folder` (required) — must be inside a configured root, or inside the
+  runner's own worktree base (`~/.groundcontrol/worktrees/...`) — the latter
+  is what lets an agent already running in a worktree spawn a rescue session
+  in its exact working directory (see [the stuck-agent
+  handoff](#the-stuck-agent-handoff-magic-link)).
 - `name` — must not collide with a live session; omit to auto-generate.
 - `spawnMode` — `same-dir` (default) or `worktree`. Worktree mode requires
   `branch`, cuts a private `gc/<name-slug>-<id>` branch off it under
@@ -354,6 +363,25 @@ config key: `{ "concurrency": 2, "timeoutMs": 900000 }`. On completion,
 an 80-char preview, never the full prompt — the full text lives on the job
 record until dismissed.
 
+### What spawned agents inherit
+
+Every `claude` process this runner spawns — session launchers and headless
+jobs alike — gets the runner's coordinates in its environment:
+
+| variable | value |
+|---|---|
+| `GROUNDCONTROL_URL` | this API's base URL (`http://127.0.0.1:<port>/api/v1`; loopback even when the server binds wider — spawned agents run on the same box) |
+| `GROUNDCONTROL_SESSION_ID` | the launch's session id (sessions only) |
+| `GROUNDCONTROL_JOB_ID` | the launch's job id (jobs only) |
+
+That's discovery, not credentials: **no token is ever injected**. Spawned
+agents inherit the runner's full environment, so if the API requires auth
+(it should), export a scoped token before starting the runner — e.g.
+`GROUNDCONTROL_TOKEN=<a launch-scoped token>` — and every agent can use it;
+or hand a token to one specific run inside its prompt. A token with the
+`read` + `launch` scopes covers the whole handoff loop below and can never
+widen the configured roots.
+
 ## Events & notifications
 
 One mechanism, one payload. Every lifecycle transition becomes an event:
@@ -495,6 +523,69 @@ applied, so a rejected write leaves the config untouched.
 A token that can reach `PUT /config` can widen `roots` — treat `authToken`
 and any `admin`-scoped token as root on the box. Give automations
 `read`/`launch` tokens instead; they can never widen what's reachable.
+
+## The stuck-agent handoff (magic link)
+
+The journey this API is optimized for: an autonomous agent — a `claude -p`
+job this runner spawned, a CI harness, any automation — hits a wall it can't
+resolve alone (a credential prompt, an ambiguous decision, a broken test only
+a human understands). Instead of failing, it opens a live session **in its
+own working directory**, hands the human the claude.ai link, and polls until
+the human's work lands.
+
+From inside a spawned agent, everything needed is already in the environment
+(`GROUNDCONTROL_URL`, plus an operator-provided token — see
+[What spawned agents inherit](#what-spawned-agents-inherit)):
+
+```bash
+# 1. one round-trip: spawn a session in my own cwd and get the magic link
+rescue=$(curl -sf -H "authorization: Bearer $GROUNDCONTROL_TOKEN" \
+  -X POST "$GROUNDCONTROL_URL/sessions?wait=ready" \
+  -d "{\"folder\":\"$PWD\",\"name\":\"rescue-$GROUNDCONTROL_JOB_ID\"}")
+id=$(echo "$rescue" | jq -r .id)
+url=$(echo "$rescue" | jq -r .pairingUrl)
+
+# 2. hand the link to the human, wherever they are (Slack, ntfy, a PR comment)
+echo "I'm stuck on X — hop in here and I'll pick up when you're done: $url"
+
+# 3. poll until the human has been in and gone idle (or watch /events, or
+#    pass a callbackUrl at step 1 and just wait for the webhook)
+while :; do
+  s=$(curl -sf -H "authorization: Bearer $GROUNDCONTROL_TOKEN" \
+    "$GROUNDCONTROL_URL/sessions/$id")
+  state=$(echo "$s" | jq -r .state)
+  [ "$state" != "ready" ] && break            # human closed it / it exited
+  echo "$s" | jq -e '.activity == "idle"' >/dev/null && break  # or: done working
+  sleep 15
+done
+
+# 4. read what happened, clean up, and continue
+curl -sf -H "authorization: Bearer $GROUNDCONTROL_TOKEN" \
+  "$GROUNDCONTROL_URL/sessions/$id/transcript" | jq .
+curl -sf -H "authorization: Bearer $GROUNDCONTROL_TOKEN" \
+  -X DELETE "$GROUNDCONTROL_URL/sessions/$id"
+```
+
+The pieces that make this work:
+
+- **`folder: $PWD` always works for spawned agents.** Runner-managed
+  worktrees count as inside the roots, so a worktree-mode job can launch the
+  rescue session in the exact checkout it's stuck in — the human sees the
+  agent's uncommitted work, not a fresh clone.
+- **`?wait=ready` collapses the launch to one round-trip** — `201` with
+  `pairingUrl`, `409 launch_failed` if the CLI died, `504 ready_timeout` if
+  it's slow (keep polling `GET /sessions/{id}`).
+- **"Done" is a judgment call the API gives you signals for**: `state`
+  leaving `ready` (the session exited), `activity` flipping back to `idle`
+  after the human worked, new entries in `/transcript`, or — cleanest for
+  job-style automations — a `callbackUrl` that receives `session.exit`.
+  Define the convention with your humans (e.g. "type *done* and close the
+  session") and key off the strongest signal available.
+- **Caveat for rescue sessions inside a job's worktree**: when the job that
+  owns the worktree finishes, a *clean* worktree is removed. The human's
+  in-progress edits keep it dirty (dirty worktrees are always kept, as
+  `worktree-kept`), but the polite pattern is to keep the job alive until
+  the rescue session exits.
 
 ## Cookbook
 

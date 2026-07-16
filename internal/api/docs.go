@@ -9,7 +9,11 @@ import (
 // scalarDocsHTML renders the Scalar API reference (https://scalar.com) via
 // its CDN script — no Go client library exists for it, and none is needed:
 // the whole "integration" is a static page pointed at the spec URL, which
-// works the same from any backend language.
+// works the same from any backend language. The script is pinned to major v1
+// so a future breaking release can't silently blank the page, and the static
+// fallback below the mount point keeps /docs useful (a link to the raw spec)
+// when the CDN is unreachable — e.g. a tailnet-only box — or JS is off; Scalar
+// replaces the mount's contents once it boots.
 const scalarDocsHTML = `<!doctype html>
 <html>
   <head>
@@ -19,7 +23,21 @@ const scalarDocsHTML = `<!doctype html>
   </head>
   <body>
     <script id="api-reference" data-url="/openapi.yaml"></script>
-    <script src="https://cdn.jsdelivr.net/npm/@scalar/api-reference"></script>
+    <div id="cdn-fallback" hidden style="font-family: system-ui, sans-serif; margin: 2rem">
+      <p>The interactive reference could not load (cdn.jsdelivr.net is
+      unreachable from this browser).</p>
+      <p>The machine-readable contract is always served locally at
+      <a href="/openapi.yaml">/openapi.yaml</a>, and the prose guide lives in
+      the repo at docs/api.md.</p>
+    </div>
+    <noscript>
+      <p style="font-family: system-ui, sans-serif; margin: 2rem">
+        This interactive reference needs JavaScript. The raw spec is at
+        <a href="/openapi.yaml">/openapi.yaml</a>.
+      </p>
+    </noscript>
+    <script src="https://cdn.jsdelivr.net/npm/@scalar/api-reference@1"
+      onerror="document.getElementById('cdn-fallback').hidden = false"></script>
   </body>
 </html>
 `

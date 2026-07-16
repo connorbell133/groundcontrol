@@ -119,6 +119,33 @@ func (m *Manager) Add(folder, branch, id, label string) (Info, error) {
 	return Info{Path: wtPath, Branch: wtBranch, BaseCommit: baseCommit}, nil
 }
 
+// Manages reports whether path is an existing directory inside the runner's
+// own worktree base — the folders m.Add creates. Launch guards accept these
+// alongside the configured roots so an agent already running in a
+// runner-managed worktree (a job, a session) can spawn a rescue session in
+// its exact working directory. Symlinks are resolved on both sides, same as
+// browse.WithinRoots, so a link inside the base can't smuggle in an outside
+// target.
+func (m *Manager) Manages(path string) bool {
+	resolved, err := filepath.EvalSymlinks(path)
+	if err != nil {
+		return false // must exist: there is nothing to rescue in a folder that isn't there
+	}
+	st, err := os.Stat(resolved)
+	if err != nil || !st.IsDir() {
+		return false
+	}
+	base, err := filepath.EvalSymlinks(m.base)
+	if err != nil {
+		return false
+	}
+	rel, err := filepath.Rel(base, resolved)
+	if err != nil {
+		return false
+	}
+	return rel != "." && rel != ".." && !strings.HasPrefix(rel, ".."+string(filepath.Separator))
+}
+
 // Remove removes the worktree and, when the run branch never accumulated
 // commits, its gc/ branch too. wtBranch/baseCommit may be "" (skip branch deletion).
 func (m *Manager) Remove(folder, wtPath, wtBranch, baseCommit string) {

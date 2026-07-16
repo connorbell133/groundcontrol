@@ -18,7 +18,7 @@
 </p>
 
 <p align="center">
-  <strong>Browse any folder &middot; pick a branch &middot; launch Claude Code in a worktree &middot; scan the QR &middot; done</strong>
+  <strong>Browse any folder &middot; pick a branch &middot; launch a Claude Code environment in a worktree &middot; tap open in claude.ai &middot; done</strong>
 </p>
 
 ---
@@ -30,19 +30,19 @@
 <sub><strong>1. Browse</strong> — tap a folder, see its branch</sub>
 </td>
 <td align="center" width="33%">
-<img src="assets/launch.png" width="220" alt="Launch console — worktree toggle, base branch picker, permission modes"><br>
-<sub><strong>2. Launch</strong> — worktree, base branch, permission mode</sub>
+<img src="assets/launch.png" width="220" alt="Launch console — preset picker, worktree toggle, base branch, six permission modes"><br>
+<sub><strong>2. Launch</strong> — preset, worktree, base branch, permission mode</sub>
 </td>
 <td align="center" width="33%">
-<img src="assets/sessions.png" width="220" alt="Session card — live status, pairing QR, kill switch"><br>
-<sub><strong>3. Scan</strong> — QR pairs you straight into the Claude app</sub>
+<img src="assets/sessions.png" width="220" alt="Environment card — live session count, session rows, open in claude.ai, kill switch"><br>
+<sub><strong>3. Open</strong> — one tap into the Claude app</sub>
 </td>
 </tr>
 </table>
 
 You know the moment. You're on the couch, you think of the fix, and the thought dies because starting a [Claude Code](https://claude.com/claude-code) session means: find the laptop, SSH in, `cd` three directories deep, run `claude remote-control`, and squint at a QR code rendered in terminal characters.
 
-groundcontrol is the tower. It's a small home-screen app served off your own machine: browse your real filesystem, tap a folder, clear an agent for launch — optionally in a fresh git worktree off any branch — and scan a proper QR into the Claude app. The tower is never in the conversation; once paired, you're talking straight to Claude Code. groundcontrol just tracks what's in flight, holds the worktrees, and keeps the flight log.
+groundcontrol is the tower. It's a small home-screen app served off your own machine: browse your real filesystem, tap a folder, clear an agent for launch — optionally in a fresh git worktree off any branch — and tap straight into the Claude app. Each launch is one `claude remote-control` **environment**; the Claude app can open multiple sessions inside it, and the tower watches them all. The tower is never in the conversation; once paired, you're talking straight to Claude Code. groundcontrol just tracks what's in flight, holds the worktrees, and keeps the flight log.
 
 ## Before / after
 
@@ -57,10 +57,10 @@ $ claude remote-control
   ▄▄▄▄▄▄▄ ▄  ▄▄ ▄▄▄▄▄▄▄     ← now photograph your terminal
 ```
 
-After: open the app, tap the folder, tap **Launch**, scan.
+After: open the app, tap the folder, tap **Launch**, tap **open in claude.ai**.
 
 <p align="center">
-  <a href="assets/demo.mp4"><img src="assets/demo.gif" width="340" alt="Real demo, real time: browse to a repo, launch a worktree session, scan the QR, land in the Claude app"></a>
+  <a href="assets/demo.mp4"><img src="assets/demo.gif" width="340" alt="Real demo, real time: browse to a repo, launch a worktree environment, and land in the Claude app"></a>
 </p>
 <p align="center"><sub>Not staged — one take, real time, recorded on a phone. Ends where it should: in the Claude app, paired. (<a href="assets/demo.mp4">MP4</a>)</sub></p>
 
@@ -69,10 +69,13 @@ After: open the app, tap the folder, tap **Launch**, scan.
 - **Browses your actual filesystem** from configured roots — no repo allowlist to maintain. Git repos get a branch chip; subfolders of a repo inherit its git context, so launching from `src/` still offers the repo's branches.
 - **A branch picker on every git launch.** *In folder* switches the checkout to the branch you pick (refused if you have uncommitted changes — your mess is safe). *Worktree* cuts a private `gc/<name>-<id>` branch — named after what you said the run is for — from any base, local or remote, under `~/.groundcontrol/worktrees/`, so launching off the branch you're standing on just works. Session branches are deleted on cleanup only when fully merged; dirty worktrees are never force-deleted — kept, listed in Settings, cleaned when you say so.
 - **Permission modes per launch:** all six the CLI documents — Ask (default), accept-Edits, Plan, auto, don't-ask, and YOLO (bypass permissions) — passed through as `--permission-mode <mode>`. YOLO in a folder with no git history takes a deliberate second tap — no undo exists there, so the button makes you mean it.
-- **Live session cards** with pairing QR, one-tap open-in-Claude-app, an environment readout (environment id, live session count, Claude conversation id, host, workspace), Claude's last reply as a snippet, runtime log tail, uptime and last-output age, and a kill switch that updates instantly.
+- **Environment console cards.** A card is one live environment: one-tap **open in claude.ai**, a "N of `<capacity>` sessions" counter, the environment's own sessions as rows with busy/idle ticks, other sessions running in the same folder demoted to a muted group, a stats block (environment id, Claude conversation id, host, workspace), Claude's last reply as a snippet, the runtime log tail, a PR link when the session opens one, uptime and last-output age, and a kill switch that updates instantly. A pairing QR sits behind a toggle for the one case that needs it — pairing a second device.
+- **Session capacity per launch.** *Max sessions* in the launch sheet is passed through as `--capacity` — how many sessions claude.ai can open in the environment. Out-of-range values are clamped server-side, not rejected.
+- **Environment presets:** named launch configurations saved in `config.json` — permission mode, workspace mode, capacity, and an optional settings JSON written to the launch folder as `.claude/settings.local.json` for the run. The injected file is marker-scoped: it never replaces a file you own, rejects `hooks` and other code-executing keys, and is removed when the environment exits ([docs](docs/api.md#preset-settings-injection)).
+- **One live environment per folder** for in-folder launches. claude.ai's picker names environments by folder basename, so a second one would be indistinguishable — the API answers 409 and the launch sheet flips to worktree mode instead. Worktree folders are named after the run, so your name carries into the picker.
 - **Recent dispatches:** your last launches as one-tap relaunch chips, with staleness detection — if the branch is gone, the chip says so and degrades gracefully.
-- **Survives restarts honestly.** Sessions the tower lost track of show up as *lost* cards from the flight log instead of silently vanishing.
-- **Webhook notifications** when a session pairs or dies, so you can put the phone down while it provisions. One generic JSON POST per lifecycle event — point it at [ntfy](https://ntfy.sh) (via its `?template=yes` params), n8n, or anything else with a URL; nothing is special-cased.
+- **Survives restarts honestly.** Environments the tower lost track of show up as *lost* cards from the flight log instead of silently vanishing.
+- **Webhook notifications** when an environment pairs or dies, so you can put the phone down while it provisions. One generic JSON POST per lifecycle event — point it at [ntfy](https://ntfy.sh) (via its `?template=yes` params), n8n, or anything else with a URL; nothing is special-cased.
 - **Installable PWA** — add to home screen, standalone window, offline shell, and it self-reloads when the server ships a new version.
 
 ## How it works
@@ -82,16 +85,16 @@ phone (PWA, vanilla JS) ──HTTPS via [your choice: Tailscale, Caddy, LAN...]�
                                                                                  │
                                                                  creack/pty ─▶ claude remote-control
                                                                                  │
-                                                            scrape pairing URL ─▶ QR ─▶ Claude app
+                                                              read pairing URL ─▶ open in claude.ai ─▶ Claude app
 ```
 
-One static Go binary. The server spawns `claude remote-control` in a PTY, scrapes the pairing URL out of the output, and renders it as a QR. Session history lives in an append-only JSON journal that doubles as the recents list, the lost-session detector, and the audit trail. No database, no build tooling, no framework — the server is one flat Go package leaning on the stdlib plus two small libraries ([creack/pty](https://github.com/creack/pty), [skip2/go-qrcode](https://github.com/skip2/go-qrcode)), the frontend three static files plus a 32-line service worker, embedded straight into the binary with `go:embed`.
+One static Go binary. The server spawns `claude remote-control` in a PTY, reads the pairing URL from the CLI's pid-validated `bridge-pointer.json` (falling back to scraping the PTY output), and surfaces it as a one-tap open-in-claude.ai link — you're usually already on the phone, so there's nothing to scan; a QR fallback sits behind a toggle for pairing a second device. A registry poller runs `claude agents --json` on a tiered cadence and joins the rows to each environment by process ancestry — that's where the session rows, busy/idle activity, and Claude conversation ids on the cards come from. Environment history lives in an append-only JSON journal that doubles as the recents list, the lost-environment detector, and the audit trail. No database, no build tooling, no framework — the server is a handful of small stdlib-only internal packages plus two small libraries ([creack/pty](https://github.com/creack/pty), [skip2/go-qrcode](https://github.com/skip2/go-qrcode)), the frontend three static files plus a 32-line service worker, embedded straight into the binary with `go:embed`.
 
 The server itself doesn't know or care how it's reached — it just binds a host/port. Tailscale is the one we recommend and document below, but it's a suggestion, not a dependency: anything that gets HTTPS to `:3020` works (see [Reaching it from your phone](#reaching-it-from-your-phone)).
 
 ## Install
 
-You need [Go 1.24+](https://go.dev), git, and the [Claude Code CLI](https://claude.com/claude-code) logged in on the host machine (`claude` must work in a terminal there — Remote Control needs full login credentials, not an API key). Linux and macOS only.
+You need [Go 1.24+](https://go.dev), git, and the [Claude Code CLI](https://claude.com/claude-code) logged in on the host machine (`claude` must work in a terminal there — Remote Control needs full login credentials, not an API key). Linux and macOS only. Any reasonably current CLI launches fine; the per-session readouts on the cards (session rows, busy/idle activity, Claude conversation id) need `claude` ≥ 2.1.145 and quietly stay blank on older CLIs.
 
 > **0.4.0+ is a Go rewrite.** Same config format, same API, same frontend, same journal — only the runtime changed. It builds to one static binary with the web frontend embedded: no Node, no npm, no native prebuilds, no postinstall hacks. The one casualty: Windows is no longer supported (the Go PTY layer has no ConPTY support).
 
@@ -175,19 +178,20 @@ Adjust the binary path to wherever `go env GOPATH`/bin (or your build output) ac
 
 | key | what it does |
 |---|---|
-| `roots` | absolute paths the folder browser can see (and the only places sessions may launch) |
+| `roots` | absolute paths the folder browser can see (and the only places environments may launch) |
 | `authToken` | bearer token with full access, required on every API call; empty disables auth (don't) |
 | `tokens` | scoped tokens for automations: `[{name, token, scopes}]` with scopes from `read`/`launch`/`admin` — an n8n token gets `read,launch` and can never widen `roots` ([docs](docs/api.md#scoped-tokens)) |
 | `webhooks` | notification subscribers: `[{url, events?}]` — each lifecycle event is POSTed as JSON to every matching URL; filter with exact names, `session.*`, `session.failed`, or `*` |
+| `presets` | environment presets for the launch sheet: `[{name, permissionMode?, spawnMode?, capacity?, settingsJson?}]` — unset fields fall back to the launch defaults; `settingsJson` is injected for the run and refuses `hooks` keys ([docs](docs/api.md#preset-settings-injection)) |
 | `jobs` | headless-job bounds: `{concurrency, timeoutMs}` (default 2 parallel, 15 min) |
 | `showHidden` | show dotfolders in the browser |
 | `port`, `host` | where the server listens. `host` defaults to `127.0.0.1` (loopback only) if omitted — the example config and `install.sh`'s generated config both set it to `0.0.0.0` so LAN/Tailscale/proxy access works out of the box; narrow it back to `127.0.0.1` if you're only ever reaching it through something on `localhost` (an SSH tunnel, a reverse proxy on the same box) |
 
-Everything user-facing — theme, launch defaults, roots, the notification webhook, kept-worktree cleanup — is also editable from the ⚙ Settings sheet in the app itself.
+Everything user-facing — theme, launch defaults, environment presets, roots, the notification webhook, kept-worktree cleanup — is also editable from the ⚙ Settings sheet in the app itself.
 
 ## API
 
-Everything the app does is a bearer-token HTTP API at `/api/v1` — the PWA is just the first client. Spawn a session from a script or an n8n workflow with `POST /api/v1/sessions?wait=ready` and get the pairing URL in one round-trip; run a fully headless agent with `POST /api/v1/jobs` (`claude -p` in a fresh worktree, result + cost on your webhook); follow every lifecycle event live over SSE (`GET /api/v1/events`). [docs/api.md](docs/api.md) is the guide with a curl cookbook; [docs/openapi.yaml](docs/openapi.yaml) is the machine contract. Errors are a stable envelope (`{"error":{"code","message"}}`) — key off `code`.
+Everything the app does is a bearer-token HTTP API at `/api/v1` — the PWA is just the first client. Launch an environment from a script or an n8n workflow with `POST /api/v1/sessions?wait=ready` and get the pairing URL in one round-trip; run a fully headless agent with `POST /api/v1/jobs` (`claude -p` in a fresh worktree, result + cost on your webhook); follow every lifecycle event live over SSE (`GET /api/v1/events`). [docs/api.md](docs/api.md) is the guide with a curl cookbook; [docs/openapi.yaml](docs/openapi.yaml) is the machine contract. Errors are a stable envelope (`{"error":{"code","message"}}`) — key off `code`.
 
 ## Development
 
@@ -209,9 +213,9 @@ Design notes, for the curious: the UI is a "paper dispatch" theme — Instrument
 
 ## What it deliberately isn't
 
-- **Not a chat UI.** All conversation happens in the official Claude app; the tower only clears launches and supervises.
+- **Not a chat UI.** A card shows at most Claude's last reply as a snippet; the conversation itself lives entirely in the official Claude app. The tower only clears launches and supervises.
 - **Not multi-tenant.** It's your machine and your token.
-- **Not containerized (yet).** Sessions run as your user on the host.
+- **Not containerized (yet).** Environments run as your user on the host.
 
 ## Contributing
 
